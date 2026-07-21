@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.streamlit/
+.venv/
+venv/
+reports/
+sample_data/
+tests/
