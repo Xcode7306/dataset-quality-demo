@@ -1,11 +1,16 @@
-"""CSV、Excel、JSON 输入文件的解析模块。"""
+"""CSV、Excel、表格型 JSON 与 GeoJSON 输入文件的解析模块。"""
 
+import codecs
 import csv
+import io
 import json
 import math
+import zlib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, Callable, ContextManager
+from zipfile import BadZipFile, LargeZipFile, ZipFile, ZipInfo
 
 import pandas as pd
 
@@ -14,19 +19,54 @@ from .resource_limits import (
     MAX_DATASET_CELLS,
     MAX_DATASET_COLUMNS,
     MAX_DATASET_ROWS,
+    MAX_JSON_ARRAY_ITEMS,
+    MAX_CELL_TEXT_BYTES,
     MAX_JSON_NESTING_DEPTH,
     MAX_JSON_OBJECT_PAIRS,
     MAX_JSON_RECORDS,
+    MAX_JSON_TOTAL_ARRAY_ITEMS,
     MAX_JSON_TOTAL_PAIRS,
     ResourceLimitExceeded,
     validate_dataframe_limits,
     validate_input_file_size,
+    validate_json_zip_archive,
     validate_xlsx_archive,
 )
 from .text_utils import normalize_display_text
 
 
-SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".json"}
+SUPPORTED_EXTENSIONS = {
+    ".csv",
+    ".xls",
+    ".xlsx",
+    ".json",
+    ".jsonl",
+    ".ndjson",
+    ".geojson",
+    ".zip",
+}
+JSON_WRAPPER_KEYS = {"data", "rows", "records", "items", "list", "result"}
+GEOJSON_TECHNICAL_PREFIX = "__geojson_"
+GEOJSON_ALLOWED_GEOMETRY_TYPES = {
+    "Point",
+    "MultiPoint",
+    "LineString",
+    "MultiLineString",
+    "Polygon",
+    "MultiPolygon",
+    "GeometryCollection",
+}
+GEOJSON_COORDINATE_DEPTHS = {
+    "Point": 0,
+    "MultiPoint": 1,
+    "LineString": 1,
+    "MultiLineString": 2,
+    "Polygon": 2,
+    "MultiPolygon": 3,
+}
+ERROR_VALUE_MAX_CHARACTERS = 160
+ERROR_VALUE_MAX_ITEMS = 10
+BinaryOpener = Callable[[], ContextManager[BinaryIO]]
 
 
 class _ReportableInputError(ValueError):
@@ -63,8 +103,55 @@ class ParsedDataset:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class _JsonReadResult:
+    """单个 JSON 文档或分片的内部读取结果。"""
+
+    dataframe: pd.DataFrame
+    warnings: list[str]
+    structure_kind: str
+    total_pairs: int
+    total_array_items: int
+
+
+@dataclass
+class _GeoJsonCoordinateSummary:
+    """仅保留 GeoJSON 坐标的统计摘要，永不保留或展开原始坐标。"""
+
+    coordinate_count: int = 0
+    coordinate_dimension: int = 0
+    min_x: float | None = None
+    min_y: float | None = None
+    max_x: float | None = None
+    max_y: float | None = None
+
+
+def _error_value_excerpt(value: object) -> str:
+    """将输入派生文本限制为可安全写入失败报告的短摘要。"""
+
+    text, _ = normalize_display_text(value)
+    text = "".join(
+        character if character.isprintable() else "�" for character in text
+    )
+    if len(text) > ERROR_VALUE_MAX_CHARACTERS:
+        return f"{text[:ERROR_VALUE_MAX_CHARACTERS]}…"
+    return text
+
+
+def _format_error_values(values: list[str], empty_label: str) -> str:
+    """有界展示字段名集合，避免攻击性输入放大错误报告。"""
+
+    displayed = [
+        _error_value_excerpt(value) or empty_label
+        for value in values[:ERROR_VALUE_MAX_ITEMS]
+    ]
+    if len(values) > ERROR_VALUE_MAX_ITEMS:
+        displayed.append(f"等 {len(values)} 个")
+    return "、".join(displayed)
+
+
 def validate_file_type(file_path: str | Path) -> Path:
-    """检查文件存在且扩展名属于 v0.1 支持范围。"""
+    """检查文件存在且扩展名属于当前版本支持范围。"""
 
     path = Path(file_path)
     if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -96,6 +183,12 @@ def _validate_unique_original_headers(headers: list[Any], source: str) -> None:
     """在 pandas 自动改写重复列名之前拒绝原始重复表头。"""
 
     header_texts = [_header_text(value) for value in headers]
+    for field_index, header_text in enumerate(header_texts, start=1):
+        if len(header_text.encode("utf-8", errors="replace")) > MAX_CELL_TEXT_BYTES:
+            raise DatasetReadError(
+                f"{source}第 {field_index} 个字段名超过 "
+                f"{MAX_CELL_TEXT_BYTES} 字节的单项文本上限。"
+            )
     duplicated = pd.Index(header_texts).duplicated(keep=False)
     duplicate_headers = list(
         dict.fromkeys(
@@ -105,8 +198,9 @@ def _validate_unique_original_headers(headers: list[Any], source: str) -> None:
         )
     )
     if duplicate_headers:
-        display_headers = "、".join(
-            header or "（空字段名）" for header in duplicate_headers
+        display_headers = _format_error_values(
+            duplicate_headers,
+            "（空字段名）",
         )
         raise DatasetReadError(
             f"{source}原始表头存在重复字段：{display_headers}。"
@@ -220,11 +314,13 @@ def _read_csv(path: Path) -> tuple[pd.DataFrame, list[str]]:
 def _read_excel(path: Path, sheet_name: str | None) -> tuple[pd.DataFrame, str]:
     """读取指定 Excel 工作表；未指定时读取第一个工作表。"""
 
+    engine = "xlrd" if path.suffix.lower() == ".xls" else "openpyxl"
     try:
-        workbook = pd.ExcelFile(path)
-    # pandas 会根据文件内容调用不同的 Excel 引擎。损坏的 ZIP、
-    # XML 或工作簿元数据可以从这些引擎抛出 BadZipFile、OptionError、
-    # KeyError 等多种异常；它们都属于用户输入无法解析，应在边界统一。
+        # 按扩展名固定引擎，避免伪装成 .xls 的 OOXML 文件绕过
+        # .xlsx 专属的 ZIP 展开体积与压缩比预检。
+        workbook = pd.ExcelFile(path, engine=engine)
+    # 损坏的 OLE、ZIP、XML 或工作簿元数据可以从两个引擎抛出
+    # 多种异常；它们都属于用户输入无法解析，应在边界统一。
     except Exception as error:
         raise DatasetReadError(f"Excel 文件无法打开：{error}") from error
 
@@ -280,11 +376,44 @@ def _normalize_json_string(value: str) -> str:
     """
 
     try:
-        return value.encode("utf-16", errors="surrogatepass").decode("utf-16")
+        normalized = value.encode("utf-16", errors="surrogatepass").decode(
+            "utf-16"
+        )
     except UnicodeDecodeError as error:
         raise DatasetReadError(
             "JSON 包含孤立的 Unicode 代理字符，无法安全输出 UTF-8 报告。"
         ) from error
+    if len(normalized.encode("utf-8")) > MAX_CELL_TEXT_BYTES:
+        raise DatasetReadError(
+            f"JSON 包含超过 {MAX_CELL_TEXT_BYTES} 字节的单项文本，"
+            "为避免内存和报告放大已停止解析。"
+        )
+    return normalized
+
+
+def _validate_json_unicode_tree(value: Any) -> None:
+    """递归校验整个 JSON 文档，包括最终不映射的包装元数据。"""
+
+    if isinstance(value, str):
+        _normalize_json_string(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_json_unicode_tree(item)
+        return
+    if not isinstance(value, dict):
+        return
+
+    normalized_keys: set[str] = set()
+    for key, child in value.items():
+        normalized_key = _normalize_json_string(key)
+        if normalized_key in normalized_keys:
+            raise DatasetReadError(
+                "JSON 字段名规范化后存在重复："
+                f"{_error_value_excerpt(normalized_key)}。"
+            )
+        normalized_keys.add(normalized_key)
+        _validate_json_unicode_tree(child)
 
 
 def _normalize_record_unicode(record: dict[str, Any]) -> dict[str, Any]:
@@ -295,7 +424,8 @@ def _normalize_record_unicode(record: dict[str, Any]) -> dict[str, Any]:
         normalized_key = _normalize_json_string(key)
         if normalized_key in normalized:
             raise DatasetReadError(
-                f"JSON 字段名规范化后存在重复：{normalized_key}。"
+                "JSON 字段名规范化后存在重复："
+                f"{_error_value_excerpt(normalized_key)}。"
             )
         normalized[normalized_key] = (
             _normalize_json_string(value) if isinstance(value, str) else value
@@ -307,10 +437,20 @@ def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, An
     """构造 JSON 对象时立即拒绝重复键，避免静默保留最后一个值。"""
 
     result: dict[str, Any] = {}
+    normalized_keys: set[str] = set()
     for key, value in pairs:
+        normalized_key = _normalize_json_string(key)
         if key in result:
-            display_key, _ = normalize_display_text(key)
-            raise DatasetReadError(f"JSON 对象存在重复字段：{display_key}。")
+            raise DatasetReadError(
+                "JSON 对象存在重复字段："
+                f"{_error_value_excerpt(key)}。"
+            )
+        if normalized_key in normalized_keys:
+            raise DatasetReadError(
+                "JSON 字段名规范化后存在重复："
+                f"{_error_value_excerpt(normalized_key)}。"
+            )
+        normalized_keys.add(normalized_key)
         result[key] = value
     return result
 
@@ -354,194 +494,1162 @@ def _parse_json_float(value: str) -> float:
     return parsed
 
 
-def _preflight_json_structure(path: Path) -> None:
-    """在 json.load 物化数据前限制结构规模并拒绝嵌套。
+def _path_binary_opener(path: Path) -> BinaryOpener:
+    return lambda: path.open("rb")
 
-    v0.1 只支持顶层扁平对象或扁平对象列表。这个轻量
-    扫描器只跟踪字符串、转义和结构深度；完整语法仍交由
-    标准 json 解析器校验。
-    """
 
+def _can_decode_stream(open_binary: BinaryOpener, encoding: str) -> None:
+    """以增量解码检查整个输入流，避免为编码探测制造文本副本。"""
+
+    decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+    with open_binary() as file:
+        for chunk in iter(lambda: file.read(64 * 1024), b""):
+            decoder.decode(chunk)
+    decoder.decode(b"", final=True)
+
+
+def _detect_json_encoding_source(
+    open_binary: BinaryOpener,
+) -> tuple[str, list[str]]:
+    """识别 JSON 编码；无 BOM 时只做 UTF-8 与 GB18030 的确定性回退。"""
+
+    try:
+        with open_binary() as file:
+            prefix = file.read(4)
+        if prefix.startswith(codecs.BOM_UTF8):
+            _can_decode_stream(open_binary, "utf-8-sig")
+            return "utf-8-sig", []
+        if prefix.startswith(codecs.BOM_UTF32_LE) or prefix.startswith(
+            codecs.BOM_UTF32_BE
+        ):
+            _can_decode_stream(open_binary, "utf-32")
+            return "utf-32", ["JSON 使用 UTF-32 BOM 编码读取。"]
+        if prefix.startswith(codecs.BOM_UTF16_LE) or prefix.startswith(
+            codecs.BOM_UTF16_BE
+        ):
+            _can_decode_stream(open_binary, "utf-16")
+            return "utf-16", ["JSON 使用 UTF-16 BOM 编码读取。"]
+
+        for encoding in ("utf-8", "gb18030"):
+            try:
+                _can_decode_stream(open_binary, encoding)
+                warnings = (
+                    []
+                    if encoding == "utf-8"
+                    else ["JSON 使用 GB18030 编码读取。"]
+                )
+                return encoding, warnings
+            except UnicodeDecodeError:
+                continue
+    except UnicodeDecodeError as error:
+        raise DatasetReadError("JSON 声明的 BOM 编码与文件内容不匹配。") from error
+    except (BadZipFile, NotImplementedError, OSError, RuntimeError) as error:
+        raise DatasetReadError(f"JSON 文件无法读取：{error}") from error
+
+    raise DatasetReadError("JSON 无法按 UTF-8 或 GB18030 编码读取。")
+
+
+def _detect_json_encoding(path: Path) -> tuple[str, list[str]]:
+    return _detect_json_encoding_source(_path_binary_opener(path))
+
+
+def _preflight_json_chunks(
+    chunks: Iterable[str],
+    *,
+    max_records: int | None = None,
+    max_total_pairs: int | None = None,
+    max_total_array_items: int | None = None,
+) -> tuple[int, int]:
+    """在标准解码器物化数据前流式限制 JSON 结构规模。"""
+
+    record_limit = max(
+        MAX_JSON_RECORDS if max_records is None else max_records,
+        0,
+    )
+    total_pair_limit = (
+        MAX_JSON_TOTAL_PAIRS
+        if max_total_pairs is None
+        else max_total_pairs
+    )
+    total_array_item_limit = (
+        MAX_JSON_TOTAL_ARRAY_ITEMS
+        if max_total_array_items is None
+        else max_total_array_items
+    )
     top_level: str | None = None
     depth = 0
     in_string = False
     escaped = False
-    array_value_started = False
-    record_count = 0
-    contains_nested_value = False
     container_types: dict[int, str] = {}
     object_pair_counts: dict[int, int] = {}
+    array_value_started: dict[int, bool] = {}
+    array_value_kinds: dict[int, str | None] = {}
+    array_item_counts: dict[int, int] = {}
     total_pair_count = 0
+    total_array_item_count = 0
 
-    def finish_array_value() -> None:
-        nonlocal array_value_started, record_count
-        if not array_value_started:
+    def start_array_value(kind: str) -> None:
+        if container_types.get(depth) != "array":
             return
-        record_count += 1
-        array_value_started = False
-        if record_count > MAX_JSON_RECORDS:
+        array_value_started[depth] = True
+        if array_value_kinds.get(depth) is None:
+            array_value_kinds[depth] = kind
+
+    def finish_array_value(array_depth: int) -> None:
+        nonlocal total_array_item_count
+        if not array_value_started.get(array_depth, False):
+            return
+        item_count = array_item_counts[array_depth] + 1
+        array_item_counts[array_depth] = item_count
+        array_value_started[array_depth] = False
+        total_array_item_count += 1
+
+        first_kind = array_value_kinds.get(array_depth)
+        parent_is_matrix = (
+            container_types.get(array_depth - 1) == "array"
+            and array_value_kinds.get(array_depth - 1) == "array"
+        )
+        if parent_is_matrix:
+            item_limit = min(MAX_JSON_ARRAY_ITEMS, MAX_DATASET_COLUMNS)
+        else:
+            item_limit = min(
+                MAX_JSON_ARRAY_ITEMS,
+                record_limit + (1 if first_kind == "array" else 0),
+            )
+        if item_count > item_limit:
             raise DatasetReadError(
-                f"JSON 顶层包含超过 {MAX_JSON_RECORDS} 条记录，"
+                f"JSON 单个记录数组包含超过 {item_limit} 项，"
                 "为避免内存耗尽已停止解析。"
             )
+        if total_array_item_count > total_array_item_limit:
+            raise DatasetReadError(
+                f"JSON 全文件数组项总数超过 "
+                f"{total_array_item_limit} 项，为避免内存耗尽已停止解析。"
+            )
 
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
-        for chunk in iter(lambda: file.read(64 * 1024), ""):
-            for character in chunk:
-                if in_string:
-                    if escaped:
-                        escaped = False
-                    elif character == "\\":
-                        escaped = True
-                    elif character == '"':
-                        in_string = False
+    for chunk in chunks:
+        for character in chunk:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                continue
+
+            if top_level is None:
+                if character.isspace():
                     continue
+                if character not in "[{":
+                    # 顶层标量或非法语法交给标准解码器生成准确错误。
+                    return total_pair_count, total_array_item_count
+                top_level = "array" if character == "[" else "object"
+                depth = 1
+                container_types[depth] = top_level
+                if top_level == "array":
+                    array_value_started[depth] = False
+                    array_value_kinds[depth] = None
+                    array_item_counts[depth] = 0
+                else:
+                    object_pair_counts[depth] = 0
+                continue
 
-                if top_level is None:
-                    if character.isspace():
-                        continue
-                    if character == "[":
-                        top_level = "array"
-                        depth = 1
-                        container_types[depth] = "array"
-                        continue
-                    if character == "{":
-                        top_level = "object"
-                        depth = 1
-                        container_types[depth] = "object"
-                        object_pair_counts[depth] = 0
-                        continue
-                    # 标量或其他非法顶层交给 json.load 生成统一语法错误。
-                    return
+            if character == '"':
+                start_array_value("scalar")
+                in_string = True
+                continue
 
-                if character == '"':
-                    if top_level == "array" and depth == 1:
-                        array_value_started = True
-                    in_string = True
-                    continue
-
-                if character in "[{":
-                    if top_level == "array" and depth == 1:
-                        array_value_started = True
-                        if character != "{":
-                            raise DatasetReadError(
-                                "JSON 顶层列表中的每一项都必须是对象记录。"
-                            )
-                    else:
-                        contains_nested_value = True
-                    depth += 1
-                    container_types[depth] = (
-                        "array" if character == "[" else "object"
+            if character in "[{":
+                # 顶层记录列表或二维数组中的单元格不允许再嵌套，
+                # 可在物化前直接拒绝；对象顶层则保留给包装提取判断。
+                if (
+                    top_level == "array"
+                    and depth == 2
+                    and container_types.get(depth) in {"array", "object"}
+                ):
+                    raise DatasetReadError(
+                        "JSON 包含嵌套对象或列表，"
+                        "当前不支持自动展平。"
                     )
-                    if character == "{":
-                        object_pair_counts[depth] = 0
-                    if depth > MAX_JSON_NESTING_DEPTH:
-                        raise DatasetReadError("JSON 嵌套层级过深，无法安全解析。")
-                    continue
+                start_array_value("array" if character == "[" else "object")
+                depth += 1
+                if depth > MAX_JSON_NESTING_DEPTH:
+                    raise DatasetReadError("JSON 嵌套层级过深，无法安全解析。")
+                container_type = "array" if character == "[" else "object"
+                container_types[depth] = container_type
+                if container_type == "array":
+                    array_value_started[depth] = False
+                    array_value_kinds[depth] = None
+                    array_item_counts[depth] = 0
+                else:
+                    object_pair_counts[depth] = 0
+                continue
 
-                if character == ":" and container_types.get(depth) == "object":
-                    object_pair_counts[depth] += 1
-                    total_pair_count += 1
-                    if object_pair_counts[depth] > MAX_JSON_OBJECT_PAIRS:
-                        raise DatasetReadError(
-                            f"JSON 单个对象包含超过 {MAX_JSON_OBJECT_PAIRS} 个键值对，"
-                            "为避免内存耗尽已停止解析。"
-                        )
-                    if total_pair_count > MAX_JSON_TOTAL_PAIRS:
-                        raise DatasetReadError(
-                            f"JSON 全文件包含超过 {MAX_JSON_TOTAL_PAIRS} 个键值对，"
-                            "为避免内存耗尽已停止解析。"
-                        )
-                    continue
+            if character == ":" and container_types.get(depth) == "object":
+                object_pair_counts[depth] += 1
+                total_pair_count += 1
+                if object_pair_counts[depth] > MAX_JSON_OBJECT_PAIRS:
+                    raise DatasetReadError(
+                        f"JSON 单个对象包含超过 {MAX_JSON_OBJECT_PAIRS} 个键值对，"
+                        "为避免内存耗尽已停止解析。"
+                    )
+                if total_pair_count > total_pair_limit:
+                    raise DatasetReadError(
+                        f"JSON 全文件包含超过 {total_pair_limit} 个键值对，"
+                        "为避免内存耗尽已停止解析。"
+                    )
+                continue
 
-                if character in "]}":
-                    if top_level == "array" and depth == 1 and character == "]":
-                        finish_array_value()
-                        if contains_nested_value:
-                            raise DatasetReadError(
-                                "JSON 包含嵌套对象或列表，"
-                                "第一版暂不支持自动展平。"
-                            )
-                        return
-                    if top_level == "object" and depth == 1 and character == "}":
-                        if contains_nested_value:
-                            raise DatasetReadError(
-                                "JSON 包含嵌套对象或列表，"
-                                "第一版暂不支持自动展平。"
-                            )
-                        return
-                    container_types.pop(depth, None)
-                    object_pair_counts.pop(depth, None)
-                    depth -= 1
-                    continue
+            if character == "," and container_types.get(depth) == "array":
+                finish_array_value(depth)
+                continue
 
-                if top_level == "array" and depth == 1:
-                    if character == ",":
-                        finish_array_value()
-                    elif not character.isspace():
-                        array_value_started = True
+            if character in "]}":
+                if character == "]" and container_types.get(depth) == "array":
+                    finish_array_value(depth)
+                    array_value_started.pop(depth, None)
+                    array_value_kinds.pop(depth, None)
+                    array_item_counts.pop(depth, None)
+                object_pair_counts.pop(depth, None)
+                container_types.pop(depth, None)
+                depth = max(depth - 1, 0)
+                continue
+
+            if not character.isspace() and character != ",":
+                start_array_value("scalar")
+
+    return total_pair_count, total_array_item_count
 
 
-def _read_json(path: Path) -> pd.DataFrame:
-    """读取记录列表或单条扁平记录 JSON。
-
-    嵌套结构的展平规则需要单独讨论，第一版不擅自处理，避免改变业务含义。
-    """
-
-    seen_fields: set[str] = set()
-
-    def limited_object_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        record = _object_without_duplicate_keys(pairs)
-        seen_fields.update(record)
-        if len(seen_fields) > MAX_DATASET_COLUMNS:
-            raise DatasetReadError(
-                f"JSON 记录合并后超过 {MAX_DATASET_COLUMNS} 个字段，"
-                "为避免内存耗尽已停止解析。"
-            )
-        return record
-
+def _preflight_json_source(
+    open_binary: BinaryOpener,
+    encoding: str,
+    *,
+    max_records: int | None = None,
+    max_total_pairs: int | None = None,
+    max_total_array_items: int | None = None,
+) -> tuple[int, int]:
     try:
-        _preflight_json_structure(path)
-        with path.open("r", encoding="utf-8-sig") as file:
-            payload = json.load(
-                file,
-                object_pairs_hook=limited_object_hook,
-                parse_constant=_reject_nonstandard_json_constant,
-                parse_int=_parse_json_integer,
-                parse_float=_parse_json_float,
-            )
-    except DatasetReadError:
-        raise
+        with open_binary() as binary_file:
+            with io.TextIOWrapper(
+                binary_file, encoding=encoding, newline=""
+            ) as file:
+                return _preflight_json_chunks(
+                    iter(lambda: file.read(64 * 1024), ""),
+                    max_records=max_records,
+                    max_total_pairs=max_total_pairs,
+                    max_total_array_items=max_total_array_items,
+                )
     except UnicodeDecodeError as error:
-        raise DatasetReadError("JSON 不是 UTF-8 编码，第一版暂不支持读取。") from error
-    except json.JSONDecodeError as error:
-        raise DatasetReadError(f"JSON 格式错误：第 {error.lineno} 行第 {error.colno} 列。") from error
-    except RecursionError as error:
-        raise DatasetReadError("JSON 嵌套层级过深，无法安全解析。") from error
-    except ValueError as error:
-        raise DatasetReadError(f"JSON 内容无法读取：{error}") from error
-    except OSError as error:
+        raise DatasetReadError("JSON 编码在解析过程中发生解码错误。") from error
+    except (BadZipFile, NotImplementedError, OSError, RuntimeError) as error:
         raise DatasetReadError(f"JSON 文件无法读取：{error}") from error
 
-    if isinstance(payload, list):
-        if not all(isinstance(record, dict) for record in payload):
-            raise DatasetReadError("JSON 顶层列表中的每一项都必须是对象记录。")
-        if any(_contains_nested_value(record) for record in payload):
-            raise DatasetReadError("JSON 包含嵌套对象或列表，第一版暂不支持自动展平。")
-        cell_count = len(payload) * len(seen_fields)
-        if cell_count > MAX_DATASET_CELLS:
-            raise DatasetReadError(
-                f"JSON 记录展开后需要 {cell_count} 个单元格，超过 "
-                f"{MAX_DATASET_CELLS} 个的 Demo 上限。"
+
+def _preflight_json_structure(path: Path, encoding: str) -> tuple[int, int]:
+    return _preflight_json_source(_path_binary_opener(path), encoding)
+
+
+def _json_load_kwargs() -> dict[str, Any]:
+    return {
+        "object_pairs_hook": _object_without_duplicate_keys,
+        "parse_constant": _reject_nonstandard_json_constant,
+        "parse_int": _parse_json_integer,
+        "parse_float": _parse_json_float,
+    }
+
+
+def _load_json_document_source(
+    open_binary: BinaryOpener, encoding: str
+) -> tuple[Any, bool]:
+    """严格读取 JSON；仅修复整体外层精确为 ``{[...]}`` 的样本。"""
+
+    try:
+        with open_binary() as binary_file:
+            with io.TextIOWrapper(binary_file, encoding=encoding) as file:
+                return json.load(file, **_json_load_kwargs()), False
+    except json.JSONDecodeError as original_error:
+        try:
+            with open_binary() as binary_file:
+                with io.TextIOWrapper(binary_file, encoding=encoding) as file:
+                    text = file.read()
+        except (
+            BadZipFile,
+            UnicodeDecodeError,
+            NotImplementedError,
+            OSError,
+            RuntimeError,
+        ) as error:
+            raise DatasetReadError(f"JSON 文件无法读取：{error}") from error
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            inner = stripped[1:-1].strip()
+        else:
+            inner = ""
+        if inner.startswith("[") and inner.endswith("]"):
+            try:
+                repaired = json.loads(inner, **_json_load_kwargs())
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(repaired, list) and all(
+                    isinstance(record, dict) for record in repaired
+                ):
+                    return repaired, True
+        raise DatasetReadError(
+            f"JSON 格式错误：第 {original_error.lineno} 行"
+            f"第 {original_error.colno} 列。"
+        ) from original_error
+
+
+def _load_json_document(path: Path, encoding: str) -> tuple[Any, bool]:
+    return _load_json_document_source(_path_binary_opener(path), encoding)
+
+
+def _classify_tabular_value(value: Any) -> str | None:
+    if isinstance(value, dict) and not _contains_nested_value(value):
+        return "record"
+    if not isinstance(value, list):
+        return None
+    if not value:
+        return "empty"
+    if all(isinstance(item, dict) for item in value):
+        return "records"
+    if all(isinstance(item, list) for item in value):
+        return "matrix"
+    return None
+
+
+def _find_wrapped_tabular_values(
+    payload: dict[str, Any], path: str = "$", *, limit: int = 2
+) -> list[tuple[str, str, Any]]:
+    """只收集判断唯一性所需的候选，避免歧义输入放大内存与错误文本。"""
+
+    candidates: list[tuple[str, str, Any]] = []
+    for key, value in payload.items():
+        if len(candidates) >= limit:
+            break
+        if key not in JSON_WRAPPER_KEYS:
+            continue
+        child_path = f"{path}.{key}"
+        kind = _classify_tabular_value(value)
+        if kind is not None:
+            candidates.append((child_path, kind, value))
+        elif isinstance(value, dict):
+            candidates.extend(
+                _find_wrapped_tabular_values(
+                    value,
+                    child_path,
+                    limit=limit - len(candidates),
+                )
             )
-        return pd.DataFrame([_normalize_record_unicode(record) for record in payload])
+    return candidates
 
+
+def _check_json_table_size(row_count: int, column_count: int) -> None:
+    if row_count > MAX_JSON_RECORDS:
+        raise DatasetReadError(
+            f"JSON 包含 {row_count} 条记录，超过 "
+            f"{MAX_JSON_RECORDS} 条的 JSON 上限。"
+        )
+    if column_count > MAX_DATASET_COLUMNS:
+        raise DatasetReadError(
+            f"JSON 记录合并后包含 {column_count} 个字段，超过 "
+            f"{MAX_DATASET_COLUMNS} 个的 Demo 上限。"
+        )
+    cell_count = row_count * column_count
+    if cell_count > MAX_DATASET_CELLS:
+        raise DatasetReadError(
+            f"JSON 记录展开后需要 {cell_count} 个单元格，超过 "
+            f"{MAX_DATASET_CELLS} 个的 Demo 上限。"
+        )
+
+
+def _records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
+    normalized_records: list[dict[str, Any]] = []
+    seen_fields: dict[str, None] = {}
+    for record in records:
+        if _contains_nested_value(record):
+            raise DatasetReadError(
+                "JSON 包含嵌套对象或列表，当前不支持自动展平。"
+            )
+        normalized = _normalize_record_unicode(record)
+        normalized_records.append(normalized)
+        for field_name in normalized:
+            seen_fields.setdefault(field_name, None)
+        _check_json_table_size(len(normalized_records), len(seen_fields))
+    _check_json_table_size(len(normalized_records), len(seen_fields))
+    # JSON 整数与 null 混合时，pandas 默认会转为 float64，
+    # 并可能将 2**53 以上的相邻整数静默舍入成同一值。
+    return pd.DataFrame(
+        normalized_records,
+        columns=list(seen_fields),
+        dtype=object,
+    )
+
+
+def _normalize_matrix_cell(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        raise DatasetReadError(
+            "JSON 二维数组包含嵌套单元格，当前不支持自动展平。"
+        )
+    return _normalize_json_string(value) if isinstance(value, str) else value
+
+
+def _matrix_to_dataframe(matrix: list[list[Any]]) -> pd.DataFrame:
+    if not matrix:
+        return pd.DataFrame()
+    normalized_header = [_normalize_matrix_cell(value) for value in matrix[0]]
+    _validate_unique_original_headers(normalized_header, "JSON 二维数组 ")
+    columns = [_header_text(value) for value in normalized_header]
+    _check_json_table_size(len(matrix) - 1, len(columns))
+    rows: list[list[Any]] = []
+    for row_number, row in enumerate(matrix[1:], start=2):
+        if len(row) > len(columns):
+            raise DatasetReadError(
+                f"JSON 二维数组第 {row_number} 行包含 {len(row)} 个值，"
+                f"超过表头的 {len(columns)} 个字段。"
+            )
+        normalized_row = [_normalize_matrix_cell(value) for value in row]
+        normalized_row.extend([None] * (len(columns) - len(normalized_row)))
+        rows.append(normalized_row)
+    return pd.DataFrame(rows, columns=columns, dtype=object)
+
+
+def _is_finite_geojson_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _reject_unmapped_geojson_nested_members(
+    value: dict[str, Any],
+    allowed_nested_members: set[str],
+    context: str,
+) -> None:
+    """拒绝白名单之外会被静默丢弃的 GeoJSON 嵌套路径。"""
+
+    for key, child in value.items():
+        if key in allowed_nested_members:
+            continue
+        if isinstance(child, (dict, list)):
+            raise DatasetReadError(
+                f"{context}包含未定义的嵌套字段"
+                f"“{_error_value_excerpt(key)}”；当前不会静默忽略或自动展平。"
+            )
+
+
+def _add_geojson_position(
+    position: list[Any], summary: _GeoJsonCoordinateSummary, feature_index: int
+) -> None:
+    """将一个经纬坐标位置聚合为范围和维度，不保留坐标值数组。"""
+
+    if len(position) not in {2, 3} or not all(
+        _is_finite_geojson_number(value) for value in position
+    ):
+        raise DatasetReadError(
+            f"GeoJSON 第 {feature_index} 个 Feature 的坐标位置"
+            "必须是包含 2 或 3 个有限数值的数组。"
+        )
+    x, y = float(position[0]), float(position[1])
+    summary.coordinate_count += 1
+    summary.coordinate_dimension = max(summary.coordinate_dimension, len(position))
+    summary.min_x = x if summary.min_x is None else min(summary.min_x, x)
+    summary.min_y = y if summary.min_y is None else min(summary.min_y, y)
+    summary.max_x = x if summary.max_x is None else max(summary.max_x, x)
+    summary.max_y = y if summary.max_y is None else max(summary.max_y, y)
+
+
+def _summarize_geojson_coordinate_tree(
+    coordinates: Any,
+    summary: _GeoJsonCoordinateSummary,
+    feature_index: int,
+    expected_depth: int,
+) -> None:
+    """按几何类型校验标准坐标树，并仅计算位置数、维度和二维范围。"""
+
+    if not isinstance(coordinates, list):
+        raise DatasetReadError(
+            f"GeoJSON 第 {feature_index} 个 Feature 的 coordinates 必须是数组。"
+        )
+    if expected_depth == 0:
+        _add_geojson_position(coordinates, summary, feature_index)
+        return
+    if not coordinates:
+        raise DatasetReadError(
+            f"GeoJSON 第 {feature_index} 个 Feature 的 coordinates 不能为空。"
+        )
+    for child in coordinates:
+        _summarize_geojson_coordinate_tree(
+            child, summary, feature_index, expected_depth - 1
+        )
+
+
+def _validate_geojson_coordinate_cardinality(
+    geometry_type: str,
+    coordinates: list[Any],
+    feature_index: int,
+) -> None:
+    """校验 LineString 和 Polygon 类型的最小基数与线性环闭合。"""
+
+    def validate_line(line: list[Any], label: str) -> None:
+        if len(line) < 2:
+            raise DatasetReadError(
+                f"GeoJSON 第 {feature_index} 个 Feature 的 {label} "
+                "至少需要 2 个坐标位置。"
+            )
+
+    def validate_ring(ring: list[Any], label: str) -> None:
+        if len(ring) < 4:
+            raise DatasetReadError(
+                f"GeoJSON 第 {feature_index} 个 Feature 的 {label} "
+                "至少需要 4 个坐标位置。"
+            )
+        if ring[0] != ring[-1]:
+            raise DatasetReadError(
+                f"GeoJSON 第 {feature_index} 个 Feature 的 {label} "
+                "首尾坐标必须相同以形成闭合线性环。"
+            )
+
+    if geometry_type == "LineString":
+        validate_line(coordinates, "LineString")
+    elif geometry_type == "MultiLineString":
+        for line_index, line in enumerate(coordinates, start=1):
+            validate_line(line, f"MultiLineString 第 {line_index} 条子线")
+    elif geometry_type == "Polygon":
+        for ring_index, ring in enumerate(coordinates, start=1):
+            validate_ring(ring, f"Polygon 第 {ring_index} 个线性环")
+    elif geometry_type == "MultiPolygon":
+        for polygon_index, polygon in enumerate(coordinates, start=1):
+            for ring_index, ring in enumerate(polygon, start=1):
+                validate_ring(
+                    ring,
+                    f"MultiPolygon 第 {polygon_index} 个多边形"
+                    f"的第 {ring_index} 个线性环",
+                )
+
+
+def _summarize_geojson_geometry(
+    geometry: dict[str, Any], feature_index: int
+) -> _GeoJsonCoordinateSummary:
+    """验证受支持的 GeoJSON 几何，并返回不含原始坐标的摘要。"""
+
+    summary = _GeoJsonCoordinateSummary()
+
+    def visit(current_geometry: Any) -> None:
+        if not isinstance(current_geometry, dict):
+            raise DatasetReadError(
+                f"GeoJSON 第 {feature_index} 个 Feature 的 geometry 必须是对象或 null。"
+            )
+        geometry_type = current_geometry.get("type")
+        if geometry_type not in GEOJSON_ALLOWED_GEOMETRY_TYPES:
+            raise DatasetReadError(
+                f"GeoJSON 第 {feature_index} 个 Feature 使用了不支持的几何类型"
+                f"“{_error_value_excerpt(geometry_type)}”。"
+            )
+        if geometry_type == "GeometryCollection":
+            _reject_unmapped_geojson_nested_members(
+                current_geometry,
+                {"geometries"},
+                f"GeoJSON 第 {feature_index} 个 Feature 的 GeometryCollection ",
+            )
+            geometries = current_geometry.get("geometries")
+            if not isinstance(geometries, list):
+                raise DatasetReadError(
+                    f"GeoJSON 第 {feature_index} 个 Feature 的 GeometryCollection "
+                    "必须包含 geometries 数组。"
+                )
+            for child_geometry in geometries:
+                visit(child_geometry)
+            return
+        _reject_unmapped_geojson_nested_members(
+            current_geometry,
+            {"coordinates"},
+            f"GeoJSON 第 {feature_index} 个 Feature 的 {geometry_type} geometry ",
+        )
+        if "coordinates" not in current_geometry:
+            raise DatasetReadError(
+                f"GeoJSON 第 {feature_index} 个 Feature 的 {geometry_type} "
+                "缺少 coordinates。"
+            )
+        _summarize_geojson_coordinate_tree(
+            current_geometry["coordinates"],
+            summary,
+            feature_index,
+            GEOJSON_COORDINATE_DEPTHS[geometry_type],
+        )
+        _validate_geojson_coordinate_cardinality(
+            geometry_type,
+            current_geometry["coordinates"],
+            feature_index,
+        )
+
+    visit(geometry)
+    return summary
+
+
+def _geojson_properties_to_record(
+    properties: Any, feature_index: int
+) -> dict[str, Any]:
+    """仅将扁平 properties 映射为表格字段，拒绝通用嵌套展平。"""
+
+    if properties is None:
+        return {}
+    if not isinstance(properties, dict):
+        raise DatasetReadError(
+            f"GeoJSON 第 {feature_index} 个 Feature 的 properties 必须是对象或 null。"
+        )
+    if _contains_nested_value(properties):
+        raise DatasetReadError(
+            f"GeoJSON 第 {feature_index} 个 Feature 的 properties 包含嵌套对象或列表；"
+            "当前只映射扁平 properties，不自动展平。"
+        )
+    normalized = _normalize_record_unicode(properties)
+    reserved_fields = [
+        field_name
+        for field_name in normalized
+        if field_name.startswith(GEOJSON_TECHNICAL_PREFIX)
+    ]
+    if reserved_fields:
+        raise DatasetReadError(
+            f"GeoJSON 第 {feature_index} 个 Feature 的 properties 使用了保留字段"
+            f"“{_error_value_excerpt(reserved_fields[0])}”。"
+        )
+    return normalized
+
+
+def _normalize_geojson_feature_id(value: Any, feature_index: int) -> Any:
+    if (
+        value is None
+        or isinstance(value, bool)
+        or not isinstance(value, (str, int, float))
+    ):
+        raise DatasetReadError(
+            f"GeoJSON 第 {feature_index} 个 Feature 的 id "
+            "必须是字符串或有限数值。"
+        )
+    return _normalize_json_string(value) if isinstance(value, str) else value
+
+
+def _geojson_feature_collection_to_dataframe(
+    payload: dict[str, Any]
+) -> tuple[pd.DataFrame, list[str]]:
+    """将标准 FeatureCollection 映射为一行一个 Feature 的表格。"""
+
+    if payload.get("type") != "FeatureCollection":
+        raise DatasetReadError("GeoJSON 顶层 type 必须为 FeatureCollection。")
+    _reject_unmapped_geojson_nested_members(
+        payload,
+        {"features"},
+        "GeoJSON FeatureCollection ",
+    )
+    features = payload.get("features")
+    if not isinstance(features, list):
+        raise DatasetReadError("GeoJSON FeatureCollection 的 features 必须是数组。")
+
+    records: list[dict[str, Any]] = []
+    null_geometry_count = 0
+    for feature_index, feature in enumerate(features, start=1):
+        if not isinstance(feature, dict) or feature.get("type") != "Feature":
+            raise DatasetReadError(
+                f"GeoJSON features 第 {feature_index} 项必须是 type 为 Feature 的对象。"
+            )
+        if "geometry" not in feature:
+            raise DatasetReadError(
+                f"GeoJSON 第 {feature_index} 个 Feature 缺少 geometry。"
+            )
+        if "properties" not in feature:
+            raise DatasetReadError(
+                f"GeoJSON 第 {feature_index} 个 Feature 缺少 properties。"
+            )
+        _reject_unmapped_geojson_nested_members(
+            feature,
+            {"properties", "geometry"},
+            f"GeoJSON 第 {feature_index} 个 Feature ",
+        )
+
+        record = _geojson_properties_to_record(
+            feature["properties"], feature_index
+        )
+        if "id" in feature:
+            record[f"{GEOJSON_TECHNICAL_PREFIX}feature_id"] = (
+                _normalize_geojson_feature_id(feature["id"], feature_index)
+            )
+
+        geometry = feature["geometry"]
+        if geometry is None:
+            null_geometry_count += 1
+            record.update(
+                {
+                    f"{GEOJSON_TECHNICAL_PREFIX}geometry_type": None,
+                    f"{GEOJSON_TECHNICAL_PREFIX}coordinate_count": None,
+                    f"{GEOJSON_TECHNICAL_PREFIX}coordinate_dimension": None,
+                    f"{GEOJSON_TECHNICAL_PREFIX}min_x": None,
+                    f"{GEOJSON_TECHNICAL_PREFIX}min_y": None,
+                    f"{GEOJSON_TECHNICAL_PREFIX}max_x": None,
+                    f"{GEOJSON_TECHNICAL_PREFIX}max_y": None,
+                }
+            )
+        else:
+            if not isinstance(geometry, dict):
+                raise DatasetReadError(
+                    f"GeoJSON 第 {feature_index} 个 Feature 的 geometry "
+                    "必须是对象或 null。"
+                )
+            summary = _summarize_geojson_geometry(geometry, feature_index)
+            record.update(
+                {
+                    f"{GEOJSON_TECHNICAL_PREFIX}geometry_type": geometry["type"],
+                    f"{GEOJSON_TECHNICAL_PREFIX}coordinate_count": summary.coordinate_count,
+                    f"{GEOJSON_TECHNICAL_PREFIX}coordinate_dimension": summary.coordinate_dimension,
+                    f"{GEOJSON_TECHNICAL_PREFIX}min_x": summary.min_x,
+                    f"{GEOJSON_TECHNICAL_PREFIX}min_y": summary.min_y,
+                    f"{GEOJSON_TECHNICAL_PREFIX}max_x": summary.max_x,
+                    f"{GEOJSON_TECHNICAL_PREFIX}max_y": summary.max_y,
+                }
+            )
+        records.append(record)
+
+    dataframe = _records_to_dataframe(records)
+    warnings = [
+        "检测到 GeoJSON FeatureCollection，已按每个 Feature 一行映射扁平 "
+        "properties 和空间摘要；坐标数组未展开。"
+    ]
+    if null_geometry_count:
+        warnings.append(
+            f"GeoJSON 中有 {null_geometry_count} 条 Feature 的 geometry 为 null，"
+            "其空间摘要留空。"
+        )
+    return dataframe, warnings
+
+
+def _tabular_payload_to_dataframe(
+    payload: Any,
+) -> tuple[pd.DataFrame, list[str], str]:
+    if isinstance(payload, dict) and payload.get("type") == "FeatureCollection":
+        dataframe, warnings = _geojson_feature_collection_to_dataframe(payload)
+        return dataframe, warnings, "geojson"
+
+    warnings: list[str] = []
+    kind = _classify_tabular_value(payload)
+    selected = payload
+
+    if isinstance(payload, dict) and kind != "record":
+        candidates = _find_wrapped_tabular_values(payload)
+        if len(candidates) > 1:
+            paths = _format_error_values(
+                [path for path, _, _ in candidates],
+                "$",
+            )
+            raise DatasetReadError(
+                f"JSON 接口包装中同时存在多个表格候选（示例：{paths}）。"
+                "无法安全判断应读取哪一个。"
+            )
+        if len(candidates) == 1:
+            selected_path, kind, selected = candidates[0]
+            warnings.append(
+                f"检测到 JSON 接口包装，已从路径 {selected_path} 提取表格记录。"
+            )
+
+    try:
+        if kind == "record":
+            return _records_to_dataframe([selected]), warnings, "records"
+        if kind in {"records", "empty"}:
+            return _records_to_dataframe(selected), warnings, "records"
+        if kind == "matrix":
+            warnings.append("检测到首行表头加二维数组的 JSON，已转换为表格。")
+            return _matrix_to_dataframe(selected), warnings, "matrix"
+    except DatasetReadError as error:
+        error.warnings = list(dict.fromkeys([*warnings, *error.warnings]))
+        raise
+
+    if isinstance(payload, list):
+        raise DatasetReadError(
+            "JSON 顶层列表中的每一项都必须是对象记录，"
+            "或每一项都必须是首行表头的二维数组行。"
+        )
     if isinstance(payload, dict):
-        if _contains_nested_value(payload):
-            raise DatasetReadError("JSON 包含嵌套对象或列表，第一版暂不支持自动展平。")
-        return pd.DataFrame([_normalize_record_unicode(payload)])
+        raise DatasetReadError(
+            "JSON 包含嵌套对象或列表，且未在常见接口包装"
+            "路径中找到唯一表格，当前不支持自动展平。"
+        )
+    raise DatasetReadError(
+        "JSON 顶层必须是记录列表、单条对象记录、"
+        "二维数组或可识别的接口包装。"
+    )
 
-    raise DatasetReadError("JSON 顶层必须是记录列表或单条对象记录。")
+
+def _read_json_lines_source(
+    open_binary: BinaryOpener,
+    encoding: str,
+    *,
+    max_records: int | None = None,
+    max_total_pairs: int | None = None,
+    max_total_array_items: int | None = None,
+) -> _JsonReadResult:
+    record_limit = max(
+        MAX_JSON_RECORDS if max_records is None else max_records,
+        0,
+    )
+    total_pair_limit = (
+        MAX_JSON_TOTAL_PAIRS
+        if max_total_pairs is None
+        else max_total_pairs
+    )
+    total_array_item_limit = (
+        MAX_JSON_TOTAL_ARRAY_ITEMS
+        if max_total_array_items is None
+        else max_total_array_items
+    )
+    records: list[dict[str, Any]] = []
+    seen_fields: dict[str, None] = {}
+    total_pairs = 0
+    total_array_items = 0
+    try:
+        with open_binary() as binary_file:
+            with io.TextIOWrapper(
+                binary_file, encoding=encoding, newline=""
+            ) as file:
+                for line_number, line in enumerate(file, start=1):
+                    if not line.strip(" \t\r\n"):
+                        continue
+                    line_prefix = f"JSON Lines 第 {line_number} 行"
+                    try:
+                        if len(records) >= record_limit:
+                            raise DatasetReadError(
+                                f"JSON Lines 包含超过 {record_limit} 条记录。"
+                            )
+                        pairs, array_items = _preflight_json_chunks(
+                            [line],
+                            max_records=max(record_limit - len(records), 0),
+                            max_total_pairs=max(total_pair_limit - total_pairs, 0),
+                            max_total_array_items=max(
+                                total_array_item_limit - total_array_items,
+                                0,
+                            ),
+                        )
+                        total_pairs += pairs
+                        total_array_items += array_items
+                        try:
+                            record = json.loads(line, **_json_load_kwargs())
+                        except json.JSONDecodeError as error:
+                            raise DatasetReadError(
+                                f"{line_prefix}格式错误：第 {error.colno} 列。"
+                            ) from error
+                        _validate_json_unicode_tree(record)
+                        if not isinstance(record, dict):
+                            raise DatasetReadError(
+                                f"{line_prefix}必须是单条对象记录。"
+                            )
+                        if _contains_nested_value(record):
+                            raise DatasetReadError(
+                                f"{line_prefix}包含嵌套对象或列表，"
+                                "当前不支持自动展平。"
+                            )
+                        normalized_record = _normalize_record_unicode(record)
+                    except DatasetReadError as error:
+                        if str(error).startswith(line_prefix):
+                            raise
+                        raise DatasetReadError(
+                            f"{line_prefix}无法读取：{error}",
+                            warnings=error.warnings,
+                        ) from error
+                    records.append(normalized_record)
+                    for field_name in normalized_record:
+                        seen_fields.setdefault(field_name, None)
+                    try:
+                        _check_json_table_size(len(records), len(seen_fields))
+                    except DatasetReadError as error:
+                        raise DatasetReadError(
+                            f"{line_prefix}无法读取：{error}",
+                            warnings=error.warnings,
+                        ) from error
+    except UnicodeDecodeError as error:
+        raise DatasetReadError("JSON Lines 在解析过程中发生解码错误。") from error
+    except (
+        BadZipFile,
+        NotImplementedError,
+        OSError,
+        RuntimeError,
+        zlib.error,
+    ) as error:
+        raise DatasetReadError(f"JSON Lines 文件无法读取：{error}") from error
+
+    return _JsonReadResult(
+        dataframe=_records_to_dataframe(records),
+        warnings=["检测到 JSON Lines / NDJSON，已按每个非空行一条记录读取。"],
+        structure_kind="records",
+        total_pairs=total_pairs,
+        total_array_items=total_array_items,
+    )
+
+
+def _read_json_lines(path: Path, encoding: str) -> tuple[pd.DataFrame, list[str]]:
+    result = _read_json_lines_source(_path_binary_opener(path), encoding)
+    return result.dataframe, result.warnings
+
+
+def _read_json_source(
+    open_binary: BinaryOpener,
+    suffix: str,
+    *,
+    allow_geojson: bool = True,
+    max_records: int | None = None,
+    max_total_pairs: int | None = None,
+    max_total_array_items: int | None = None,
+) -> _JsonReadResult:
+    """从可重复打开的二进制流读取一个 JSON 文档或 JSON Lines 分片。"""
+
+    warnings: list[str] = []
+    try:
+        encoding, encoding_warnings = _detect_json_encoding_source(open_binary)
+        warnings.extend(encoding_warnings)
+        if suffix.lower() in {".jsonl", ".ndjson"}:
+            result = _read_json_lines_source(
+                open_binary,
+                encoding,
+                max_records=max_records,
+                max_total_pairs=max_total_pairs,
+                max_total_array_items=max_total_array_items,
+            )
+            result.warnings = [*warnings, *result.warnings]
+            return result
+
+        total_pairs, total_array_items = _preflight_json_source(
+            open_binary,
+            encoding,
+            max_records=max_records,
+            max_total_pairs=max_total_pairs,
+            max_total_array_items=max_total_array_items,
+        )
+        payload, repaired_outer_wrapper = _load_json_document_source(
+            open_binary, encoding
+        )
+        if repaired_outer_wrapper:
+            warnings.append(
+                "原文件不是标准 JSON；已仅移除整体 `{[...]}` 外层的一对花括号。"
+            )
+        _validate_json_unicode_tree(payload)
+        is_feature_collection = (
+            isinstance(payload, dict)
+            and payload.get("type") == "FeatureCollection"
+        )
+        if is_feature_collection and not allow_geojson:
+            raise DatasetReadError(
+                "ZIP JSON 分片当前不支持 GeoJSON FeatureCollection；"
+                "请将其作为单个 .geojson 文件评估。"
+            )
+        if (
+            suffix.lower() == ".geojson"
+            and not is_feature_collection
+        ):
+            raise DatasetReadError(
+                "GeoJSON 文件必须是顶层 type 为 FeatureCollection 的对象。"
+            )
+        dataframe, shape_warnings, structure_kind = (
+            _tabular_payload_to_dataframe(payload)
+        )
+        warnings.extend(shape_warnings)
+        record_limit = max(
+            MAX_JSON_RECORDS if max_records is None else max_records,
+            0,
+        )
+        if len(dataframe) > record_limit:
+            raise DatasetReadError(
+                f"JSON 包含 {len(dataframe)} 条记录，超过"
+                f"当前可用的 {record_limit} 条记录预算。"
+            )
+        return _JsonReadResult(
+            dataframe=dataframe,
+            warnings=warnings,
+            structure_kind=structure_kind,
+            total_pairs=total_pairs,
+            total_array_items=total_array_items,
+        )
+    except DatasetReadError as error:
+        error.warnings = list(dict.fromkeys([*warnings, *error.warnings]))
+        raise
+    except RecursionError as error:
+        raise DatasetReadError("JSON 嵌套层级过深，无法安全解析。") from error
+    except (
+        BadZipFile,
+        NotImplementedError,
+        OSError,
+        RuntimeError,
+        zlib.error,
+    ) as error:
+        raise DatasetReadError(f"JSON 内容无法读取：{error}") from error
+    except ValueError as error:
+        raise DatasetReadError(f"JSON 内容无法读取：{error}") from error
+
+
+def _read_json(path: Path) -> tuple[pd.DataFrame, list[str]]:
+    """读取严格 JSON、常见表格型包装或 JSON Lines。"""
+
+    result = _read_json_source(_path_binary_opener(path), path.suffix.lower())
+    return result.dataframe, result.warnings
+
+
+def _zip_entry_binary_opener(archive: ZipFile, entry: ZipInfo) -> BinaryOpener:
+    return lambda: archive.open(entry, mode="r")
+
+
+def _display_zip_member_name(entry: ZipInfo) -> str:
+    display_name, _ = normalize_display_text(entry.filename)
+    return display_name
+
+
+def _format_zip_warning(message: str, members: list[str]) -> str:
+    examples = "、".join(members[:3])
+    if len(members) > 3:
+        examples = f"{examples} 等"
+    return f"ZIP 中 {len(members)} 个分片（{examples}）：{message}"
+
+
+def _format_field_difference(expected: set[str], actual: set[str]) -> str:
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    details: list[str] = []
+    if missing:
+        details.append(f"缺少字段：{_format_error_values(missing, '（空字段名）')}")
+    if extra:
+        details.append(f"新增字段：{_format_error_values(extra, '（空字段名）')}")
+    return "；".join(details)
+
+
+def _read_json_zip(path: Path) -> tuple[pd.DataFrame, list[str]]:
+    """直接从 ZIP 流读取同构 JSON 分片，不按成员路径解压落地。"""
+
+    try:
+        archive = ZipFile(path)
+    except (BadZipFile, LargeZipFile, OSError) as error:
+        raise DatasetReadError(f"ZIP 文件无法打开：{error}") from error
+
+    with archive:
+        shard_entries = validate_json_zip_archive(archive)
+        dataframes: list[pd.DataFrame] = []
+        expected_kind: str | None = None
+        expected_columns: list[str] = []
+        expected_fields: set[str] = set()
+        first_member = ""
+        total_rows = 0
+        total_pairs = 0
+        total_array_items = 0
+        warning_members: dict[str, list[str]] = {}
+
+        def current_warnings() -> list[str]:
+            return [
+                _format_zip_warning(message, members)
+                for message, members in warning_members.items()
+            ]
+
+        for entry in shard_entries:
+            member_name = _display_zip_member_name(entry)
+            remaining_records = max(MAX_JSON_RECORDS - total_rows, 0)
+            if expected_columns:
+                used_cells = total_rows * len(expected_columns)
+                remaining_cell_rows = max(
+                    (MAX_DATASET_CELLS - used_cells) // len(expected_columns),
+                    0,
+                )
+                remaining_records = min(
+                    remaining_records,
+                    remaining_cell_rows,
+                )
+            try:
+                result = _read_json_source(
+                    _zip_entry_binary_opener(archive, entry),
+                    Path(entry.filename).suffix.lower(),
+                    allow_geojson=False,
+                    max_records=remaining_records,
+                    max_total_pairs=max(MAX_JSON_TOTAL_PAIRS - total_pairs, 0),
+                    max_total_array_items=max(
+                        MAX_JSON_TOTAL_ARRAY_ITEMS - total_array_items,
+                        0,
+                    ),
+                )
+                for warning in result.warnings:
+                    warning_members.setdefault(warning, []).append(member_name)
+                validate_dataframe_limits(result.dataframe)
+            except ResourceLimitExceeded as error:
+                raise DatasetReadError(
+                    f"ZIP 分片“{member_name}”超出资源上限：{error}",
+                    warnings=current_warnings(),
+                ) from error
+            except DatasetReadError as error:
+                raise DatasetReadError(
+                    f"ZIP 分片“{member_name}”读取失败：{error}",
+                    warnings=[*current_warnings(), *error.warnings],
+                ) from error
+
+            columns = [str(column) for column in result.dataframe.columns]
+            if not columns:
+                raise DatasetReadError(
+                    f"ZIP 分片“{member_name}”没有可校验的表头或字段集合。",
+                    warnings=current_warnings(),
+                )
+            actual_fields = set(columns)
+            if expected_kind is None:
+                expected_kind = result.structure_kind
+                expected_columns = columns
+                expected_fields = actual_fields
+                first_member = member_name
+            elif result.structure_kind != expected_kind:
+                raise DatasetReadError(
+                    f"ZIP 分片“{member_name}”的结构类型为 "
+                    f"{result.structure_kind}，与首个分片“{first_member}”的 "
+                    f"{expected_kind} 不一致。",
+                    warnings=current_warnings(),
+                )
+            elif expected_kind == "matrix" and columns != expected_columns:
+                raise DatasetReadError(
+                    f"ZIP 分片“{member_name}”的二维数组表头或字段顺序"
+                    f"与首个分片“{first_member}”不一致。",
+                    warnings=current_warnings(),
+                )
+            elif expected_kind == "records" and actual_fields != expected_fields:
+                difference = _format_field_difference(
+                    expected_fields, actual_fields
+                )
+                raise DatasetReadError(
+                    f"ZIP 分片“{member_name}”的对象字段集合与首个分片"
+                    f"“{first_member}”不一致（{difference}）。",
+                    warnings=current_warnings(),
+                )
+
+            total_rows += len(result.dataframe)
+            total_pairs += result.total_pairs
+            total_array_items += result.total_array_items
+            _check_json_table_size(total_rows, len(expected_columns))
+            if total_pairs > MAX_JSON_TOTAL_PAIRS:
+                raise DatasetReadError(
+                    f"ZIP 内全部 JSON 分片合计超过 "
+                    f"{MAX_JSON_TOTAL_PAIRS} 个键值对。",
+                    warnings=current_warnings(),
+                )
+            if total_array_items > MAX_JSON_TOTAL_ARRAY_ITEMS:
+                raise DatasetReadError(
+                    f"ZIP 内全部 JSON 分片合计超过 "
+                    f"{MAX_JSON_TOTAL_ARRAY_ITEMS} 个数组项。",
+                    warnings=current_warnings(),
+                )
+
+            result.dataframe.columns = columns
+            if result.structure_kind == "records":
+                result.dataframe = result.dataframe.reindex(columns=expected_columns)
+            dataframes.append(result.dataframe)
+
+    dataframe = pd.concat(dataframes, ignore_index=True, copy=False)
+    warnings = [
+        f"检测到 ZIP JSON 分片包，已直接从压缩流读取并合并 "
+        f"{len(dataframes)} 个分片、{len(dataframe)} 条记录；"
+        "未按包内成员路径解压落地。",
+        *current_warnings(),
+    ]
+    return dataframe, warnings
 
 
 def parse_dataset(
@@ -549,7 +1657,7 @@ def parse_dataset(
     dataset_name: str | None = None,
     sheet_name: str | None = None,
 ) -> ParsedDataset:
-    """将 v0.1 支持的文件解析为统一表格型数据对象。"""
+    """将当前版本支持的文件解析为统一表格型数据对象。"""
 
     path = Path(file_path)
     warnings: list[str] = []
@@ -594,13 +1702,18 @@ def parse_dataset(
         if extension == ".csv":
             dataframe, read_warnings = _read_csv(path)
             warnings.extend(read_warnings)
-        elif extension == ".xlsx":
-            validate_xlsx_archive(path)
+        elif extension in {".xls", ".xlsx"}:
+            if extension == ".xlsx":
+                validate_xlsx_archive(path)
             dataframe, resolved_sheet_name = _read_excel(
                 path, normalized_sheet_name
             )
+        elif extension == ".zip":
+            dataframe, read_warnings = _read_json_zip(path)
+            warnings.extend(read_warnings)
         else:
-            dataframe = _read_json(path)
+            dataframe, read_warnings = _read_json(path)
+            warnings.extend(read_warnings)
         validate_dataframe_limits(dataframe)
     except ResourceLimitExceeded as error:
         raise DatasetReadError(str(error), warnings=warnings) from error

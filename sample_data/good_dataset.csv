@@ -1,0 +1,6 @@
+record_id,service_name,department,update_time,source_url,version,handling_days
+1,社会保险缴费查询,人力资源和社会保障局,2026-06-01,https://example.gov.cn/service/1,v1.0,1
+2,公积金账户查询,住房和城乡建设局,2026-06-03,https://example.gov.cn/service/2,v1.0,1
+3,营业执照办理,市场监督管理局,2026-06-05,https://example.gov.cn/service/3,v1.1,3
+4,户籍迁移办理,公安局,2026-06-07,https://example.gov.cn/service/4,v1.0,5
+5,不动产登记查询,自然资源局,2026-06-10,https://example.gov.cn/service/5,v1.2,2

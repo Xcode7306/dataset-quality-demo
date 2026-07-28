@@ -1,0 +1,5 @@
+record_id,service_name,department,update_time,source_url,version,handling_days
+1,事项A,部门A,2026-06-01,https://example.gov.cn/a,v1.0,3
+2,事项B,部门B,日期待确认,网址待补充,v2.0,三个工作日
+3,事项C,部门C,2026/06/03,https://example.gov.cn/c,v3.0,5
+4,事项D,部门D,2026-06-04,https://example.gov.cn/d,v4.0,7

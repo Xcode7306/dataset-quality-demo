@@ -124,7 +124,7 @@ def profile_dataframe(dataframe: pd.DataFrame, sample_size: int = 3) -> dict[str
                     round(missing_count / len(series), 6) if len(series) else None
                 ),
                 "inferred_type": inferred_type,
-                # 保留原有字段，避免破坏展示层和 report.json 结构；
+                # 保留原有字段，避免破坏展示层和结构化报告对象；
                 # 空列表明确表示不导出原始样例。
                 "non_null_samples": [],
             }

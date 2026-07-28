@@ -15,6 +15,7 @@ from src.presentation import (
     build_profile_rows,
     build_risk_chart_rows,
     build_summary,
+    serialize_markdown_report,
     serialize_report,
 )
 from src.resource_limits import MAX_INPUT_FILE_MIB
@@ -154,9 +155,19 @@ with st.sidebar:
     st.header("开始评估")
     uploaded_file = st.file_uploader(
         "选择数据文件",
-        type=["csv", "xlsx", "json"],
+        type=[
+            "csv",
+            "xls",
+            "xlsx",
+            "json",
+            "jsonl",
+            "ndjson",
+            "geojson",
+            "zip",
+        ],
         help=(
-            "支持 CSV、Excel（.xlsx）和扁平记录型 JSON；"
+            "支持 CSV、Excel（.xls、.xlsx）、表格型 JSON "
+            "、JSONL / NDJSON、GeoJSON FeatureCollection 以及同构 JSON 分片 ZIP；"
             f"单文件上限 {MAX_INPUT_FILE_MIB} MiB。"
         ),
     )
@@ -170,7 +181,10 @@ with st.sidebar:
         help="更新滞后天数以此日期为基准；固定该日期可复现同一份报告。",
     )
     sheet_name = ""
-    if uploaded_file and Path(uploaded_file.name).suffix.lower() == ".xlsx":
+    if (
+        uploaded_file
+        and Path(uploaded_file.name).suffix.lower() in {".xls", ".xlsx"}
+    ):
         sheet_name = st.text_input(
             "工作表名称（可选）",
             placeholder="默认读取第一个工作表",
@@ -211,7 +225,7 @@ if run_evaluation and uploaded_file is not None:
 
 report = st.session_state.get("quality_report")
 if report is None:
-    st.info("请从左侧上传 CSV、Excel 或扁平 JSON 文件，然后运行评估。")
+    st.info("请从左侧上传 CSV、Excel、JSON、JSONL文件")
 else:
     dataset = report.dataset
     title = dataset.name
@@ -234,20 +248,30 @@ else:
     with execution_tab:
         _render_execution(report)
 
-    download_file_name = sanitize_file_name(
+    json_download_file_name = sanitize_file_name(
         f"{dataset.name}_quality_report.json",
         default_name="quality_report.json",
         safe_extension=".json",
     )
+    markdown_download_file_name = sanitize_file_name(
+        f"{dataset.name}_quality_report.md",
+        default_name="quality_report.md",
+        safe_extension=".md",
+    )
     st.download_button(
-        "下载 report.json",
+        "下载结构化报告（JSON）",
         data=serialize_report(report),
-        file_name=download_file_name,
+        file_name=json_download_file_name,
         mime="application/json",
         type="primary",
     )
+    st.download_button(
+        "下载评估报告（Markdown）",
+        data=serialize_markdown_report(report),
+        file_name=markdown_download_file_name,
+        mime="text/markdown",
+    )
     st.caption(
-        "下载报告不包含原始字段样例。"
-        "未来 AI 解读层只读取该结构化报告，"
-        "不参与指标计算或风险判定。"
+        "JSON 报告用于系统对接，Markdown 报告适合直接阅读；"
+        "两种下载都不包含原始字段样例。"
     )

@@ -60,7 +60,7 @@ class NotAssessableItem:
 
 @dataclass
 class QualityReport:
-    """对应输入输出协议中 report.json 的顶层结构。"""
+    """评估过程使用的结构化报告对象；Markdown 由其生成。"""
 
     dataset: DatasetInfo
     status: EvaluationStatus = "success"
@@ -74,6 +74,6 @@ class QualityReport:
     )
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为可直接写入 report.json 的普通字典。"""
+        """转换为供内部处理或扩展使用的普通字典。"""
 
         return asdict(self)
