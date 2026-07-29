@@ -800,13 +800,13 @@
     }
   ],
   "evaluation_context": {
-    "engine_version": "0.3",
+    "engine_version": "0.4",
     "reference_date": "2026-07-17",
     "threshold_config_version": "0.3",
     "parser_path": "csv",
     "input_sha256": "c4ba32aa5588e3f8ce935c8d4397ed66b0b49b944a0ebfb9e3dcc0ef4ea6de43",
     "input_size_bytes": 333,
-    "report_sha256": "4bf20ce0043ef6783ca6b983c56a40eb891ca393070ee80cc707dedc8b2677ae"
+    "report_sha256": "7f95e417a69d2853e5748d9c57f2f6fd53410fad6428924ab9007250470e9a3f"
   },
   "execution": {
     "warnings": [],

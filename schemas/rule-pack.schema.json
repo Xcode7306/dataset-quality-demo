@@ -1,0 +1,492 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rule-pack.schema.json",
+  "title": "RulePack v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "rule_pack_id",
+    "name",
+    "version",
+    "status",
+    "base_report_sha256",
+    "base_input_sha256",
+    "reference_date",
+    "source",
+    "field_semantics",
+    "rules",
+    "approval"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1"
+    },
+    "rule_pack_id": {
+      "type": "string",
+      "pattern": "^rulepack-[0-9a-f]{20}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
+    },
+    "status": {
+      "enum": [
+        "draft",
+        "approved"
+      ]
+    },
+    "base_report_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "base_input_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "reference_date": {
+      "type": "string",
+      "format": "date"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "field_semantics": {
+      "$ref": "#/$defs/fieldSemantics"
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    },
+    "approval": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/approval"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "draft"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "approval": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "approval": {
+            "$ref": "#/$defs/approval"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "generator",
+        "generated_at"
+      ],
+      "properties": {
+        "type": {
+          "const": "local_guided"
+        },
+        "generator": {
+          "const": "quality-rule-agent-v0.4"
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        }
+      }
+    },
+    "fieldName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "fieldSemantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primary_key_fields",
+        "required_fields",
+        "update_time_field",
+        "categorical_fields",
+        "numeric_fields"
+      ],
+      "properties": {
+        "primary_key_fields": {
+          "type": "array",
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/fieldName"
+          }
+        },
+        "required_fields": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/fieldName"
+          }
+        },
+        "update_time_field": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/fieldName"
+            }
+          ]
+        },
+        "categorical_fields": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/fieldName"
+          }
+        },
+        "numeric_fields": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/fieldName"
+          }
+        }
+      }
+    },
+    "jsonScalar": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        {
+          "type": "number",
+          "minimum": -1e308,
+          "maximum": 1e308
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "rule_id",
+        "fields",
+        "frequency",
+        "max_age_days",
+        "allowed_values",
+        "minimum",
+        "maximum"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "primary_key",
+            "required",
+            "update_freshness",
+            "allowed_values",
+            "numeric_range"
+          ]
+        },
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/fieldName"
+          }
+        },
+        "frequency": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_age_days": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "allowed_values": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/jsonScalar"
+          }
+        },
+        "minimum": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1e308,
+          "maximum": 1e308
+        },
+        "maximum": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1e308,
+          "maximum": 1e308
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "primary_key",
+                  "required"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "frequency": {
+                "type": "null"
+              },
+              "max_age_days": {
+                "type": "null"
+              },
+              "allowed_values": {
+                "maxItems": 0
+              },
+              "minimum": {
+                "type": "null"
+              },
+              "maximum": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "required",
+                  "update_freshness",
+                  "allowed_values",
+                  "numeric_range"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "fields": {
+                "maxItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "update_freshness"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "frequency": {
+                "enum": [
+                  "daily",
+                  "weekly",
+                  "monthly",
+                  "quarterly",
+                  "yearly",
+                  "custom"
+                ]
+              },
+              "max_age_days": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3660
+              },
+              "allowed_values": {
+                "maxItems": 0
+              },
+              "minimum": {
+                "type": "null"
+              },
+              "maximum": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "allowed_values"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "frequency": {
+                "type": "null"
+              },
+              "max_age_days": {
+                "type": "null"
+              },
+              "allowed_values": {
+                "minItems": 1
+              },
+              "minimum": {
+                "type": "null"
+              },
+              "maximum": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "numeric_range"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "frequency": {
+                "type": "null"
+              },
+              "max_age_days": {
+                "type": "null"
+              },
+              "allowed_values": {
+                "maxItems": 0
+              }
+            },
+            "anyOf": [
+              {
+                "properties": {
+                  "minimum": {
+                    "type": "number"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "maximum": {
+                    "type": "number"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "approver",
+        "approved_at",
+        "draft_sha256",
+        "base_report_sha256",
+        "base_input_sha256",
+        "reference_date",
+        "statement",
+        "identity_verified"
+      ],
+      "properties": {
+        "approval_id": {
+          "type": "string",
+          "pattern": "^approval-[0-9a-f]{20}$"
+        },
+        "approver": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "approved_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "draft_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "base_report_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "base_input_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reference_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "identity_verified": {
+          "const": false
+        }
+      }
+    }
+  }
+}
