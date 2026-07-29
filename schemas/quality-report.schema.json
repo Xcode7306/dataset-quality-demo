@@ -312,7 +312,10 @@
       ],
       "properties": {
         "engine_version": {
-          "const": "0.3"
+          "enum": [
+            "0.3",
+            "0.4"
+          ]
         },
         "reference_date": {
           "type": [

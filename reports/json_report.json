@@ -330,13 +330,13 @@
     }
   ],
   "evaluation_context": {
-    "engine_version": "0.3",
+    "engine_version": "0.4",
     "reference_date": "2026-07-17",
     "threshold_config_version": "0.3",
     "parser_path": "json",
     "input_sha256": "9c52b88b9041a00621c3856e8b538b61778a705495597cfea260eafd1df71ec4",
     "input_size_bytes": 336,
-    "report_sha256": "9bc4f38eab734af0a855e1d22cc75049ccb7c941e7f8bc919a79c2d43b2ced91"
+    "report_sha256": "b3d8c003c61193e8231438604f1f1d96ab07448d5796603f2cd6ae75264581e4"
   },
   "execution": {
     "warnings": [],

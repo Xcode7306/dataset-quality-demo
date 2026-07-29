@@ -36,6 +36,12 @@ ISSUE_TYPE_LABELS = {
     "missing_source_info": "来源信息缺失",
     "missing_version_info": "版本信息缺失",
     "statistical_outlier": "统计异常值",
+    "rule_primary_key_missing": "主键缺失",
+    "rule_primary_key_duplicate": "主键重复",
+    "rule_required_missing": "必填字段缺失",
+    "rule_update_time_missing_or_invalid": "更新时间缺失或不可解析",
+    "rule_allowed_value_violation": "不在允许值范围",
+    "rule_numeric_range_violation": "超出数值范围",
 }
 
 
@@ -225,6 +231,10 @@ def _markdown_table(headers: list[str], rows: list[list[object]]) -> list[str]:
 
 
 def _status_summary(report: QualityReport, summary: dict[str, int]) -> str:
+    has_rule_metrics = any(
+        metric.id.startswith(("rule_", "business_"))
+        for metric in report.metrics
+    )
     if report.status == "failed":
         return "文件未能成功解析，以下结果仅说明失败原因和无法评估的项目。"
     if summary["warning_count"]:
@@ -237,6 +247,8 @@ def _status_summary(report: QualityReport, summary: dict[str, int]) -> str:
             f"评估完成，发现 {summary['attention_count']} 项需要关注的现象，"
             "建议结合业务规则复核。"
         )
+    if has_rule_metrics:
+        return "规则增强评估完成，零配置规则与已审批业务规则均未发现警告或需要关注的现象。"
     return "评估完成，当前默认规则未发现警告或需要关注的现象。"
 
 
@@ -289,7 +301,15 @@ def render_markdown_report(report: QualityReport) -> str:
     ]
 
     if not report.risks:
-        lines.append("当前默认阈值下没有生成风险提示。")
+        has_rule_metrics = any(
+            metric.id.startswith(("rule_", "business_"))
+            for metric in report.metrics
+        )
+        lines.append(
+            "当前默认阈值和已审批业务规则下没有生成风险提示。"
+            if has_rule_metrics
+            else "当前默认阈值下没有生成风险提示。"
+        )
     else:
         for level in ("warning", "attention", "info"):
             risks = [risk for risk in report.risks if risk.level == level]

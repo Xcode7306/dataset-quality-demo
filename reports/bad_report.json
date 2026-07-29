@@ -1124,13 +1124,13 @@
     }
   ],
   "evaluation_context": {
-    "engine_version": "0.3",
+    "engine_version": "0.4",
     "reference_date": "2026-07-17",
     "threshold_config_version": "0.3",
     "parser_path": "csv",
     "input_sha256": "683571252ca325f104a1fdaf85bc5a1972864e5c8ecc68b8ef21861eed14c350",
     "input_size_bytes": 522,
-    "report_sha256": "75b5332df5abc9487a861915fa0567596b10a0f0171892fd8df19fbd97fe83bb"
+    "report_sha256": "9bf28c8bb4ca12038d0931ddcbe7c89db4d9538cebc554e147eac98a1c1e349d"
   },
   "execution": {
     "warnings": [],

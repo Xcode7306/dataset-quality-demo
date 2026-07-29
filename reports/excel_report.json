@@ -623,13 +623,13 @@
   "risks": [],
   "not_assessable": [],
   "evaluation_context": {
-    "engine_version": "0.3",
+    "engine_version": "0.4",
     "reference_date": "2026-07-17",
     "threshold_config_version": "0.3",
     "parser_path": "excel:xlsx",
     "input_sha256": "64f2737184155304e9c9fa4aed8a9308cade7b470bb187d783194b58a4a49781",
     "input_size_bytes": 6496,
-    "report_sha256": "f19281d4fff21ace2152bc8662a2f2eb04f9435b7ecf74607e8229bc4dc6b89c"
+    "report_sha256": "2367d90d8cfe506893d0a9e2b5d893e3f3dc86a8bfe189a1eedc6a68da94de05"
   },
   "execution": {
     "warnings": [],

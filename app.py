@@ -1,6 +1,8 @@
 """政务数据集质量评估的 Streamlit 网页入口。"""
 
 import hashlib
+import json
+import math
 import os
 from datetime import date
 from pathlib import Path
@@ -23,15 +25,56 @@ from src.presentation import (
     serialize_report,
 )
 from src.resource_limits import MAX_INPUT_FILE_MIB
+from src.rule_engine import RulePackExecutionError
+from src.rule_pack import (
+    Rule,
+    MAX_RULE_NUMBER_ABS,
+    RulePackValidationError,
+    approve_rule_pack,
+    build_rule_guidance,
+    build_rule_pack,
+    draft_sha256,
+    validate_rule_pack,
+)
+from src.rule_service import (
+    evaluate_uploaded_dataset_with_rule_pack,
+    serialize_rule_evaluation_result,
+    serialize_rule_issue_locations_csv,
+)
 from src.upload_service import evaluate_uploaded_dataset, sanitize_file_name
 
 
 AGENT_STATE_KEY = "agent_ui_state"
+RULE_STATE_KEY = "rule_ui_state"
 AGENT_HISTORY_LIMIT = 8
 AGENT_PRIORITY_LABELS = {
     "high": "高",
     "medium": "中",
     "low": "低",
+}
+RULE_WIDGET_KEYS = (
+    "rule_pack_name",
+    "rule_pack_version",
+    "rule_primary_key_fields",
+    "rule_required_fields",
+    "rule_update_time_field",
+    "rule_update_frequency",
+    "rule_update_custom_days",
+    "rule_allowed_values_field",
+    "rule_allowed_values_json",
+    "rule_numeric_range_field",
+    "rule_numeric_minimum",
+    "rule_numeric_maximum",
+    "rule_approver",
+    "rule_approval_confirmed",
+)
+RULE_FREQUENCIES = {
+    "每日（1 天）": ("daily", 1),
+    "每周（7 天）": ("weekly", 7),
+    "每月（31 天）": ("monthly", 31),
+    "每季度（92 天）": ("quarterly", 92),
+    "每年（366 天）": ("yearly", 366),
+    "自定义天数": ("custom", None),
 }
 
 
@@ -46,6 +89,14 @@ def _clear_agent_state() -> None:
     """清除只属于当前确定性报告的 Agent 结果与问答记录。"""
 
     st.session_state.pop(AGENT_STATE_KEY, None)
+
+
+def _clear_rule_state() -> None:
+    """清除当前报告的规则草案、审批、增强结果及表单缓存。"""
+
+    st.session_state.pop(RULE_STATE_KEY, None)
+    for key in RULE_WIDGET_KEYS:
+        st.session_state.pop(key, None)
 
 
 def _escape_markdown(value: object) -> str:
@@ -80,6 +131,52 @@ def _agent_state_for(report: QualityReport) -> dict:
         }
         st.session_state[AGENT_STATE_KEY] = state
     return state
+
+
+def _rule_state_for(report: QualityReport) -> dict:
+    """返回绑定当前零配置报告的 RulePack 页面状态。"""
+
+    report_sha256 = _report_sha256(report)
+    state = st.session_state.get(RULE_STATE_KEY)
+    if not isinstance(state, dict) or state.get("report_sha256") != report_sha256:
+        state = {
+            "report_sha256": report_sha256,
+            "guidance_started": False,
+            "draft": None,
+            "draft_signature": None,
+            "confirmed_draft_sha256": None,
+            "approved_pack": None,
+            "result": None,
+            "execution_error": None,
+        }
+        st.session_state[RULE_STATE_KEY] = state
+    return state
+
+
+def _clear_rule_approval_widgets() -> None:
+    """在新草案出现前清除只适用于上一草案的人工确认。"""
+
+    st.session_state.pop("rule_approver", None)
+    st.session_state.pop("rule_approval_confirmed", None)
+
+
+def _bind_rule_confirmation() -> None:
+    """把一次真实 checkbox 变更绑定到当前草案哈希。"""
+
+    state = st.session_state.get(RULE_STATE_KEY)
+    if not isinstance(state, dict):
+        return
+    draft = state.get("draft")
+    confirmed = bool(st.session_state.get("rule_approval_confirmed"))
+    confirmed_hash = (
+        draft_sha256(draft)
+        if confirmed and draft is not None
+        else None
+    )
+    st.session_state[RULE_STATE_KEY] = {
+        **state,
+        "confirmed_draft_sha256": confirmed_hash,
+    }
 
 
 def _citation_caption(
@@ -301,6 +398,670 @@ def _render_agent(report: QualityReport) -> None:
     _render_agent_analysis(latest_analysis)
 
 
+def _rule_form_signature(payload: dict) -> str:
+    """稳定标识当前规则问答；任一答案变化都会使旧审批失效。"""
+
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _rule_id(rule_type: str, fields: list[str]) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            [rule_type, *fields],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8", errors="strict")
+    ).hexdigest()[:12]
+    return f"{rule_type}-{digest}"
+
+
+def _parse_allowed_values(value: str) -> tuple[object, ...]:
+    """严格解析本地 JSON 数组，不接受 NaN/Infinity 等扩展常量。"""
+
+    try:
+        parsed = json.loads(
+            value,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"不允许 {constant}")
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise RulePackValidationError(
+            ("允许值必须是合法 JSON 数组。",)
+        ) from error
+    if not isinstance(parsed, list):
+        raise RulePackValidationError(("允许值必须使用 JSON 数组。",))
+    return tuple(parsed)
+
+
+def _parse_optional_number(value: str, label: str) -> int | float | None:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(
+            text,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"不允许 {constant}")
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise RulePackValidationError(
+            (f"{label}必须是合法 JSON 数字。",)
+        ) from error
+    if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+        raise RulePackValidationError((f"{label}必须是有限数字。",))
+    if isinstance(parsed, int):
+        if abs(parsed) > MAX_RULE_NUMBER_ABS:
+            raise RulePackValidationError(
+                (f"{label}绝对值不能超过 1e308。",)
+            )
+    elif (
+        not math.isfinite(parsed)
+        or abs(parsed) > MAX_RULE_NUMBER_ABS
+    ):
+        raise RulePackValidationError(
+            (f"{label}必须是绝对值不超过 1e308 的有限数字。",)
+        )
+    return parsed
+
+
+def _rule_form_rules(
+    *,
+    primary_key_fields: list[str],
+    required_fields: list[str],
+    update_time_field: str | None,
+    frequency_label: str,
+    custom_days: int,
+    allowed_values_field: str | None,
+    allowed_values_json: str,
+    numeric_range_field: str | None,
+    numeric_minimum_text: str,
+    numeric_maximum_text: str,
+) -> tuple[Rule, ...]:
+    """把已经由用户回答的本地表单转换为严格白名单规则。"""
+
+    rules: list[Rule] = []
+    if primary_key_fields:
+        rules.append(
+            Rule(
+                type="primary_key",
+                rule_id=_rule_id("primary_key", primary_key_fields),
+                fields=tuple(primary_key_fields),
+            )
+        )
+    for field in required_fields:
+        rules.append(
+            Rule(
+                type="required",
+                rule_id=_rule_id("required", [field]),
+                fields=(field,),
+            )
+        )
+    if update_time_field is not None:
+        frequency, default_days = RULE_FREQUENCIES[frequency_label]
+        rules.append(
+            Rule(
+                type="update_freshness",
+                rule_id=_rule_id(
+                    "update_freshness",
+                    [update_time_field],
+                ),
+                fields=(update_time_field,),
+                frequency=frequency,
+                max_age_days=(
+                    int(custom_days)
+                    if default_days is None
+                    else int(default_days)
+                ),
+            )
+        )
+    if allowed_values_field is not None:
+        rules.append(
+            Rule(
+                type="allowed_values",
+                rule_id=_rule_id(
+                    "allowed_values",
+                    [allowed_values_field],
+                ),
+                fields=(allowed_values_field,),
+                allowed_values=_parse_allowed_values(
+                    allowed_values_json
+                ),
+            )
+        )
+    if numeric_range_field is not None:
+        rules.append(
+            Rule(
+                type="numeric_range",
+                rule_id=_rule_id(
+                    "numeric_range",
+                    [numeric_range_field],
+                ),
+                fields=(numeric_range_field,),
+                minimum=_parse_optional_number(
+                    numeric_minimum_text,
+                    "数值下限",
+                ),
+                maximum=_parse_optional_number(
+                    numeric_maximum_text,
+                    "数值上限",
+                ),
+            )
+        )
+    if not rules:
+        raise RulePackValidationError(
+            ("请至少确认一条主键、必填、更新时间、允许值或数值范围规则。",)
+        )
+    return tuple(rules)
+
+
+def _render_rule_result(result) -> None:
+    """展示本次零配置与规则增强差异，不推断跨历史改善或恶化。"""
+
+    baseline_summary = build_summary(result.baseline_report)
+    enhanced_summary = build_summary(result.enhanced_report)
+    st.success("已审批 RulePack 已由确定性 Python 引擎重新评估。")
+    st.caption(
+        "下表只说明本次新增业务规则结果；不表示跨版本的改善或恶化。"
+    )
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "结果层": "零配置基线",
+                    "指标结果数": len(result.baseline_report.metrics),
+                    "风险提示数": baseline_summary["risk_count"],
+                    "无法评估项": baseline_summary["not_assessable_count"],
+                },
+                {
+                    "结果层": "规则增强",
+                    "指标结果数": len(result.enhanced_report.metrics),
+                    "风险提示数": enhanced_summary["risk_count"],
+                    "无法评估项": enhanced_summary["not_assessable_count"],
+                },
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+    added_keys = set(result.diff.added_metric_keys)
+    added_metrics = [
+        metric
+        for metric in result.enhanced_report.metrics
+        if metric.metric_key in added_keys
+    ]
+    st.markdown("#### 新增业务规则指标")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "指标名称": metric.name,
+                    "字段名称": metric.field or "—",
+                    "状态": (
+                        "已评估"
+                        if metric.status == "evaluated"
+                        else "无法评估"
+                    ),
+                    "结果": (
+                        f"{float(metric.value):.2%}"
+                        if metric.value is not None
+                        and metric.unit == "ratio"
+                        else "—"
+                    ),
+                    "原因": metric.reason or "—",
+                }
+                for metric in added_metrics
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+    added_risk_ids = set(result.diff.added_risk_ids)
+    added_risks = [
+        risk
+        for risk in result.enhanced_report.risks
+        if risk.id in added_risk_ids
+    ]
+    st.markdown("#### 新增业务规则风险")
+    if not added_risks:
+        st.info("已审批业务规则没有新增风险提示。")
+    for risk in added_risks:
+        st.text(f"{RISK_LEVEL_LABELS[risk.level]} · {risk.title}")
+        st.text(risk.message)
+
+    approval = result.approved_rule_pack.approval
+    with st.expander("查看规则来源与审批记录"):
+        st.json(
+            {
+                "rule_pack_id": result.approved_rule_pack.rule_pack_id,
+                "rule_pack_version": result.approved_rule_pack.version,
+                "base_report_sha256": (
+                    result.approved_rule_pack.base_report_sha256
+                ),
+                "base_input_sha256": (
+                    result.approved_rule_pack.base_input_sha256
+                ),
+                "reference_date": result.approved_rule_pack.reference_date,
+                "approval": (
+                    approval.to_dict() if approval is not None else None
+                ),
+            }
+        )
+        st.caption("审批人是本地自声明标识，系统未验证其身份。")
+
+
+def _render_rule_enhancement(
+    report: QualityReport,
+    *,
+    uploaded_file,
+    dataset_name: str,
+    sheet_name: str,
+    reference_date: date,
+) -> None:
+    """渲染 v0.4 引导、草案校验、明确审批和确定性重评闭环。"""
+
+    st.subheader("引导式规则增强")
+    st.caption(
+        "候选字段只来自脱敏字段画像，不读取原始值。所有规则默认处于草案状态，"
+        "只有明确批准后才会重新解析当前上传文件并执行。规则元数据不会发送给 DeepSeek。"
+    )
+    if report.status != "success":
+        st.info("零配置评估成功后才能创建 RulePack。")
+        return
+    if uploaded_file is None:
+        st.info("当前上传内容已不可用，请重新选择文件并运行零配置评估。")
+        return
+
+    guidance = build_rule_guidance(report)
+    fields = list(guidance.required_field_candidates)
+    state = _rule_state_for(report)
+    if not state.get("guidance_started"):
+        start_guidance = st.button(
+            "开始配置业务规则",
+            key="start_rule_guidance",
+            width="stretch",
+        )
+        if not start_guidance:
+            st.info("点击后才会显示规则问题；此操作不会启用或执行任何规则。")
+            return
+        state = {
+            **state,
+            "guidance_started": True,
+        }
+        st.session_state[RULE_STATE_KEY] = state
+    with st.expander("查看本地 Agent 的确认问题与候选", expanded=True):
+        for question in guidance.questions:
+            st.text(question)
+        st.caption(
+            "主键候选："
+            + ("、".join(guidance.primary_key_candidates) or "未自动识别")
+        )
+        st.caption(
+            "更新时间候选："
+            + ("、".join(guidance.update_time_candidates) or "未自动识别")
+        )
+
+    rule_pack_name = st.text_input(
+        "规则包名称",
+        value=f"{report.dataset.name}业务规则",
+        max_chars=120,
+        key="rule_pack_name",
+    )
+    rule_pack_version = st.text_input(
+        "规则包版本",
+        value="1.0.0",
+        max_chars=32,
+        key="rule_pack_version",
+    )
+    primary_key_fields = st.multiselect(
+        "主键字段（可组合，最多 5 个）",
+        options=fields,
+        default=[],
+        max_selections=5,
+        key="rule_primary_key_fields",
+    )
+    required_fields = st.multiselect(
+        "必填字段",
+        options=fields,
+        default=[],
+        key="rule_required_fields",
+    )
+    update_time_field = st.selectbox(
+        "更新时间字段",
+        options=[None, *guidance.update_time_candidates],
+        format_func=lambda value: "不启用" if value is None else str(value),
+        key="rule_update_time_field",
+    )
+    frequency_label = st.selectbox(
+        "更新频率",
+        options=list(RULE_FREQUENCIES),
+        index=2,
+        disabled=update_time_field is None,
+        key="rule_update_frequency",
+    )
+    custom_days = st.number_input(
+        "自定义最长更新间隔（天）",
+        min_value=1,
+        max_value=3660,
+        value=30,
+        step=1,
+        disabled=(
+            update_time_field is None
+            or frequency_label != "自定义天数"
+        ),
+        key="rule_update_custom_days",
+    )
+    allowed_values_field = st.selectbox(
+        "允许值字段（可选）",
+        options=[None, *fields],
+        format_func=lambda value: "不启用" if value is None else str(value),
+        key="rule_allowed_values_field",
+    )
+    allowed_values_json = st.text_area(
+        "允许值 JSON 数组",
+        value="[]",
+        max_chars=5000,
+        disabled=allowed_values_field is None,
+        help='示例：["启用", "停用"]；缺失值请另设必填规则。',
+        key="rule_allowed_values_json",
+    )
+    numeric_range_field = st.selectbox(
+        "数值范围字段（可选）",
+        options=[None, *guidance.numeric_field_candidates],
+        format_func=lambda value: "不启用" if value is None else str(value),
+        key="rule_numeric_range_field",
+    )
+    range_columns = st.columns(2)
+    numeric_minimum_text = range_columns[0].text_input(
+        "数值下限（闭区间，可留空）",
+        disabled=numeric_range_field is None,
+        key="rule_numeric_minimum",
+    )
+    numeric_maximum_text = range_columns[1].text_input(
+        "数值上限（闭区间，可留空）",
+        disabled=numeric_range_field is None,
+        key="rule_numeric_maximum",
+    )
+
+    form_payload = {
+        "name": rule_pack_name,
+        "version": rule_pack_version,
+        "primary_key_fields": primary_key_fields,
+        "required_fields": required_fields,
+        "update_time_field": update_time_field,
+        "frequency_label": frequency_label,
+        "custom_days": int(custom_days),
+        "allowed_values_field": allowed_values_field,
+        "allowed_values_json": allowed_values_json,
+        "numeric_range_field": numeric_range_field,
+        "numeric_minimum_text": numeric_minimum_text,
+        "numeric_maximum_text": numeric_maximum_text,
+    }
+    current_signature = _rule_form_signature(form_payload)
+    if (
+        state.get("draft") is not None
+        and state.get("draft_signature") != current_signature
+    ):
+        state = {
+            "report_sha256": state["report_sha256"],
+            "guidance_started": True,
+            "draft": None,
+            "draft_signature": None,
+            "confirmed_draft_sha256": None,
+            "approved_pack": None,
+            "result": None,
+            "execution_error": None,
+        }
+        _clear_rule_approval_widgets()
+        st.session_state[RULE_STATE_KEY] = state
+        st.info("规则答案已变化，旧草案、审批和增强结果已失效。")
+
+    generate_draft = st.button(
+        "生成并校验规则草案",
+        key="generate_rule_pack_draft",
+        width="stretch",
+    )
+    if generate_draft:
+        try:
+            rules = _rule_form_rules(
+                primary_key_fields=primary_key_fields,
+                required_fields=required_fields,
+                update_time_field=update_time_field,
+                frequency_label=frequency_label,
+                custom_days=int(custom_days),
+                allowed_values_field=allowed_values_field,
+                allowed_values_json=allowed_values_json,
+                numeric_range_field=numeric_range_field,
+                numeric_minimum_text=numeric_minimum_text,
+                numeric_maximum_text=numeric_maximum_text,
+            )
+            draft = build_rule_pack(
+                report,
+                name=rule_pack_name,
+                version=rule_pack_version,
+                rules=rules,
+            )
+            state = {
+                "report_sha256": _report_sha256(report),
+                "guidance_started": True,
+                "draft": draft,
+                "draft_signature": current_signature,
+                "confirmed_draft_sha256": None,
+                "approved_pack": None,
+                "result": None,
+                "execution_error": None,
+            }
+            _clear_rule_approval_widgets()
+            st.session_state[RULE_STATE_KEY] = state
+        except RulePackValidationError as error:
+            st.error(_escape_markdown(str(error)))
+
+    state = _rule_state_for(report)
+    draft = state.get("draft")
+    if draft is None:
+        st.info("回答规则问题并生成草案后，才会出现审批入口。")
+        return
+    validation = validate_rule_pack(draft, report)
+    if not validation.valid:
+        st.error("规则草案未通过确定性校验，不能进入审批。")
+        for error in validation.errors:
+            st.text(error)
+        return
+
+    st.success(f"规则草案校验通过：{draft.rule_pack_id} v{draft.version}")
+    with st.expander("查看待审批 RulePack"):
+        st.json(draft.to_dict())
+    draft_download_name = sanitize_file_name(
+        f"{report.dataset.name}_rule_pack_draft.json",
+        default_name="rule_pack_draft.json",
+        safe_extension=".json",
+    )
+    st.download_button(
+        "下载规则草案（JSON）",
+        data=json.dumps(
+            draft.to_dict(),
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        ).encode("utf-8"),
+        file_name=draft_download_name,
+        mime="application/json",
+    )
+    approver = st.text_input(
+        "审批人标识（本地自声明）",
+        max_chars=100,
+        key="rule_approver",
+    )
+    confirmed = st.checkbox(
+        "我已核对当前 RulePack，并明确批准其仅用于当前绑定输入的确定性重评。",
+        key="rule_approval_confirmed",
+        on_change=_bind_rule_confirmation,
+    )
+    state = _rule_state_for(report)
+    current_draft_sha256 = validation.draft_sha256 or draft_sha256(draft)
+    confirmation_matches = (
+        confirmed
+        and state.get("confirmed_draft_sha256")
+        == current_draft_sha256
+    )
+    approve_and_run = st.button(
+        "批准并重新评估",
+        type="primary",
+        width="stretch",
+        disabled=not confirmation_matches or not approver.strip(),
+        key="approve_and_run_rule_pack",
+    )
+    if approve_and_run:
+        if (
+            not confirmed
+            or state.get("confirmed_draft_sha256")
+            != current_draft_sha256
+            or not approver.strip()
+        ):
+            st.error("当前草案尚未获得与其哈希绑定的明确确认，不能批准或执行。")
+        else:
+            try:
+                approved_pack = approve_rule_pack(
+                    draft,
+                    report,
+                    approver=approver,
+                )
+            except RulePackValidationError as error:
+                st.error(_escape_markdown(f"规则审批失败：{error}"))
+            else:
+                st.session_state[RULE_STATE_KEY] = {
+                    **state,
+                    "approved_pack": approved_pack,
+                    "result": None,
+                    "execution_error": None,
+                }
+                try:
+                    with st.spinner("正在重新解析当前输入并执行已审批业务规则……"):
+                        result = evaluate_uploaded_dataset_with_rule_pack(
+                            uploaded_file.getvalue(),
+                            uploaded_file.name,
+                            approved_pack,
+                            dataset_name=dataset_name.strip() or None,
+                            sheet_name=sheet_name.strip() or None,
+                            reference_date=reference_date,
+                        )
+                except RulePackExecutionError as error:
+                    st.session_state[RULE_STATE_KEY] = {
+                        **state,
+                        "approved_pack": approved_pack,
+                        "result": None,
+                        "execution_error": str(error),
+                    }
+                    st.error(_escape_markdown(f"规则增强未执行：{error}"))
+                except Exception:
+                    failure_message = (
+                        "规则增强未能完成；零配置报告不受影响，"
+                        "请核对输入后重试。"
+                    )
+                    st.session_state[RULE_STATE_KEY] = {
+                        **state,
+                        "approved_pack": approved_pack,
+                        "result": None,
+                        "execution_error": failure_message,
+                    }
+                    st.error(failure_message)
+                else:
+                    st.session_state[RULE_STATE_KEY] = {
+                        **state,
+                        "approved_pack": approved_pack,
+                        "result": result,
+                        "execution_error": None,
+                    }
+
+    final_state = _rule_state_for(report)
+    result = final_state.get("result")
+    if result is None:
+        approved_pack = final_state.get("approved_pack")
+        if approved_pack is None:
+            st.caption("草案尚未批准；零配置报告未发生变化。")
+            return
+        st.warning("RulePack 已批准，但确定性重评尚未成功；零配置报告不受影响。")
+        execution_error = final_state.get("execution_error")
+        if execution_error:
+            st.text(str(execution_error))
+        failed_approved_download_name = sanitize_file_name(
+            f"{report.dataset.name}_approved_rule_pack.json",
+            default_name="approved_rule_pack.json",
+            safe_extension=".json",
+        )
+        st.download_button(
+            "下载已审批 RulePack（JSON）",
+            data=json.dumps(
+                approved_pack.to_dict(),
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            ).encode("utf-8"),
+            file_name=failed_approved_download_name,
+            mime="application/json",
+        )
+        return
+    _render_rule_result(result)
+
+    approved_download_name = sanitize_file_name(
+        f"{report.dataset.name}_approved_rule_pack.json",
+        default_name="approved_rule_pack.json",
+        safe_extension=".json",
+    )
+    result_download_name = sanitize_file_name(
+        f"{report.dataset.name}_rule_evaluation.json",
+        default_name="rule_evaluation.json",
+        safe_extension=".json",
+    )
+    enhanced_markdown_name = sanitize_file_name(
+        f"{report.dataset.name}_rule_enhanced_report.md",
+        default_name="rule_enhanced_report.md",
+        safe_extension=".md",
+    )
+    rule_locations_name = sanitize_file_name(
+        f"{report.dataset.name}_rule_issue_locations.csv",
+        default_name="rule_issue_locations.csv",
+        safe_extension=".csv",
+    )
+    st.download_button(
+        "下载已审批 RulePack（JSON）",
+        data=json.dumps(
+            result.approved_rule_pack.to_dict(),
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        ).encode("utf-8"),
+        file_name=approved_download_name,
+        mime="application/json",
+    )
+    st.download_button(
+        "下载规则增强结果（JSON）",
+        data=serialize_rule_evaluation_result(result),
+        file_name=result_download_name,
+        mime="application/json",
+    )
+    st.download_button(
+        "下载规则增强报告（Markdown）",
+        data=serialize_markdown_report(result.enhanced_report),
+        file_name=enhanced_markdown_name,
+        mime="text/markdown",
+    )
+    st.download_button(
+        "下载规则问题位置（CSV）",
+        data=serialize_rule_issue_locations_csv(result),
+        file_name=rule_locations_name,
+        mime="text/csv",
+    )
+
+
 def _render_status(report: QualityReport, summary: dict[str, int]) -> None:
     if report.status == "failed":
         st.error("文件未能成功解析。请查看下方运行信息中的具体原因。")
@@ -491,6 +1252,7 @@ with st.sidebar:
         st.session_state["evaluation_request_signature"] = request_signature
         st.session_state.pop("quality_report", None)
         _clear_agent_state()
+        _clear_rule_state()
     run_evaluation = st.button(
         "运行质量评估",
         type="primary",
@@ -501,6 +1263,7 @@ with st.sidebar:
 
 if run_evaluation and uploaded_file is not None:
     _clear_agent_state()
+    _clear_rule_state()
     with st.spinner("正在解析文件并计算质量指标……"):
         try:
             st.session_state["quality_report"] = evaluate_uploaded_dataset(
@@ -513,10 +1276,12 @@ if run_evaluation and uploaded_file is not None:
         except (DatasetReadError, UnsupportedFileTypeError) as error:
             st.session_state.pop("quality_report", None)
             _clear_agent_state()
+            _clear_rule_state()
             st.error(_escape_markdown(f"评估未能启动：{error}"))
         except Exception:  # 防止界面中断，且不暴露本地路径等环境细节
             st.session_state.pop("quality_report", None)
             _clear_agent_state()
+            _clear_rule_state()
             st.error("评估未能启动：运行环境或临时文件不可用，请重试。")
 
 report = st.session_state.get("quality_report")
@@ -526,6 +1291,7 @@ if report is None:
     )
 else:
     _agent_state_for(report)
+    _rule_state_for(report)
     dataset = report.dataset
     title = dataset.name
     details = f"文件：{dataset.file_name} · 类型：{dataset.file_type.upper()}"
@@ -541,6 +1307,7 @@ else:
         profile_tab,
         execution_tab,
         agent_tab,
+        rule_tab,
     ) = st.tabs(
         [
             "风险提示",
@@ -548,6 +1315,7 @@ else:
             "字段画像",
             "无法评估与运行信息",
             "Agent 解读",
+            "规则增强",
         ]
     )
     with risk_tab:
@@ -560,6 +1328,14 @@ else:
         _render_execution(report)
     with agent_tab:
         _render_agent(report)
+    with rule_tab:
+        _render_rule_enhancement(
+            report,
+            uploaded_file=uploaded_file,
+            dataset_name=dataset_name,
+            sheet_name=sheet_name,
+            reference_date=reference_date,
+        )
 
     json_download_file_name = sanitize_file_name(
         f"{dataset.name}_quality_report.json",

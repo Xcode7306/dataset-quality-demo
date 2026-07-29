@@ -119,7 +119,7 @@ class AgentReportContractTests(unittest.TestCase):
         context = first_payload["evaluation_context"]
 
         self.assertEqual(report.schema_version, "0.2")
-        self.assertEqual(context["engine_version"], "0.3")
+        self.assertEqual(context["engine_version"], "0.4")
         self.assertEqual(context["reference_date"], "2026-07-17")
         self.assertEqual(context["threshold_config_version"], "0.3")
         self.assertEqual(context["parser_path"], "csv")

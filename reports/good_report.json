@@ -623,13 +623,13 @@
   "risks": [],
   "not_assessable": [],
   "evaluation_context": {
-    "engine_version": "0.3",
+    "engine_version": "0.4",
     "reference_date": "2026-07-17",
     "threshold_config_version": "0.3",
     "parser_path": "csv",
     "input_sha256": "71466710b0e195a676876e07add006c8121c7b56bdf6e563d60d332e06f1c037",
     "input_size_bytes": 555,
-    "report_sha256": "7adaace63f47910e87b8bcbec1de4f39b3233d9f0c9637a7c64c90eded12538a"
+    "report_sha256": "836b9f948bb2b6558871f4c1bdcdad032494c3fa91d9fed451a8ca72c19b72ae"
   },
   "execution": {
     "warnings": [],
