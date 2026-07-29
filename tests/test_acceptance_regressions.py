@@ -201,6 +201,10 @@ class ParserAndCliAcceptanceTests(unittest.TestCase):
 
 
 class StreamlitStateAcceptanceTests(unittest.TestCase):
+    @staticmethod
+    def _button_by_label(app, label):
+        return next(button for button in app.button if button.label == label)
+
     def _new_app(self):
         app = AppTest.from_file(str(PROJECT_ROOT / "app.py"), default_timeout=15)
         app.run()
@@ -209,6 +213,7 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
 
     def _assert_report_is_cleared(self, app):
         self.assertNotIn("quality_report", app.session_state.filtered_state)
+        self.assertNotIn("agent_ui_state", app.session_state.filtered_state)
         self.assertEqual(len(app.metric), 0)
         self.assertEqual(len(app.download_button), 0)
         self.assertTrue(
@@ -219,7 +224,7 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
         app.file_uploader[0].set_value((file_name, content, mime_type))
         app.run()
         app.date_input[0].set_value(REFERENCE_DATE)
-        app.button[0].click().run()
+        self._button_by_label(app, "运行质量评估").click().run()
         self.assertFalse(app.exception)
         self.assertIn("quality_report", app.session_state.filtered_state)
 
@@ -232,7 +237,7 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
         app.run()
         self._assert_report_is_cleared(app)
 
-        app.button[0].click().run()
+        self._button_by_label(app, "运行质量评估").click().run()
         self.assertEqual(
             app.session_state["quality_report"].dataset.name,
             "新数据集名称",
@@ -293,7 +298,7 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
             "src.upload_service.evaluate_uploaded_dataset",
             side_effect=OSError("临时文件写入失败"),
         ) as evaluate:
-            app.button[0].click().run()
+            self._button_by_label(app, "运行质量评估").click().run()
 
         evaluate.assert_called_once()
         self.assertFalse(app.exception)

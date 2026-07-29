@@ -1,6 +1,11 @@
-"""集中管理第一版风险提示规则的默认阈值。"""
+"""集中管理风险提示规则、阈值和报告引擎版本。"""
 
 from dataclasses import dataclass
+
+
+ENGINE_VERSION = "0.3"
+RISK_RULE_VERSION = "0.3"
+THRESHOLD_CONFIG_VERSION = "0.3"
 
 
 @dataclass(frozen=True)

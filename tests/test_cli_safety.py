@@ -94,7 +94,7 @@ class CliSafetyTests(unittest.TestCase):
 
             saved = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["dataset"]["name"], "测试数据集")
-            self.assertEqual(saved["schema_version"], "0.1")
+            self.assertEqual(saved["schema_version"], "0.2")
             self.assertFalse(output_path.is_symlink())
 
     def test_save_report_selects_format_from_extension(self):

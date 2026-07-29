@@ -42,9 +42,39 @@ class InitialMetricTests(unittest.TestCase):
         blank_rate = find_metric(report, "blank_record_rate")
         self.assertAlmostEqual(blank_rate.value, 1 / 6, places=6)
         self.assertNotIn("record_id", blank_rate.evidence["content_fields"])
+        self.assertEqual(
+            [
+                location["record_number"]
+                for location in blank_rate.issue_locations
+            ],
+            [5],
+        )
+        department_missing = find_metric(
+            report,
+            "field_missing_rate",
+            "department",
+        )
+        self.assertEqual(
+            [
+                location["record_number"]
+                for location in department_missing.issue_locations
+            ],
+            [4, 5],
+        )
         self.assertAlmostEqual(
             find_metric(report, "field_type_consistency", "handling_days").value,
             3 / 5,
+        )
+        self.assertEqual(
+            [
+                location["record_number"]
+                for location in find_metric(
+                    report,
+                    "field_type_consistency",
+                    "handling_days",
+                ).issue_locations
+            ],
+            [3, 6],
         )
 
     def test_empty_dataset_marks_unavailable_metrics(self):

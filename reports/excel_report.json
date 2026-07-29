@@ -6,7 +6,7 @@
     "sheet_name": "服务事项"
   },
   "status": "success",
-  "schema_version": "0.1",
+  "schema_version": "0.2",
   "profile": {
     "row_count": 5,
     "column_count": 7,
@@ -105,7 +105,8 @@
         "successful_file_count": 1,
         "failed_file_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:file_parse_rate:dataset"
     },
     {
       "id": "dataset_scale",
@@ -121,7 +122,8 @@
         "row_count": 5,
         "column_count": 7
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:dataset_scale:dataset"
     },
     {
       "id": "field_missing_rate",
@@ -136,7 +138,8 @@
         "checked_count": 5,
         "issue_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:record_id"
     },
     {
       "id": "field_missing_rate",
@@ -151,7 +154,8 @@
         "checked_count": 5,
         "issue_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:service_name"
     },
     {
       "id": "field_missing_rate",
@@ -166,7 +170,8 @@
         "checked_count": 5,
         "issue_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:department"
     },
     {
       "id": "field_missing_rate",
@@ -181,7 +186,8 @@
         "checked_count": 5,
         "issue_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:update_time"
     },
     {
       "id": "field_missing_rate",
@@ -196,7 +202,8 @@
         "checked_count": 5,
         "issue_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:source_url"
     },
     {
       "id": "field_missing_rate",
@@ -211,7 +218,8 @@
         "checked_count": 5,
         "issue_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:version"
     },
     {
       "id": "field_missing_rate",
@@ -226,7 +234,8 @@
         "checked_count": 5,
         "issue_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:handling_days"
     },
     {
       "id": "blank_record_rate",
@@ -250,7 +259,8 @@
           "handling_days"
         ]
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:blank_record_rate:dataset"
     },
     {
       "id": "field_type_consistency",
@@ -263,12 +273,14 @@
       "field": "record_id",
       "evidence": {
         "checked_count": 5,
+        "issue_count": 0,
         "dominant_type": "numeric",
         "type_counts": {
           "numeric": 5
         }
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:record_id"
     },
     {
       "id": "field_type_consistency",
@@ -281,12 +293,14 @@
       "field": "service_name",
       "evidence": {
         "checked_count": 5,
+        "issue_count": 0,
         "dominant_type": "text",
         "type_counts": {
           "text": 5
         }
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:service_name"
     },
     {
       "id": "field_type_consistency",
@@ -299,12 +313,14 @@
       "field": "department",
       "evidence": {
         "checked_count": 5,
+        "issue_count": 0,
         "dominant_type": "text",
         "type_counts": {
           "text": 5
         }
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:department"
     },
     {
       "id": "field_type_consistency",
@@ -317,12 +333,14 @@
       "field": "update_time",
       "evidence": {
         "checked_count": 5,
+        "issue_count": 0,
         "dominant_type": "datetime",
         "type_counts": {
           "datetime": 5
         }
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:update_time"
     },
     {
       "id": "field_type_consistency",
@@ -335,12 +353,14 @@
       "field": "source_url",
       "evidence": {
         "checked_count": 5,
+        "issue_count": 0,
         "dominant_type": "text",
         "type_counts": {
           "text": 5
         }
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:source_url"
     },
     {
       "id": "field_type_consistency",
@@ -353,12 +373,14 @@
       "field": "version",
       "evidence": {
         "checked_count": 5,
+        "issue_count": 0,
         "dominant_type": "text",
         "type_counts": {
           "text": 5
         }
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:version"
     },
     {
       "id": "field_type_consistency",
@@ -371,12 +393,14 @@
       "field": "handling_days",
       "evidence": {
         "checked_count": 5,
+        "issue_count": 0,
         "dominant_type": "numeric",
         "type_counts": {
           "numeric": 5
         }
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:handling_days"
     },
     {
       "id": "recognizable_format_anomaly_rate",
@@ -393,7 +417,8 @@
         "issue_count": 0,
         "invalid_samples": []
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:recognizable_format_anomaly_rate:field:update_time"
     },
     {
       "id": "recognizable_format_anomaly_rate",
@@ -410,7 +435,8 @@
         "issue_count": 0,
         "invalid_samples": []
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:recognizable_format_anomaly_rate:field:source_url"
     },
     {
       "id": "recognizable_format_anomaly_rate",
@@ -427,7 +453,8 @@
         "issue_count": 0,
         "invalid_samples": []
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:recognizable_format_anomaly_rate:field:handling_days"
     },
     {
       "id": "exact_duplicate_rate",
@@ -453,7 +480,8 @@
         ],
         "normalization": false
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:exact_duplicate_rate:dataset"
     },
     {
       "id": "normalized_duplicate_rate",
@@ -479,7 +507,8 @@
         ],
         "normalization": true
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:normalized_duplicate_rate:dataset"
     },
     {
       "id": "time_info_availability",
@@ -500,7 +529,8 @@
         "earliest_date": "2026-06-01",
         "latest_date": "2026-06-10"
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:time_info_availability:dataset"
     },
     {
       "id": "update_lag_days",
@@ -518,7 +548,8 @@
         "latest_update_date": "2026-06-10",
         "reference_date": "2026-07-17"
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:update_lag_days:dataset"
     },
     {
       "id": "source_info_coverage",
@@ -539,7 +570,8 @@
         "issue_count": 0,
         "missing_row_indices": []
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:source_info_coverage:dataset"
     },
     {
       "id": "version_info_coverage",
@@ -560,7 +592,8 @@
         "issue_count": 0,
         "missing_row_indices": []
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:version_info_coverage:dataset"
     },
     {
       "id": "statistical_outlier_rate",
@@ -583,11 +616,21 @@
         "outlier_samples": [],
         "non_finite_samples": []
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:statistical_outlier_rate:field:handling_days"
     }
   ],
   "risks": [],
   "not_assessable": [],
+  "evaluation_context": {
+    "engine_version": "0.3",
+    "reference_date": "2026-07-17",
+    "threshold_config_version": "0.3",
+    "parser_path": "excel:xlsx",
+    "input_sha256": "64f2737184155304e9c9fa4aed8a9308cade7b470bb187d783194b58a4a49781",
+    "input_size_bytes": 6496,
+    "report_sha256": "f19281d4fff21ace2152bc8662a2f2eb04f9435b7ecf74607e8229bc4dc6b89c"
+  },
   "execution": {
     "warnings": [],
     "errors": []

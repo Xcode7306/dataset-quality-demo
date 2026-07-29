@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from datetime import date
 import math
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -54,6 +54,42 @@ CODE_VALUE_PATTERN = re.compile(
     r"^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)+$"
 )
 NORMALIZE_TEXT_PATTERN = re.compile(r"[\s\W_]+", re.UNICODE)
+
+
+def _issue_locations(
+    record_numbers: Iterable[int],
+    *,
+    issue_type: str,
+    fields: Iterable[str],
+    related_record_numbers: Mapping[int, Iterable[int]] | None = None,
+) -> list[dict[str, Any]]:
+    """生成完整、无原始值的问题位置列表。
+
+    ``record_number`` 是解析后数据记录的 1 基序号，不是物理文件行号；
+    CSV/Excel 的表头不计入，JSON 则对应数组中的记录顺序。
+    """
+
+    normalized_fields = list(
+        dict.fromkeys(str(field) for field in fields if str(field))
+    )
+    locations: list[dict[str, Any]] = []
+    related = related_record_numbers or {}
+    for raw_record_number in record_numbers:
+        record_number = int(raw_record_number)
+        location: dict[str, Any] = {
+            "record_number": record_number,
+            "fields": normalized_fields,
+            "issue_type": issue_type,
+        }
+        linked_records = [
+            int(value)
+            for value in related.get(record_number, ())
+            if int(value) > 0
+        ]
+        if linked_records:
+            location["related_record_numbers"] = linked_records
+        locations.append(location)
+    return locations
 
 
 def _infer_content_columns(dataframe: pd.DataFrame) -> list[str]:
@@ -279,7 +315,16 @@ def calculate_field_missing_rates(dataframe: pd.DataFrame) -> list[MetricResult]
                 )
             )
             continue
-        missing_count = int(series.map(is_missing_value).sum())
+        missing_mask = series.map(is_missing_value)
+        missing_count = int(missing_mask.sum())
+        missing_record_numbers = (
+            position
+            for position, is_missing in enumerate(
+                missing_mask.tolist(),
+                start=1,
+            )
+            if is_missing
+        )
         results.append(
             MetricResult(
                 id="field_missing_rate",
@@ -290,7 +335,15 @@ def calculate_field_missing_rates(dataframe: pd.DataFrame) -> list[MetricResult]
                 unit="ratio",
                 scope="field",
                 field=str(column_name),
-                evidence={"checked_count": int(len(series)), "issue_count": missing_count},
+                evidence={
+                    "checked_count": int(len(series)),
+                    "issue_count": missing_count,
+                },
+                issue_locations=_issue_locations(
+                    missing_record_numbers,
+                    issue_type="missing_value",
+                    fields=[str(column_name)],
+                ),
             )
         )
     return results
@@ -335,6 +388,18 @@ def calculate_blank_record_rate(dataframe: pd.DataFrame) -> MetricResult:
             "method": "inferred_content_fields_blank",
             "content_fields": content_columns,
         },
+        issue_locations=_issue_locations(
+            (
+                position
+                for position, is_blank in enumerate(
+                    blank_mask.tolist(),
+                    start=1,
+                )
+                if is_blank
+            ),
+            issue_type="blank_record",
+            fields=content_columns,
+        ),
     )
 
 
@@ -351,12 +416,15 @@ def calculate_field_type_consistency(dataframe: pd.DataFrame) -> list[MetricResu
 
     results: list[MetricResult] = []
     for column_name in dataframe.columns:
-        values = [
-            inferred_type
-            for value in dataframe[column_name].tolist()
+        typed_rows = [
+            (position, inferred_type)
+            for position, value in enumerate(
+                dataframe[column_name].tolist(),
+                start=1,
+            )
             if (inferred_type := infer_value_type(value)) is not None
         ]
-        if not values:
+        if not typed_rows:
             results.append(
                 _not_assessable(
                     "field_type_consistency",
@@ -369,25 +437,38 @@ def calculate_field_type_consistency(dataframe: pd.DataFrame) -> list[MetricResu
             )
             continue
 
-        type_counts = Counter(values)
+        type_counts = Counter(
+            inferred_type for _, inferred_type in typed_rows
+        )
         dominant_type, dominant_count = sorted(
             type_counts.items(), key=lambda item: (-item[1], item[0])
         )[0]
+        inconsistent_record_numbers = [
+            position
+            for position, inferred_type in typed_rows
+            if inferred_type != dominant_type
+        ]
         results.append(
             MetricResult(
                 id="field_type_consistency",
                 name="字段类型一致率",
                 category="类型一致性",
                 status="evaluated",
-                value=round(dominant_count / len(values), 6),
+                value=round(dominant_count / len(typed_rows), 6),
                 unit="ratio",
                 scope="field",
                 field=str(column_name),
                 evidence={
-                    "checked_count": len(values),
+                    "checked_count": len(typed_rows),
+                    "issue_count": len(inconsistent_record_numbers),
                     "dominant_type": dominant_type,
                     "type_counts": dict(sorted(type_counts.items())),
                 },
+                issue_locations=_issue_locations(
+                    inconsistent_record_numbers,
+                    issue_type="inconsistent_type",
+                    fields=[str(column_name)],
+                ),
             )
         )
     return results
@@ -428,10 +509,15 @@ def calculate_recognizable_format_anomaly_rates(
     }
     results: list[MetricResult] = []
     for field, expected_format in field_checks.items():
-        non_missing_values = [
-            value for value in dataframe[field].tolist() if not is_missing_value(value)
+        non_missing_rows = [
+            (position, value)
+            for position, value in enumerate(
+                dataframe[field].tolist(),
+                start=1,
+            )
+            if not is_missing_value(value)
         ]
-        if not non_missing_values:
+        if not non_missing_rows:
             results.append(
                 _not_assessable(
                     "recognizable_format_anomaly_rate",
@@ -443,9 +529,9 @@ def calculate_recognizable_format_anomaly_rates(
                 )
             )
             continue
-        invalid_values = [
-            value
-            for value in non_missing_values
+        invalid_record_numbers = [
+            position
+            for position, value in non_missing_rows
             if not validators[expected_format](value)
         ]
         results.append(
@@ -454,18 +540,26 @@ def calculate_recognizable_format_anomaly_rates(
                 name="可识别格式异常率",
                 category="格式规范性",
                 status="evaluated",
-                value=round(len(invalid_values) / len(non_missing_values), 6),
+                value=round(
+                    len(invalid_record_numbers) / len(non_missing_rows),
+                    6,
+                ),
                 unit="ratio",
                 scope="field",
                 field=field,
                 evidence={
                     "expected_format": expected_format,
-                    "checked_count": len(non_missing_values),
-                    "issue_count": len(invalid_values),
+                    "checked_count": len(non_missing_rows),
+                    "issue_count": len(invalid_record_numbers),
                     # 仅输出异常数量，不将可能包含个人信息的
                     # 原始值写入 QualityReport。
                     "invalid_samples": [],
                 },
+                issue_locations=_issue_locations(
+                    invalid_record_numbers,
+                    issue_type="invalid_format",
+                    fields=[field],
+                ),
             )
         )
     return results
@@ -481,6 +575,14 @@ def _calculate_duplicate_rate(dataframe: pd.DataFrame, normalize: bool) -> Metri
 
     groups = _duplicate_groups(dataframe, normalize)
     duplicate_count = sum(len(group) - 1 for group in groups)
+    duplicate_record_numbers: list[int] = []
+    related_record_numbers: dict[int, list[int]] = {}
+    for group in groups:
+        original_record = group[0]
+        for duplicate_record in group[1:]:
+            duplicate_record_numbers.append(duplicate_record)
+            related_record_numbers[duplicate_record] = [original_record]
+    compared_fields = _infer_content_columns(dataframe)
     return MetricResult(
         id=metric_id,
         name=name,
@@ -497,9 +599,19 @@ def _calculate_duplicate_rate(dataframe: pd.DataFrame, normalize: bool) -> Metri
                 {"row_indices": group, "duplicate_count": len(group) - 1}
                 for group in groups[:5]
             ],
-            "compared_fields": _infer_content_columns(dataframe),
+            "compared_fields": compared_fields,
             "normalization": normalize,
         },
+        issue_locations=_issue_locations(
+            duplicate_record_numbers,
+            issue_type=(
+                "normalized_duplicate_record"
+                if normalize
+                else "exact_duplicate_record"
+            ),
+            fields=compared_fields,
+            related_record_numbers=related_record_numbers,
+        ),
     )
 
 
@@ -554,6 +666,11 @@ def calculate_time_info_availability(dataframe: pd.DataFrame) -> MetricResult:
     parsed_dates = _collect_parsed_dates(dataframe, fields)
     available_rows = {row_position for row_position, _, _ in parsed_dates}
     dates = [parsed for _, _, parsed in parsed_dates]
+    unavailable_record_numbers = [
+        record_number
+        for record_number in range(1, len(dataframe) + 1)
+        if record_number not in available_rows
+    ]
     return MetricResult(
         id="time_info_availability",
         name="时间信息可用率",
@@ -566,10 +683,15 @@ def calculate_time_info_availability(dataframe: pd.DataFrame) -> MetricResult:
             "identified_fields": fields,
             "checked_count": int(len(dataframe)),
             "available_count": len(available_rows),
-            "issue_count": int(len(dataframe)) - len(available_rows),
+            "issue_count": len(unavailable_record_numbers),
             "earliest_date": min(dates).date().isoformat() if dates else None,
             "latest_date": max(dates).date().isoformat() if dates else None,
         },
+        issue_locations=_issue_locations(
+            unavailable_record_numbers,
+            issue_type="missing_or_invalid_time",
+            fields=fields,
+        ),
     )
 
 
@@ -632,6 +754,7 @@ def _calculate_coverage(
     covered_count = 0
     issue_count = 0
     missing_row_indices: list[int] = []
+    issue_record_numbers: list[int] = []
     for position, (_, row) in enumerate(dataframe[fields].iterrows(), start=1):
         if any(not is_missing_value(value) for value in row.tolist()):
             covered_count += 1
@@ -639,6 +762,12 @@ def _calculate_coverage(
         issue_count += 1
         if len(missing_row_indices) < 20:
             missing_row_indices.append(position)
+        issue_record_numbers.append(position)
+    issue_type = (
+        "missing_source_info"
+        if metric_id == "source_info_coverage"
+        else "missing_version_info"
+    )
     return MetricResult(
         id=metric_id,
         name=name,
@@ -654,6 +783,11 @@ def _calculate_coverage(
             "issue_count": issue_count,
             "missing_row_indices": missing_row_indices,
         },
+        issue_locations=_issue_locations(
+            issue_record_numbers,
+            issue_type=issue_type,
+            fields=fields,
+        ),
     )
 
 
@@ -697,20 +831,31 @@ def calculate_statistical_outlier_rates(dataframe: pd.DataFrame) -> list[MetricR
 
     results: list[MetricResult] = []
     for field in _infer_content_columns(dataframe):
-        raw_values = [
-            value for value in dataframe[field].tolist() if not is_missing_value(value)
+        non_missing_rows = [
+            (position, value)
+            for position, value in enumerate(
+                dataframe[field].tolist(),
+                start=1,
+            )
+            if not is_missing_value(value)
         ]
-        if not raw_values:
+        if not non_missing_rows:
             continue
         numeric_values = pd.to_numeric(
-            pd.Series([_format_value(value) for value in raw_values]), errors="coerce"
+            pd.Series(
+                [_format_value(value) for _, value in non_missing_rows]
+            ),
+            errors="coerce",
         )
         numeric_count = int(numeric_values.notna().sum())
         finite_mask = numeric_values.map(
             lambda value: pd.notna(value) and math.isfinite(float(value))
         )
         finite_count = int(finite_mask.sum())
-        if finite_count < 4 or numeric_count / len(raw_values) < 0.8:
+        if (
+            finite_count < 4
+            or numeric_count / len(non_missing_rows) < 0.8
+        ):
             continue
         numeric_series = numeric_values[finite_mask]
         first_quartile = float(numeric_series.quantile(0.25))
@@ -757,6 +902,22 @@ def calculate_statistical_outlier_rates(dataframe: pd.DataFrame) -> list[MetricR
         outlier_mask = (numeric_series < lower_bound) | (numeric_series > upper_bound)
         non_finite_count = numeric_count - finite_count
         issue_count = int(outlier_mask.sum()) + non_finite_count
+        issue_value_indices = sorted(
+            [
+                int(index)
+                for index, is_outlier in outlier_mask.items()
+                if bool(is_outlier)
+            ]
+            + [
+                int(index)
+                for index, value in numeric_values.items()
+                if pd.notna(value) and not math.isfinite(float(value))
+            ]
+        )
+        issue_record_numbers = [
+            non_missing_rows[index][0]
+            for index in issue_value_indices
+        ]
         results.append(
             MetricResult(
                 id="statistical_outlier_rate",
@@ -780,6 +941,11 @@ def calculate_statistical_outlier_rates(dataframe: pd.DataFrame) -> list[MetricR
                     "outlier_samples": [],
                     "non_finite_samples": [],
                 },
+                issue_locations=_issue_locations(
+                    issue_record_numbers,
+                    issue_type="statistical_outlier",
+                    fields=[field],
+                ),
             )
         )
     if results:

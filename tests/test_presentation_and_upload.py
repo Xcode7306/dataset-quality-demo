@@ -1,5 +1,7 @@
 """网页上传服务和展示适配层测试。"""
 
+import csv
+import io
 from pathlib import Path
 import json
 import unittest
@@ -12,6 +14,7 @@ from src.presentation import (
     build_risk_chart_rows,
     build_summary,
     format_metric_value,
+    serialize_issue_locations_csv,
     serialize_markdown_report,
     serialize_report,
 )
@@ -61,7 +64,17 @@ class PresentationTests(unittest.TestCase):
     def test_tables_preserve_details(self):
         metric_rows = build_metric_rows(self.report)
         profile_rows = build_profile_rows(self.report)
-        self.assertTrue(any(row["字段"] == "service_name" for row in metric_rows))
+        self.assertTrue(
+            any(row["字段名称"] == "service_name" for row in metric_rows)
+        )
+        self.assertTrue(
+            any(
+                row["指标名称"] == "字段缺失率"
+                and row["字段名称"] == "service_name"
+                for row in metric_rows
+            )
+        )
+        self.assertTrue(all("引用键" not in row for row in metric_rows))
         self.assertTrue(any(row["字段"] == "source_url" for row in profile_rows))
         self.assertTrue(all("非空样例" not in row for row in profile_rows))
 
@@ -69,12 +82,78 @@ class PresentationTests(unittest.TestCase):
         rows = build_risk_chart_rows(self.report)
         self.assertEqual([row["级别"] for row in rows], ["警告", "关注", "提示"])
 
+    def test_issue_locations_are_human_readable_and_exclude_raw_values(self):
+        payload = serialize_issue_locations_csv(self.report).decode("utf-8-sig")
+        rows = list(csv.DictReader(io.StringIO(payload)))
+
+        self.assertGreater(len(rows), 0)
+        self.assertTrue(
+            any(
+                row["疑似问题类型"] == "格式异常"
+                and row["字段名称"] == "handling_days"
+                and row["数据记录序号"] == "3"
+                for row in rows
+            )
+        )
+        self.assertTrue(
+            any(
+                row["疑似问题类型"] == "完全重复记录"
+                and row["数据记录序号"] == "2"
+                and row["关联记录序号"] == "1"
+                and row["备注"]
+                == (
+                    "第 2 条记录与第 1 条记录内容完全相同；"
+                    "关联记录序号 1 表示这组重复数据中首次出现的记录。"
+                )
+                for row in rows
+            )
+        )
+        self.assertTrue(
+            any(
+                row["疑似问题类型"] == "规范化后重复记录"
+                and row["数据记录序号"] == "2"
+                and row["关联记录序号"] == "1"
+                and row["备注"]
+                == (
+                    "第 2 条记录与第 1 条记录在忽略自然文本中的"
+                    "大小写、空白和标点差异后相同；关联记录序号 1 "
+                    "表示这组重复数据中首次出现的记录。"
+                )
+                for row in rows
+            )
+        )
+        self.assertTrue(
+            all(
+                not row["备注"]
+                for row in rows
+                if row["关联记录序号"] == "—"
+            )
+        )
+        expected_location_count = sum(
+            len(metric.issue_locations) for metric in self.report.metrics
+        )
+        self.assertEqual(len(rows), expected_location_count)
+        for metric in self.report.metrics:
+            issue_count = metric.evidence.get("issue_count")
+            if isinstance(issue_count, int) and not isinstance(issue_count, bool):
+                with self.subTest(metric=metric.metric_key):
+                    self.assertEqual(
+                        len(metric.issue_locations),
+                        issue_count,
+                    )
+        for raw_value in ("invalid", "https://bad url"):
+            self.assertNotIn(raw_value, payload)
+
     def test_report_download_is_human_readable_utf8_markdown(self):
         payload = serialize_markdown_report(self.report).decode("utf-8")
         self.assertIn("# 数据集质量评估报告：bad_dataset", payload)
         self.assertIn("## 风险提示", payload)
+        self.assertNotIn("## 疑似问题位置", payload)
+        self.assertNotIn("数据记录序号", payload)
         self.assertIn("## 指标明细", payload)
         self.assertIn("## 字段画像", payload)
+        self.assertIn("| 指标名称 | 字段名称 |", payload)
+        self.assertNotIn("| 引用键 |", payload)
         self.assertIn("bad_dataset.csv", payload)
 
     def test_structured_report_download_is_strict_json(self):
@@ -85,12 +164,26 @@ class PresentationTests(unittest.TestCase):
         )
 
         self.assertEqual(structured, self.report.to_dict())
+        self.assertNotIn("issue_locations", payload)
         self.assertTrue(
             all(
                 column["non_null_samples"] == []
                 for column in structured["profile"]["columns"]
             )
         )
+
+    def test_markdown_report_escapes_untrusted_link_and_image_syntax(self):
+        malicious_text = "![x](https://example.invalid/pixel.png)"
+        report = evaluate_uploaded_dataset(
+            f"{malicious_text},other\n,1\n,2\n".encode("utf-8"),
+            "untrusted.csv",
+            dataset_name=malicious_text,
+        )
+
+        payload = serialize_markdown_report(report).decode("utf-8")
+
+        self.assertNotIn(malicious_text, payload)
+        self.assertIn(r"\!\[x\]\(https://example.invalid/pixel.png\)", payload)
 
 
 class UploadServiceTests(unittest.TestCase):

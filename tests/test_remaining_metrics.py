@@ -72,6 +72,44 @@ class RemainingMetricTests(unittest.TestCase):
         self.assertAlmostEqual(
             find_metric(report, "version_info_coverage").value, 5 / 6, places=6
         )
+        self.assertEqual(
+            find_metric(
+                report,
+                "recognizable_format_anomaly_rate",
+                "handling_days",
+            ).issue_locations,
+            [
+                {
+                    "record_number": 3,
+                    "fields": ["handling_days"],
+                    "issue_type": "invalid_format",
+                },
+                {
+                    "record_number": 6,
+                    "fields": ["handling_days"],
+                    "issue_type": "invalid_format",
+                },
+            ],
+        )
+        duplicate_location = find_metric(
+            report,
+            "exact_duplicate_rate",
+        ).issue_locations[0]
+        self.assertEqual(duplicate_location["record_number"], 2)
+        self.assertEqual(
+            duplicate_location["related_record_numbers"],
+            [1],
+        )
+        self.assertEqual(
+            [
+                location["record_number"]
+                for location in find_metric(
+                    report,
+                    "time_info_availability",
+                ).issue_locations
+            ],
+            [4, 5],
+        )
 
     def test_normalized_duplicate_ignores_whitespace_and_case(self):
         dataframe = pd.DataFrame(
@@ -225,6 +263,16 @@ class RemainingMetricTests(unittest.TestCase):
         self.assertEqual(metric.field, "amount")
         self.assertAlmostEqual(metric.value, 1 / 5, places=6)
         self.assertEqual(metric.evidence["outlier_samples"], [])
+        self.assertEqual(
+            metric.issue_locations,
+            [
+                {
+                    "record_number": 5,
+                    "fields": ["amount"],
+                    "issue_type": "statistical_outlier",
+                }
+            ],
+        )
 
     def test_minimal_dataset_marks_semantic_metrics_not_assessable(self):
         report = build_profile_report(SAMPLES / "minimal_dataset.json")

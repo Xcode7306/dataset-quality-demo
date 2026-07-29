@@ -1,8 +1,8 @@
 # 政务数据集质量评估 Demo
 
-版本：v0.2
+版本：v0.3
 
-一个本地运行的 Streamlit Demo，用于对 CSV、Excel（`.xls`、`.xlsx`）、表格型 JSON、JSON Lines、GeoJSON FeatureCollection 和同构 JSON 分片 ZIP 数据集生成可复现的质量指标、风险提示与无法评估项。
+一个本地运行的 Streamlit Demo，用于对 CSV、Excel（`.xls`、`.xlsx`）、表格型 JSON、JSON Lines、GeoJSON FeatureCollection 和同构 JSON 分片 ZIP 数据集生成可复现的质量指标、风险提示、疑似问题位置 CSV 与无法评估项，并由只读报告诊断 Agent 提供带证据引用的解释和整改建议。
 
 ## 部署与启动
 
@@ -38,12 +38,32 @@ Windows PowerShell 请将激活命令替换为：
 .venv/bin/python -m src.cli sample_data/good_dataset.csv --output reports/report.md
 ```
 
+## Agent 模式
+
+v0.3 的 Agent 只读消费结构化 `QualityReport`。它不会重新计算 13 项指标、改变风险等级、修改阈值或接触原始字段值。页面中的“概括结果”“优先整改事项”“解释无法评估项”和报告问答都必须由用户显式触发。
+
+默认使用本地模板模式，不需要 API Key，也不会把报告发送到外部服务。若要启用 DeepSeek API，在启动前显式设置：
+
+```bash
+export QUALITY_AGENT_PROVIDER=deepseek
+export DEEPSEEK_API_KEY="<你的 API Key>"
+export DEEPSEEK_MODEL="deepseek-v4-flash"
+python3 run_demo.py
+```
+
+`DEEPSEEK_MODEL` 可在 DeepSeek API 当前支持的模型中切换；截至 2026-07-28，官方列出 `deepseek-v4-flash` 和 `deepseek-v4-pro`，本项目默认使用前者。本项目通过 `httpx` 直接调用 DeepSeek Chat Completions，不依赖 OpenAI API 或 SDK。模型超时、限流、工具越权、输出结构不合法、引用不存在或数字无法落到报告证据时，系统会丢弃该模型结果并回退到本地模板。API Key 不会写入报告、Agent 审计信息或缓存键。
+
+启用外部模型前仍应完成所在单位的数据分类分级、服务采购和跨境/外发审批。白名单上下文虽然不包含原始单元格值，但字段名、聚合统计和风险说明仍可能属于内部元数据。
+
 ## 使用方式
 
 1. 上传 CSV、`.xls`、`.xlsx`、`.json`、`.jsonl`、`.ndjson`、`.geojson` 或同构 JSON 分片 `.zip` 文件；单文件上限为 50 MiB。
 2. 可选填写数据集名称；Excel 可选填写工作表名称。
 3. 选择评估基准日期，点击“运行质量评估”。
-4. 查看数据画像、质量指标、风险提示与无法评估项，并按需下载结构化 JSON 或 Markdown 评估报告。
+4. 查看风险提示、质量指标、数据画像与无法评估项，并按需下载结构化 JSON、Markdown 评估报告或疑似问题位置 CSV。
+5. 在“Agent 解读”页签中按需生成报告概括、优先整改建议、无法评估项说明，或询问仅基于当前报告的问题。
+
+疑似问题位置只在独立 CSV 中提供。记录序号从 1 开始，表示解析后的记录顺序，不包含 CSV/Excel 表头；它不是物理文件行号。当前可定位字段缺失、空白记录、类型不一致、格式异常、重复记录、时间信息缺失或不可解析、来源/版本信息缺失和 IQR 统计异常。CSV 写入每项指标定位到的全部位置，不做静默截断，只包含指标名称、字段名称、问题类型、记录序号及重复记录的关联序号，不包含原始单元格值；重复记录行的“备注”会直接说明当前记录与哪条首次出现的记录完全相同或规范化后相同。位置明细不会进入页面表格、JSON、Markdown 或 Agent 上下文。
 
 JSON 支持以下表格型形态：
 
@@ -83,8 +103,11 @@ GeoJSON 仅支持顶层 `FeatureCollection`：一个 `Feature` 固定对应一�
 ## 功能边界
 
 - 内置确定性数据画像、质量指标与风险规则，无需模型 API；
+- `QualityReport` 是指标和风险的唯一事实源；Agent 输出使用独立 `AgentAnalysis`，不会回写报告；
+- 每条 Agent 事实和整改建议都引用当前报告中的 `metric_key`、`risk_id`、无法评估项或报告摘要；
+- Agent 只可调用只读白名单工具，默认不发送文件名、数据集名称、运行错误全文、原始字段样例、异常原值或记录定位列表；
 - 上传文件仅用于本次临时评估，完成后自动删除；
-- 页面同时提供严格 JSON 与 UTF-8 Markdown 报告，两者均不导出原始字段样例；
+- 页面同时提供严格 JSON、UTF-8 Markdown 报告和独立的疑似问题位置 CSV；JSON 包含稳定报告哈希、引擎版本、基准日期、解析路径和风险判定证据，JSON 与 Markdown 不携带位置明细，三类下载均不导出原始字段样例或异常原值；
 - 不会修改或覆盖原始数据；
 - 仓库包含自动化测试、可演示的合成样例，以及用于一致性检查的固定基准报告；
   用户运行时生成的其他报告默认不纳入版本控制。

@@ -1,0 +1,376 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "quality-report.schema.json",
+  "title": "QualityReport v0.2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "dataset",
+    "status",
+    "schema_version",
+    "profile",
+    "metrics",
+    "risks",
+    "not_assessable",
+    "evaluation_context",
+    "execution"
+  ],
+  "properties": {
+    "dataset": {
+      "$ref": "#/$defs/datasetInfo"
+    },
+    "status": {
+      "enum": [
+        "success",
+        "partial_success",
+        "failed"
+      ]
+    },
+    "schema_version": {
+      "const": "0.2"
+    },
+    "profile": {
+      "type": "object"
+    },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/metricResult"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/riskItem"
+      }
+    },
+    "not_assessable": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/notAssessableItem"
+      }
+    },
+    "evaluation_context": {
+      "$ref": "#/$defs/evaluationContext"
+    },
+    "execution": {
+      "$ref": "#/$defs/execution"
+    }
+  },
+  "$defs": {
+    "datasetInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "file_name",
+        "file_type",
+        "sheet_name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "file_name": {
+          "type": "string"
+        },
+        "file_type": {
+          "type": "string"
+        },
+        "sheet_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "metricResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "category",
+        "status",
+        "value",
+        "unit",
+        "scope",
+        "field",
+        "evidence",
+        "reason",
+        "metric_key"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "evaluated",
+            "not_assessable"
+          ]
+        },
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "enum": [
+            "dataset",
+            "field"
+          ]
+        },
+        "field": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence": {
+          "type": "object"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metric_key": {
+          "type": "string",
+          "pattern": "^metric:[^:]+:(dataset|field:.*)$"
+        }
+      }
+    },
+    "riskItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "level",
+        "title",
+        "message",
+        "related_metrics",
+        "related_metric_keys",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "level": {
+          "enum": [
+            "info",
+            "attention",
+            "warning"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "related_metrics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "related_metric_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^metric:[^:]+:(dataset|field:.*)$"
+          },
+          "uniqueItems": true
+        },
+        "evidence": {
+          "type": "object",
+          "required": [
+            "decision"
+          ],
+          "properties": {
+            "decision": {
+              "$ref": "#/$defs/riskDecision"
+            }
+          }
+        }
+      }
+    },
+    "riskDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "rule_version",
+        "threshold_config_version",
+        "observed_name",
+        "observed_value",
+        "operator",
+        "threshold"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "threshold_config_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "observed_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "observed_value": {
+          "type": [
+            "number",
+            "string",
+            "boolean",
+            "null"
+          ]
+        },
+        "operator": {
+          "enum": [
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "==",
+            "!="
+          ]
+        },
+        "threshold": {
+          "type": [
+            "number",
+            "string",
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "notAssessableItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "reason",
+        "metric_key"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "metric_key": {
+          "type": "string",
+          "pattern": "^metric:[^:]+:(dataset|field:.*)$"
+        }
+      }
+    },
+    "evaluationContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine_version",
+        "reference_date",
+        "threshold_config_version",
+        "parser_path",
+        "input_sha256",
+        "input_size_bytes",
+        "report_sha256"
+      ],
+      "properties": {
+        "engine_version": {
+          "const": "0.3"
+        },
+        "reference_date": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date"
+        },
+        "threshold_config_version": {
+          "const": "0.3"
+        },
+        "parser_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "input_size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "report_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warnings",
+        "errors"
+      ],
+      "properties": {
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

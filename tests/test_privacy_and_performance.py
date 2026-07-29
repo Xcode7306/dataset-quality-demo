@@ -50,6 +50,7 @@ class PrivacyAndPerformanceTests(unittest.TestCase):
 
         serialized = serialize_report(report).decode("utf-8")
 
+        self.assertNotIn("issue_locations", serialized)
         self.assertTrue(
             all(column["non_null_samples"] == [] for column in profile["columns"])
         )
@@ -73,7 +74,7 @@ class PrivacyAndPerformanceTests(unittest.TestCase):
 
     def test_large_coverage_calculation_keeps_counts_and_first_twenty_indices(self):
         # 10 万行回归用例不依赖机器耗时阈值；它验证线性实现
-        # 在大规模数据上仍能正确计数，且只保留有界的行号证据。
+        # 在大规模数据上仍能正确计数，并完整保留独立 CSV 所需位置。
         row_count = 100_000
         missing_positions = set(range(0, row_count, 10))
         dataframe = pd.DataFrame(
@@ -100,6 +101,18 @@ class PrivacyAndPerformanceTests(unittest.TestCase):
                 self.assertEqual(
                     metric.evidence["missing_row_indices"],
                     list(range(1, 192, 10)),
+                )
+                self.assertEqual(
+                    len(metric.issue_locations),
+                    10_000,
+                )
+                self.assertEqual(
+                    metric.issue_locations[0]["record_number"],
+                    1,
+                )
+                self.assertEqual(
+                    metric.issue_locations[-1]["record_number"],
+                    99_991,
                 )
 
 

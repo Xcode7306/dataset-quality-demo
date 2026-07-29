@@ -6,7 +6,7 @@
     "sheet_name": null
   },
   "status": "success",
-  "schema_version": "0.1",
+  "schema_version": "0.2",
   "profile": {
     "row_count": 3,
     "column_count": 2,
@@ -52,7 +52,8 @@
         "successful_file_count": 1,
         "failed_file_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:file_parse_rate:dataset"
     },
     {
       "id": "dataset_scale",
@@ -68,7 +69,8 @@
         "row_count": 3,
         "column_count": 2
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:dataset_scale:dataset"
     },
     {
       "id": "field_missing_rate",
@@ -83,7 +85,8 @@
         "checked_count": 3,
         "issue_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:%E6%A0%87%E9%A2%98"
     },
     {
       "id": "field_missing_rate",
@@ -98,7 +101,8 @@
         "checked_count": 3,
         "issue_count": 0
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:%E8%AF%B4%E6%98%8E"
     },
     {
       "id": "blank_record_rate",
@@ -118,7 +122,8 @@
           "说明"
         ]
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:blank_record_rate:dataset"
     },
     {
       "id": "field_type_consistency",
@@ -131,12 +136,14 @@
       "field": "标题",
       "evidence": {
         "checked_count": 3,
+        "issue_count": 0,
         "dominant_type": "text",
         "type_counts": {
           "text": 3
         }
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:%E6%A0%87%E9%A2%98"
     },
     {
       "id": "field_type_consistency",
@@ -149,12 +156,14 @@
       "field": "说明",
       "evidence": {
         "checked_count": 3,
+        "issue_count": 0,
         "dominant_type": "text",
         "type_counts": {
           "text": 3
         }
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:%E8%AF%B4%E6%98%8E"
     },
     {
       "id": "recognizable_format_anomaly_rate",
@@ -166,7 +175,8 @@
       "scope": "dataset",
       "field": null,
       "evidence": {},
-      "reason": "未识别到可检查的日期、数值、URL 或邮箱字段。"
+      "reason": "未识别到可检查的日期、数值、URL 或邮箱字段。",
+      "metric_key": "metric:recognizable_format_anomaly_rate:dataset"
     },
     {
       "id": "exact_duplicate_rate",
@@ -188,7 +198,8 @@
         ],
         "normalization": false
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:exact_duplicate_rate:dataset"
     },
     {
       "id": "normalized_duplicate_rate",
@@ -210,7 +221,8 @@
         ],
         "normalization": true
       },
-      "reason": null
+      "reason": null,
+      "metric_key": "metric:normalized_duplicate_rate:dataset"
     },
     {
       "id": "time_info_availability",
@@ -222,7 +234,8 @@
       "scope": "dataset",
       "field": null,
       "evidence": {},
-      "reason": "未识别到日期或时间字段。"
+      "reason": "未识别到日期或时间字段。",
+      "metric_key": "metric:time_info_availability:dataset"
     },
     {
       "id": "update_lag_days",
@@ -234,7 +247,8 @@
       "scope": "dataset",
       "field": null,
       "evidence": {},
-      "reason": "未识别到更新时间字段。"
+      "reason": "未识别到更新时间字段。",
+      "metric_key": "metric:update_lag_days:dataset"
     },
     {
       "id": "source_info_coverage",
@@ -246,7 +260,8 @@
       "scope": "dataset",
       "field": null,
       "evidence": {},
-      "reason": "未识别到来源部门、来源链接或原始标识字段。"
+      "reason": "未识别到来源部门、来源链接或原始标识字段。",
+      "metric_key": "metric:source_info_coverage:dataset"
     },
     {
       "id": "version_info_coverage",
@@ -258,7 +273,8 @@
       "scope": "dataset",
       "field": null,
       "evidence": {},
-      "reason": "未识别到版本号、更新时间或处理记录字段。"
+      "reason": "未识别到版本号、更新时间或处理记录字段。",
+      "metric_key": "metric:version_info_coverage:dataset"
     },
     {
       "id": "statistical_outlier_rate",
@@ -270,7 +286,8 @@
       "scope": "dataset",
       "field": null,
       "evidence": {},
-      "reason": "未识别到至少含 4 个可用数值的非标识字段。"
+      "reason": "未识别到至少含 4 个可用数值的非标识字段。",
+      "metric_key": "metric:statistical_outlier_rate:dataset"
     }
   ],
   "risks": [],
@@ -278,34 +295,49 @@
     {
       "id": "recognizable_format_anomaly_rate",
       "name": "可识别格式异常率",
-      "reason": "未识别到可检查的日期、数值、URL 或邮箱字段。"
+      "reason": "未识别到可检查的日期、数值、URL 或邮箱字段。",
+      "metric_key": "metric:recognizable_format_anomaly_rate:dataset"
     },
     {
       "id": "time_info_availability",
       "name": "时间信息可用率",
-      "reason": "未识别到日期或时间字段。"
+      "reason": "未识别到日期或时间字段。",
+      "metric_key": "metric:time_info_availability:dataset"
     },
     {
       "id": "update_lag_days",
       "name": "更新滞后天数",
-      "reason": "未识别到更新时间字段。"
+      "reason": "未识别到更新时间字段。",
+      "metric_key": "metric:update_lag_days:dataset"
     },
     {
       "id": "source_info_coverage",
       "name": "来源信息覆盖率",
-      "reason": "未识别到来源部门、来源链接或原始标识字段。"
+      "reason": "未识别到来源部门、来源链接或原始标识字段。",
+      "metric_key": "metric:source_info_coverage:dataset"
     },
     {
       "id": "version_info_coverage",
       "name": "版本信息覆盖率",
-      "reason": "未识别到版本号、更新时间或处理记录字段。"
+      "reason": "未识别到版本号、更新时间或处理记录字段。",
+      "metric_key": "metric:version_info_coverage:dataset"
     },
     {
       "id": "statistical_outlier_rate",
       "name": "统计异常值比例",
-      "reason": "未识别到至少含 4 个可用数值的非标识字段。"
+      "reason": "未识别到至少含 4 个可用数值的非标识字段。",
+      "metric_key": "metric:statistical_outlier_rate:dataset"
     }
   ],
+  "evaluation_context": {
+    "engine_version": "0.3",
+    "reference_date": "2026-07-17",
+    "threshold_config_version": "0.3",
+    "parser_path": "json",
+    "input_sha256": "9c52b88b9041a00621c3856e8b538b61778a705495597cfea260eafd1df71ec4",
+    "input_size_bytes": 336,
+    "report_sha256": "9bc4f38eab734af0a855e1d22cc75049ccb7c941e7f8bc919a79c2d43b2ced91"
+  },
   "execution": {
     "warnings": [],
     "errors": []

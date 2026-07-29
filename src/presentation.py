@@ -1,5 +1,7 @@
 """将质量报告转换为界面、Markdown 或内部结构化内容，不参与质量计算。"""
 
+import csv
+import io
 import json
 from collections import Counter
 from typing import Any
@@ -22,6 +24,18 @@ TYPE_LABELS = {
     "numeric": "数值",
     "text": "文本",
     "unknown": "未知",
+}
+ISSUE_TYPE_LABELS = {
+    "missing_value": "字段值缺失",
+    "blank_record": "空白记录",
+    "inconsistent_type": "字段类型不一致",
+    "invalid_format": "格式异常",
+    "exact_duplicate_record": "完全重复记录",
+    "normalized_duplicate_record": "规范化后重复记录",
+    "missing_or_invalid_time": "时间信息缺失或不可解析",
+    "missing_source_info": "来源信息缺失",
+    "missing_version_info": "版本信息缺失",
+    "statistical_outlier": "统计异常值",
 }
 
 
@@ -61,14 +75,14 @@ def build_summary(report: QualityReport) -> dict[str, int]:
 
 
 def build_metric_rows(report: QualityReport) -> list[dict[str, Any]]:
-    """生成指标明细表；保留字段级结果和无法评估原因。"""
+    """生成面向用户的指标明细表；内部引用键不在默认视图中展示。"""
 
     return [
         {
+            "指标名称": metric.name,
+            "字段名称": metric.field or "—",
             "类别": metric.category,
-            "指标": metric.name,
             "范围": "字段" if metric.scope == "field" else "数据集",
-            "字段": metric.field or "—",
             "状态": METRIC_STATUS_LABELS[metric.status],
             "结果": format_metric_value(metric),
             "原因": metric.reason or "—",
@@ -98,6 +112,80 @@ def build_profile_rows(report: QualityReport) -> list[dict[str, Any]]:
     return rows
 
 
+def build_issue_location_rows(
+    report: QualityReport,
+    *,
+    metric_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """生成供独立 CSV 导出的完整疑似问题位置明细。"""
+
+    rows: list[dict[str, Any]] = []
+    for metric in report.metrics:
+        if metric_keys is not None and metric.metric_key not in metric_keys:
+            continue
+        for location in metric.issue_locations:
+            if not isinstance(location, dict):
+                continue
+            record_number = location.get("record_number")
+            if (
+                isinstance(record_number, bool)
+                or not isinstance(record_number, int)
+                or record_number < 1
+            ):
+                continue
+            fields = location.get("fields", [])
+            field_names = (
+                [str(field) for field in fields]
+                if isinstance(fields, list)
+                else []
+            )
+            if not field_names and metric.field:
+                field_names = [metric.field]
+            related = location.get("related_record_numbers", [])
+            related_numbers = (
+                [
+                    str(number)
+                    for number in related
+                    if isinstance(number, int)
+                    and not isinstance(number, bool)
+                    and number > 0
+                ]
+                if isinstance(related, list)
+                else []
+            )
+            issue_type = str(location.get("issue_type") or "unknown")
+            related_text = "、".join(related_numbers)
+            if issue_type == "exact_duplicate_record" and related_text:
+                note = (
+                    f"第 {record_number} 条记录与第 {related_text} 条记录"
+                    f"内容完全相同；关联记录序号 {related_text} 表示这组"
+                    "重复数据中首次出现的记录。"
+                )
+            elif issue_type == "normalized_duplicate_record" and related_text:
+                note = (
+                    f"第 {record_number} 条记录与第 {related_text} 条记录"
+                    "在忽略自然文本中的大小写、空白和标点差异后相同；"
+                    f"关联记录序号 {related_text} 表示这组重复数据中"
+                    "首次出现的记录。"
+                )
+            else:
+                note = ""
+            rows.append(
+                {
+                    "疑似问题类型": ISSUE_TYPE_LABELS.get(
+                        issue_type,
+                        issue_type,
+                    ),
+                    "指标名称": metric.name,
+                    "字段名称": "、".join(field_names) or "整条记录",
+                    "数据记录序号": record_number,
+                    "关联记录序号": related_text or "—",
+                    "备注": note,
+                }
+            )
+    return rows
+
+
 def build_risk_chart_rows(report: QualityReport) -> list[dict[str, Any]]:
     """以固定顺序生成三档风险分布，零值也保留。"""
 
@@ -111,7 +199,16 @@ def build_risk_chart_rows(report: QualityReport) -> list[dict[str, Any]]:
 def _markdown_cell(value: object) -> str:
     """将表格内容转为安全、紧凑的 Markdown 单元格。"""
 
-    return str(value).replace("|", "\\|").replace("\n", "<br>")
+    return _markdown_text(value).replace("\n", "<br>")
+
+
+def _markdown_text(value: object) -> str:
+    """转义报告数据中的 Markdown、HTML 和外链图片语法。"""
+
+    text = str(value)
+    for character in ("\\", "`", "*", "[", "]", "(", ")", "<", ">", "#", "!", "|"):
+        text = text.replace(character, f"\\{character}")
+    return text
 
 
 def _markdown_table(headers: list[str], rows: list[list[object]]) -> list[str]:
@@ -148,15 +245,16 @@ def render_markdown_report(report: QualityReport) -> str:
 
     summary = build_summary(report)
     dataset = report.dataset
+    evaluation_context = report.to_dict().get("evaluation_context", {})
     lines = [
-        f"# 数据集质量评估报告：{dataset.name}",
+        f"# 数据集质量评估报告：{_markdown_text(dataset.name)}",
         "",
         _status_summary(report, summary),
         "",
         "## 数据集概况",
         "",
         *(
-            f"- {label}：{value}"
+            f"- {label}：{_markdown_text(value)}"
             for label, value in (
                 ("文件名", dataset.file_name),
                 ("文件类型", dataset.file_type.upper()),
@@ -164,6 +262,11 @@ def render_markdown_report(report: QualityReport) -> str:
                 ("评估状态", "评估完成" if report.status != "failed" else "评估失败"),
                 ("记录数", f"{summary['row_count']:,}"),
                 ("字段数", f"{summary['column_count']:,}"),
+                ("报告哈希", evaluation_context.get("report_sha256", "—")),
+                ("引擎版本", evaluation_context.get("engine_version", "—")),
+                ("评估基准日期", evaluation_context.get("reference_date", "—")),
+                ("阈值配置版本", evaluation_context.get("threshold_config_version", "—")),
+                ("解析路径", evaluation_context.get("parser_path", "—")),
             )
         ),
         "",
@@ -196,11 +299,14 @@ def render_markdown_report(report: QualityReport) -> str:
                 lines.append("")
             lines.extend([f"### {RISK_LEVEL_LABELS[level]}（{len(risks)}）", ""])
             for risk in risks:
-                related = "、".join(risk.related_metrics) or "无"
+                related = "、".join(
+                    risk.related_metric_keys or risk.related_metrics
+                ) or "无"
                 lines.extend(
                     [
-                        f"- **{risk.title}**：{risk.message}",
-                        f"  - 关联指标：{related}",
+                        f"- **{_markdown_text(risk.title)}**："
+                        f"{_markdown_text(risk.message)}",
+                        f"  - 关联指标：{_markdown_text(related)}",
                     ]
                 )
 
@@ -209,10 +315,19 @@ def render_markdown_report(report: QualityReport) -> str:
     if metric_rows:
         lines.extend(
             _markdown_table(
-                ["类别", "指标", "范围", "字段", "状态", "结果", "原因"],
+                [
+                    "指标名称",
+                    "字段名称",
+                    "类别",
+                    "范围",
+                    "状态",
+                    "结果",
+                    "原因",
+                ],
                 [
                     [
-                        row["类别"], row["指标"], row["范围"], row["字段"],
+                        row["指标名称"], row["字段名称"],
+                        row["类别"], row["范围"],
                         row["状态"], row["结果"], row["原因"],
                     ]
                     for row in metric_rows
@@ -255,8 +370,8 @@ def render_markdown_report(report: QualityReport) -> str:
     errors = report.execution.get("errors", [])
     if warnings or errors:
         lines.extend(["", "### 运行信息", ""])
-        lines.extend(f"- 警告：{message}" for message in warnings)
-        lines.extend(f"- 错误：{message}" for message in errors)
+        lines.extend(f"- 警告：{_markdown_text(message)}" for message in warnings)
+        lines.extend(f"- 错误：{_markdown_text(message)}" for message in errors)
 
     lines.extend(
         [
@@ -275,6 +390,24 @@ def serialize_markdown_report(report: QualityReport) -> bytes:
     """生成供用户下载的 UTF-8 Markdown 报告。"""
 
     return render_markdown_report(report).encode("utf-8")
+
+
+def serialize_issue_locations_csv(report: QualityReport) -> bytes:
+    """生成含全部疑似问题位置、且不含原始值的 Excel 兼容 CSV。"""
+
+    fieldnames = [
+        "疑似问题类型",
+        "指标名称",
+        "字段名称",
+        "数据记录序号",
+        "关联记录序号",
+        "备注",
+    ]
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(build_issue_location_rows(report))
+    return output.getvalue().encode("utf-8-sig")
 
 
 def serialize_report(report: QualityReport) -> bytes:
