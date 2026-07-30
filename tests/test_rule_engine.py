@@ -13,6 +13,7 @@ from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
 import src.rule_engine as rule_engine
+from src.history_store import validate_quality_report_payload
 from src.parser import parse_dataset
 from src.resource_limits import ResourceLimitExceeded
 from src.rule_engine import RulePackExecutionError
@@ -126,6 +127,31 @@ class RuleEngineTests(unittest.TestCase):
             FILE_NAME,
             self.approved,
             reference_date=REFERENCE_DATE,
+        )
+
+    def test_enhanced_report_is_accepted_by_v05_history_contract(self):
+        result = self._evaluate()
+
+        payload = validate_quality_report_payload(result.enhanced_report)
+
+        business_metrics = [
+            metric
+            for metric in payload["metrics"]
+            if metric["id"].startswith("business_")
+        ]
+        business_risks = [
+            risk
+            for risk in payload["risks"]
+            if risk["id"].startswith("business_")
+        ]
+        self.assertTrue(business_metrics)
+        self.assertTrue(business_risks)
+        self.assertTrue(
+            all(
+                metric["evidence"].get("rule_definition_sha256")
+                for metric in business_metrics
+                if metric["status"] == "evaluated"
+            )
         )
 
     def test_all_five_rule_types_append_deterministic_metrics_and_attention_risks(self):

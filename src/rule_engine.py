@@ -25,6 +25,7 @@ from .rule_pack import (
     RulePack,
     draft_sha256,
     is_rule_pack_executable,
+    rule_definition_sha256,
     validate_rule_pack,
 )
 
@@ -212,6 +213,7 @@ def _rule_evidence(
         "rule_pack_id": pack.rule_pack_id,
         "rule_pack_version": pack.version,
         "rule_pack_sha256": draft_sha256(pack),
+        "rule_definition_sha256": rule_definition_sha256(rule),
         "rule_id": rule.rule_id,
         "rule_type": rule.type,
         "threshold_source": "approved_rule_pack",

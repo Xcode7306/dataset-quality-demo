@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "governance-record.schema.json",
+  "title": "GovernanceRecord v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_id",
+    "record_sha256",
+    "comparison_sha256",
+    "plan_sha256",
+    "baseline_report_sha256",
+    "target_report_sha256",
+    "dataset_series_id",
+    "operator",
+    "recorded_at",
+    "outcomes",
+    "history_policy"
+  ],
+  "properties": {
+    "schema_version": {"const": "0.1"},
+    "record_id": {
+      "type": "string",
+      "pattern": "^governance-[0-9a-f]{24}$"
+    },
+    "record_sha256": {"$ref": "#/$defs/hash"},
+    "comparison_sha256": {"$ref": "#/$defs/hash"},
+    "plan_sha256": {"$ref": "#/$defs/hash"},
+    "baseline_report_sha256": {"$ref": "#/$defs/hash"},
+    "target_report_sha256": {"$ref": "#/$defs/hash"},
+    "dataset_series_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "operator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "identity_verified"],
+      "properties": {
+        "label": {"type": "string", "minLength": 1, "maxLength": 100},
+        "identity_verified": {"const": false}
+      }
+    },
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "outcomes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "improved_change_ids",
+        "regressed_change_ids",
+        "resolved_risk_change_ids",
+        "task_status_counts",
+        "open_task_ids"
+      ],
+      "properties": {
+        "improved_change_ids": {"$ref": "#/$defs/changeIds"},
+        "regressed_change_ids": {"$ref": "#/$defs/changeIds"},
+        "resolved_risk_change_ids": {"$ref": "#/$defs/changeIds"},
+        "task_status_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["open", "in_progress", "done", "accepted_risk"],
+          "properties": {
+            "open": {"$ref": "#/$defs/count"},
+            "in_progress": {"$ref": "#/$defs/count"},
+            "done": {"$ref": "#/$defs/count"},
+            "accepted_risk": {"$ref": "#/$defs/count"}
+          }
+        },
+        "open_task_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^task-[0-9a-f]{24}$"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "history_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_version",
+        "storage_mode",
+        "retention",
+        "access_scope",
+        "identity_authentication",
+        "manual_deletion_supported",
+        "raw_upload_bytes_stored",
+        "issue_location_csv_stored",
+        "max_reports",
+        "max_report_bytes",
+        "max_total_bytes"
+      ],
+      "properties": {
+        "policy_version": {"const": "0.5"},
+        "storage_mode": {"const": "session_memory"},
+        "retention": {
+          "const": "until_explicit_deletion_or_session_termination"
+        },
+        "access_scope": {"const": "current_local_browser_session"},
+        "identity_authentication": {"const": false},
+        "manual_deletion_supported": {"const": true},
+        "raw_upload_bytes_stored": {"const": false},
+        "issue_location_csv_stored": {"const": false},
+        "max_reports": {"type": "integer", "minimum": 1},
+        "max_report_bytes": {"type": "integer", "minimum": 1},
+        "max_total_bytes": {"type": "integer", "minimum": 1}
+      }
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "count": {"type": "integer", "minimum": 0},
+    "changeIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(metric|risk|assessability|schema)-change-[0-9a-f]{24}$"
+      },
+      "uniqueItems": true
+    }
+  }
+}
