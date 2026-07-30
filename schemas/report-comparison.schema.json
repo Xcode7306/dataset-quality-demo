@@ -1,0 +1,389 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "report-comparison.schema.json",
+  "title": "ReportComparison v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "comparison_id",
+    "comparison_sha256",
+    "comparator",
+    "baseline",
+    "target",
+    "lineage",
+    "compatibility",
+    "summary",
+    "metric_changes",
+    "risk_changes",
+    "assessability_changes",
+    "schema_changes",
+    "limitations"
+  ],
+  "properties": {
+    "schema_version": {"const": "0.1"},
+    "comparison_id": {
+      "type": "string",
+      "pattern": "^comparison-[0-9a-f]{24}$"
+    },
+    "comparison_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "comparator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "policy_version"],
+      "properties": {
+        "name": {"const": "quality-report-comparator"},
+        "version": {"const": "0.5"},
+        "policy_version": {"const": "0.1"}
+      }
+    },
+    "baseline": {"$ref": "#/$defs/reportReference"},
+    "target": {"$ref": "#/$defs/reportReference"},
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dataset_series_id",
+        "same_series_confirmed",
+        "ordered_report_sha256",
+        "confirmation_sha256"
+      ],
+      "properties": {
+        "dataset_series_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "same_series_confirmed": {"const": true},
+        "ordered_report_sha256": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "confirmation_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason_codes", "context_change_codes"],
+      "properties": {
+        "status": {"enum": ["full", "limited", "incompatible"]},
+        "reason_codes": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "context_change_codes": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric_change_count",
+        "improved_metric_count",
+        "worsened_metric_count",
+        "changed_metric_count",
+        "unchanged_metric_count",
+        "added_metric_count",
+        "removed_metric_count",
+        "not_comparable_metric_count",
+        "became_assessable_metric_count",
+        "became_not_assessable_metric_count",
+        "risk_change_count",
+        "added_risk_count",
+        "resolved_risk_count",
+        "persistent_risk_count",
+        "increased_risk_count",
+        "decreased_risk_count",
+        "not_comparable_risk_count",
+        "assessability_change_count",
+        "became_assessable_count",
+        "became_not_assessable_count",
+        "schema_change_count"
+      ],
+      "properties": {
+        "metric_change_count": {"$ref": "#/$defs/count"},
+        "improved_metric_count": {"$ref": "#/$defs/count"},
+        "worsened_metric_count": {"$ref": "#/$defs/count"},
+        "changed_metric_count": {"$ref": "#/$defs/count"},
+        "unchanged_metric_count": {"$ref": "#/$defs/count"},
+        "added_metric_count": {"$ref": "#/$defs/count"},
+        "removed_metric_count": {"$ref": "#/$defs/count"},
+        "not_comparable_metric_count": {"$ref": "#/$defs/count"},
+        "became_assessable_metric_count": {"$ref": "#/$defs/count"},
+        "became_not_assessable_metric_count": {"$ref": "#/$defs/count"},
+        "risk_change_count": {"$ref": "#/$defs/count"},
+        "added_risk_count": {"$ref": "#/$defs/count"},
+        "resolved_risk_count": {"$ref": "#/$defs/count"},
+        "persistent_risk_count": {"$ref": "#/$defs/count"},
+        "increased_risk_count": {"$ref": "#/$defs/count"},
+        "decreased_risk_count": {"$ref": "#/$defs/count"},
+        "not_comparable_risk_count": {"$ref": "#/$defs/count"},
+        "assessability_change_count": {"$ref": "#/$defs/count"},
+        "became_assessable_count": {"$ref": "#/$defs/count"},
+        "became_not_assessable_count": {"$ref": "#/$defs/count"},
+        "schema_change_count": {"$ref": "#/$defs/count"}
+      }
+    },
+    "metric_changes": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/metricChange"}
+    },
+    "risk_changes": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/riskChange"}
+    },
+    "assessability_changes": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/assessabilityChange"}
+    },
+    "schema_changes": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/schemaChange"}
+    },
+    "limitations": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nullableHash": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "reportReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_sha256",
+        "input_sha256",
+        "report_schema_version",
+        "engine_version",
+        "threshold_config_version",
+        "reference_date",
+        "parser_path",
+        "dataset_name",
+        "file_name",
+        "status",
+        "row_count",
+        "column_count"
+      ],
+      "properties": {
+        "report_sha256": {"$ref": "#/$defs/hash"},
+        "input_sha256": {"$ref": "#/$defs/nullableHash"},
+        "report_schema_version": {"type": "string", "minLength": 1},
+        "engine_version": {"type": "string", "minLength": 1},
+        "threshold_config_version": {"type": "string", "minLength": 1},
+        "reference_date": {"type": ["string", "null"]},
+        "parser_path": {"type": ["string", "null"]},
+        "dataset_name": {"type": "string"},
+        "file_name": {"type": "string"},
+        "status": {"enum": ["success", "partial_success", "failed"]},
+        "row_count": {"$ref": "#/$defs/count"},
+        "column_count": {"$ref": "#/$defs/count"}
+      }
+    },
+    "reasonCodes": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "metricChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "change_id",
+        "metric_key",
+        "metric_id",
+        "name",
+        "field",
+        "direction",
+        "classification",
+        "baseline_status",
+        "target_status",
+        "baseline_value",
+        "target_value",
+        "delta",
+        "unit",
+        "reason_codes"
+      ],
+      "properties": {
+        "change_id": {
+          "type": "string",
+          "pattern": "^metric-change-[0-9a-f]{24}$"
+        },
+        "metric_key": {"type": "string", "minLength": 1},
+        "metric_id": {"type": "string", "minLength": 1},
+        "name": {"type": "string"},
+        "field": {"type": ["string", "null"]},
+        "direction": {
+          "enum": ["higher_is_better", "lower_is_better", "neutral"]
+        },
+        "classification": {
+          "enum": [
+            "added",
+            "removed",
+            "unchanged",
+            "improved",
+            "worsened",
+            "changed",
+            "became_assessable",
+            "became_not_assessable",
+            "not_comparable"
+          ]
+        },
+        "baseline_status": {
+          "type": ["string", "null"],
+          "enum": ["evaluated", "not_assessable", null]
+        },
+        "target_status": {
+          "type": ["string", "null"],
+          "enum": ["evaluated", "not_assessable", null]
+        },
+        "baseline_value": {"type": ["number", "null"]},
+        "target_value": {"type": ["number", "null"]},
+        "delta": {"type": ["number", "null"]},
+        "unit": {"type": ["string", "null"]},
+        "reason_codes": {"$ref": "#/$defs/reasonCodes"}
+      }
+    },
+    "riskChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "change_id",
+        "risk_id",
+        "title",
+        "classification",
+        "baseline_level",
+        "target_level",
+        "related_metric_keys",
+        "reason_codes"
+      ],
+      "properties": {
+        "change_id": {
+          "type": "string",
+          "pattern": "^risk-change-[0-9a-f]{24}$"
+        },
+        "risk_id": {"type": "string", "minLength": 1},
+        "title": {"type": "string"},
+        "classification": {
+          "enum": [
+            "added",
+            "resolved",
+            "persistent",
+            "severity_increased",
+            "severity_decreased",
+            "not_comparable"
+          ]
+        },
+        "baseline_level": {
+          "type": ["string", "null"],
+          "enum": ["info", "attention", "warning", null]
+        },
+        "target_level": {
+          "type": ["string", "null"],
+          "enum": ["info", "attention", "warning", null]
+        },
+        "related_metric_keys": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "reason_codes": {"$ref": "#/$defs/reasonCodes"}
+      }
+    },
+    "assessabilityChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "change_id",
+        "metric_key",
+        "name",
+        "classification",
+        "baseline_reason",
+        "target_reason"
+      ],
+      "properties": {
+        "change_id": {
+          "type": "string",
+          "pattern": "^assessability-change-[0-9a-f]{24}$"
+        },
+        "metric_key": {"type": "string", "minLength": 1},
+        "name": {"type": "string"},
+        "classification": {
+          "enum": [
+            "became_assessable",
+            "became_not_assessable",
+            "persistent",
+            "reason_changed",
+            "added_with_metric",
+            "removed_with_metric"
+          ]
+        },
+        "baseline_reason": {"type": ["string", "null"]},
+        "target_reason": {"type": ["string", "null"]}
+      }
+    },
+    "schemaChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "change_id",
+        "kind",
+        "field",
+        "baseline_value",
+        "target_value"
+      ],
+      "properties": {
+        "change_id": {
+          "type": "string",
+          "pattern": "^schema-change-[0-9a-f]{24}$"
+        },
+        "kind": {
+          "enum": [
+            "field_added",
+            "field_removed",
+            "field_type_changed",
+            "field_order_changed",
+            "row_count_changed",
+            "column_count_changed"
+          ]
+        },
+        "field": {"type": ["string", "null"]},
+        "baseline_value": {"$ref": "#/$defs/schemaValue"},
+        "target_value": {"$ref": "#/$defs/schemaValue"}
+      }
+    },
+    "schemaValue": {
+      "oneOf": [
+        {"type": "string"},
+        {"type": "integer"},
+        {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        {"type": "null"}
+      ]
+    }
+  }
+}

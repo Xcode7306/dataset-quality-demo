@@ -12,6 +12,24 @@ import streamlit as st
 
 from src.agent_models import AgentAnalysis
 from src.agent_service import run_agent
+from src.comparison_service import (
+    ReportComparisonError,
+    compare_reports,
+    serialize_report_comparison,
+)
+from src.comparison_presentation import (
+    serialize_action_plan_csv,
+    serialize_action_plan_json,
+    serialize_action_plan_markdown,
+    serialize_governance_record,
+)
+from src.history_store import (
+    DEFAULT_HISTORY_POLICY,
+    HistoryEntry,
+    HistoryValidationError,
+    InMemoryReportHistoryStore,
+    build_version_trend,
+)
 from src.models import QualityReport
 from src.parser import DatasetReadError, UnsupportedFileTypeError
 from src.presentation import (
@@ -25,6 +43,12 @@ from src.presentation import (
     serialize_report,
 )
 from src.resource_limits import MAX_INPUT_FILE_MIB
+from src.remediation import (
+    RemediationValidationError,
+    assign_task,
+    build_action_plan,
+    build_governance_record,
+)
 from src.rule_engine import RulePackExecutionError
 from src.rule_pack import (
     Rule,
@@ -46,6 +70,8 @@ from src.upload_service import evaluate_uploaded_dataset, sanitize_file_name
 
 AGENT_STATE_KEY = "agent_ui_state"
 RULE_STATE_KEY = "rule_ui_state"
+HISTORY_STORE_KEY = "v05_report_history_store"
+HISTORY_COMPARISON_STATE_KEY = "v05_history_comparison_state"
 AGENT_HISTORY_LIMIT = 8
 AGENT_PRIORITY_LABELS = {
     "high": "高",
@@ -76,6 +102,53 @@ RULE_FREQUENCIES = {
     "每年（366 天）": ("yearly", 366),
     "自定义天数": ("custom", None),
 }
+COMPARISON_CLASSIFICATION_LABELS = {
+    "added": "新增",
+    "removed": "移除",
+    "unchanged": "未变化",
+    "improved": "已改善",
+    "worsened": "已恶化",
+    "changed": "发生变化",
+    "became_assessable": "恢复可评估",
+    "became_not_assessable": "变为无法评估",
+    "not_comparable": "不可比较",
+    "resolved": "已解除",
+    "persistent": "持续存在",
+    "severity_increased": "等级升高",
+    "severity_decreased": "等级降低",
+    "reason_changed": "原因变化",
+    "added_with_metric": "随新增指标出现",
+    "removed_with_metric": "随移除指标消失",
+}
+SCHEMA_CHANGE_LABELS = {
+    "field_added": "字段新增",
+    "field_removed": "字段移除",
+    "field_type_changed": "字段类型变化",
+    "field_order_changed": "字段顺序变化",
+    "row_count_changed": "记录数变化",
+    "column_count_changed": "字段数变化",
+}
+REMEDIATION_PRIORITY_LABELS = {
+    "high": "高",
+    "medium": "中",
+    "low": "低",
+}
+REMEDIATION_STATUS_OPTIONS = {
+    "待处理": "open",
+    "进行中": "in_progress",
+    "已完成": "done",
+    "已接受风险": "accepted_risk",
+}
+REMEDIATION_STATUS_LABELS = {
+    value: label
+    for label, value in REMEDIATION_STATUS_OPTIONS.items()
+}
+REMEDIATION_CATEGORY_LABELS = {
+    "risk": "风险",
+    "metric": "指标",
+    "assessability": "可评估性",
+    "schema": "字段结构",
+}
 
 
 st.set_page_config(
@@ -97,6 +170,32 @@ def _clear_rule_state() -> None:
     st.session_state.pop(RULE_STATE_KEY, None)
     for key in RULE_WIDGET_KEYS:
         st.session_state.pop(key, None)
+
+
+def _history_store() -> InMemoryReportHistoryStore:
+    """返回只属于当前本地浏览器会话的历史仓库。"""
+
+    store = st.session_state.get(HISTORY_STORE_KEY)
+    if not isinstance(store, InMemoryReportHistoryStore):
+        store = InMemoryReportHistoryStore()
+        st.session_state[HISTORY_STORE_KEY] = store
+    return store
+
+
+def _clear_history_comparison_state() -> None:
+    """历史集合变化后清除由旧快照生成的比较、任务与确认状态。"""
+
+    st.session_state.pop(HISTORY_COMPARISON_STATE_KEY, None)
+
+
+def _history_entry_label(entry: HistoryEntry) -> str:
+    """生成不参与路径或授权判断的历史选择器标签。"""
+
+    return (
+        f"{entry.dataset_series_id} · {entry.version_label} · "
+        f"{entry.saved_at} · "
+        f"{entry.report_sha256[:12]}"
+    )
 
 
 def _escape_markdown(value: object) -> str:
@@ -1181,6 +1280,811 @@ def _render_execution(report: QualityReport) -> None:
         st.error(_escape_markdown(message))
 
 
+def _history_collection_signature(entries: tuple[HistoryEntry, ...]) -> str:
+    payload = [
+        [entry.entry_id, entry.report_sha256, entry.dataset_series_id]
+        for entry in entries
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _history_summary_rows(entries: tuple[HistoryEntry, ...]) -> list[dict]:
+    rows: list[dict] = []
+    for entry in entries:
+        summary = entry.to_summary_dict()
+        rows.append(
+            {
+                "治理对象": summary["dataset_series_id"],
+                "版本": summary["version_label"],
+                "保存时间（UTC）": summary["saved_at"],
+                "状态": summary["status"],
+                "记录数": summary["row_count"],
+                "字段数": summary["column_count"],
+                "警告": summary["warning_count"],
+                "关注": summary["attention_count"],
+                "提示": summary["info_count"],
+                "无法评估": summary["not_assessable_count"],
+                "报告哈希": summary["report_sha256"],
+            }
+        )
+    return rows
+
+
+def _comparison_value(value: object) -> object:
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    return "—" if value is None else str(value)
+
+
+def _render_report_comparison(comparison) -> None:
+    """只展示已通过比较服务校验的确定性差异。"""
+
+    payload = comparison.to_dict()
+    summary = payload["summary"]
+    st.markdown("#### 确定性整改比较")
+    st.caption(
+        f"比较哈希：{payload['comparison_sha256']} · "
+        f"整改前：{payload['baseline']['report_sha256']} · "
+        f"整改后：{payload['target']['report_sha256']}"
+    )
+    summary_columns = st.columns(6)
+    for column, label, key in zip(
+        summary_columns,
+        (
+            "改善指标",
+            "恶化指标",
+            "解除风险",
+            "新增风险",
+            "恢复可评估",
+            "变为无法评估",
+        ),
+        (
+            "improved_metric_count",
+            "worsened_metric_count",
+            "resolved_risk_count",
+            "added_risk_count",
+            "became_assessable_count",
+            "became_not_assessable_count",
+        ),
+    ):
+        column.metric(label, int(summary.get(key, 0)))
+
+    metric_rows = [
+        {
+            "指标": change["name"],
+            "字段": change["field"] or "—",
+            "分类": COMPARISON_CLASSIFICATION_LABELS.get(
+                change["classification"],
+                change["classification"],
+            ),
+            "整改前": _comparison_value(change["baseline_value"]),
+            "整改后": _comparison_value(change["target_value"]),
+            "差值": _comparison_value(change["delta"]),
+            "单位": change["unit"] or "—",
+            "指标键": change["metric_key"],
+        }
+        for change in payload["metric_changes"]
+        if change["classification"] != "unchanged"
+    ]
+    st.markdown("##### 指标变化")
+    if metric_rows:
+        st.dataframe(pd.DataFrame(metric_rows), hide_index=True, width="stretch")
+    else:
+        st.info("两份报告没有需要展示的指标变化。")
+
+    risk_rows = [
+        {
+            "风险": change["title"],
+            "分类": COMPARISON_CLASSIFICATION_LABELS.get(
+                change["classification"],
+                change["classification"],
+            ),
+            "整改前等级": change["baseline_level"] or "—",
+            "整改后等级": change["target_level"] or "—",
+            "风险 ID": change["risk_id"],
+            "关联指标": "、".join(change["related_metric_keys"]) or "—",
+        }
+        for change in payload["risk_changes"]
+        if change["classification"] != "persistent"
+    ]
+    st.markdown("##### 风险变化")
+    if risk_rows:
+        st.dataframe(pd.DataFrame(risk_rows), hide_index=True, width="stretch")
+    else:
+        st.info("两份报告没有新增、解除或等级变化的风险。")
+
+    assessability_rows = [
+        {
+            "项目": change["name"],
+            "分类": COMPARISON_CLASSIFICATION_LABELS.get(
+                change["classification"],
+                change["classification"],
+            ),
+            "整改前原因": change["baseline_reason"] or "—",
+            "整改后原因": change["target_reason"] or "—",
+            "指标键": change["metric_key"],
+        }
+        for change in payload["assessability_changes"]
+        if change["classification"] != "persistent"
+    ]
+    st.markdown("##### 无法评估项变化")
+    if assessability_rows:
+        st.dataframe(
+            pd.DataFrame(assessability_rows),
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.info("两份报告没有需要展示的无法评估项变化。")
+
+    schema_rows = [
+        {
+            "变化": SCHEMA_CHANGE_LABELS.get(
+                change["kind"],
+                change["kind"],
+            ),
+            "字段": change["field"] or "—",
+            "整改前": _comparison_value(change["baseline_value"]),
+            "整改后": _comparison_value(change["target_value"]),
+        }
+        for change in payload["schema_changes"]
+    ]
+    st.markdown("##### 字段结构与规模变化")
+    if schema_rows:
+        st.dataframe(pd.DataFrame(schema_rows), hide_index=True, width="stretch")
+    else:
+        st.info("两份报告的字段结构与规模没有变化。")
+
+    limitations = payload.get("limitations", [])
+    if limitations:
+        with st.expander("比较限制与上下文变化"):
+            for limitation in limitations:
+                st.text(str(limitation))
+
+
+def _render_v05_remediation_ui(
+    comparison,
+    action_plan,
+    state: dict,
+    *,
+    dataset_series_id: str,
+) -> None:
+    """渲染本地整改任务、人工分派、导出和治理留痕。"""
+
+    plan = action_plan
+    st.markdown("#### 本地整改行动计划")
+    st.caption(
+        "任务由固定比较结果通过本地确定性模板生成，不调用外部模型；"
+        "人工分派只更新负责人、截止日期和状态，不改写比较证据。"
+    )
+
+    if plan.tasks:
+        task_options = {
+            (
+                f"{REMEDIATION_PRIORITY_LABELS[task.priority]}｜"
+                f"{task.title}｜{task.task_id[-8:]}"
+            ): task.task_id
+            for task in plan.tasks
+        }
+        plan_widget_hash = plan.plan_sha256[:16]
+        selected_task_label = st.selectbox(
+            "待分派任务",
+            options=list(task_options),
+            key=f"v05_remediation_task_{plan_widget_hash}",
+        )
+        selected_task_id = task_options[selected_task_label]
+        selected_task = next(
+            task
+            for task in plan.tasks
+            if task.task_id == selected_task_id
+        )
+        with st.expander("查看所选任务依据与验收标准"):
+            st.text(selected_task.detail)
+            st.text(
+                "验收标准：\n"
+                + "\n".join(
+                    f"• {item}"
+                    for item in selected_task.acceptance_criteria
+                )
+            )
+        assignment_columns = st.columns(3)
+        with assignment_columns[0]:
+            assignee = st.text_input(
+                "负责人",
+                value=selected_task.assignee or "",
+                max_chars=100,
+                key=(
+                    f"v05_remediation_assignee_{plan_widget_hash}_"
+                    f"{selected_task_id}"
+                ),
+            )
+        with assignment_columns[1]:
+            due_date_value = st.date_input(
+                "计划完成日期",
+                value=(
+                    date.fromisoformat(selected_task.due_date)
+                    if selected_task.due_date
+                    else date.today()
+                ),
+                key=(
+                    f"v05_remediation_due_date_{plan_widget_hash}_"
+                    f"{selected_task_id}"
+                ),
+            )
+        with assignment_columns[2]:
+            status_labels = list(REMEDIATION_STATUS_OPTIONS)
+            current_status_label = REMEDIATION_STATUS_LABELS[
+                selected_task.status
+            ]
+            status_label = st.selectbox(
+                "任务状态",
+                options=status_labels,
+                index=status_labels.index(current_status_label),
+                key=(
+                    f"v05_remediation_status_{plan_widget_hash}_"
+                    f"{selected_task_id}"
+                ),
+            )
+        save_assignment = st.button(
+            "保存任务分派",
+            key=(
+                f"v05_remediation_save_assignment_{plan_widget_hash}_"
+                f"{selected_task_id}"
+            ),
+        )
+        if save_assignment:
+            try:
+                updated_plan = assign_task(
+                    plan,
+                    selected_task_id,
+                    assignee=assignee,
+                    due_date=due_date_value,
+                    status=REMEDIATION_STATUS_OPTIONS[status_label],
+                )
+            except RemediationValidationError as error:
+                st.error(f"任务分派未保存：{error}")
+            except Exception:
+                st.error("任务分派未保存：本地整改服务暂时不可用。")
+            else:
+                plan = updated_plan
+                state["action_plan"] = updated_plan
+                # 治理记录绑定计划哈希；任何分派变化都必须重新生成留痕。
+                state["governance_record"] = None
+                st.session_state[HISTORY_COMPARISON_STATE_KEY] = state
+                st.success(
+                    f"任务分派已保存，行动计划哈希更新为 "
+                    f"{updated_plan.plan_sha256[:12]}。"
+                )
+    else:
+        st.info("当前比较没有生成需要分派的确定性整改任务。")
+
+    plan_payload = plan.to_dict()
+    st.text(plan_payload["improvement_summary"]["headline"])
+    plan_limitations = plan_payload["improvement_summary"]["limitations"]
+    if plan_limitations:
+        with st.expander("行动计划限制"):
+            for limitation in plan_limitations:
+                st.text(str(limitation))
+    task_rows = [
+        {
+            "任务 ID": task.task_id,
+            "类别": REMEDIATION_CATEGORY_LABELS[task.category],
+            "优先级": REMEDIATION_PRIORITY_LABELS[task.priority],
+            "状态": REMEDIATION_STATUS_LABELS[task.status],
+            "任务": task.title,
+            "建议责任角色": task.suggested_owner_role,
+            "负责人": task.assignee or "未分派",
+            "截止日期": task.due_date or "未设置",
+            "变化依据": "、".join(task.change_ids),
+        }
+        for task in plan.tasks
+    ]
+    if task_rows:
+        st.dataframe(
+            pd.DataFrame(task_rows),
+            hide_index=True,
+            width="stretch",
+        )
+    st.markdown("##### 下一轮建议")
+    for suggestion in plan.next_round_suggestions:
+        st.text(f"• {suggestion}")
+
+    plan_json_name = sanitize_file_name(
+        f"{dataset_series_id}_remediation_plan.json",
+        default_name="remediation_plan.json",
+        safe_extension=".json",
+    )
+    plan_markdown_name = sanitize_file_name(
+        f"{dataset_series_id}_remediation_plan.md",
+        default_name="remediation_plan.md",
+        safe_extension=".md",
+    )
+    plan_csv_name = sanitize_file_name(
+        f"{dataset_series_id}_remediation_plan.csv",
+        default_name="remediation_plan.csv",
+        safe_extension=".csv",
+    )
+    export_columns = st.columns(3)
+    with export_columns[0]:
+        st.download_button(
+            "下载整改行动计划（JSON）",
+            data=serialize_action_plan_json(plan),
+            file_name=plan_json_name,
+            mime="application/json",
+        )
+    with export_columns[1]:
+        st.download_button(
+            "下载整改行动计划（Markdown）",
+            data=serialize_action_plan_markdown(plan),
+            file_name=plan_markdown_name,
+            mime="text/markdown",
+        )
+    with export_columns[2]:
+        st.download_button(
+            "下载整改行动计划（CSV）",
+            data=serialize_action_plan_csv(plan),
+            file_name=plan_csv_name,
+            mime="text/csv",
+        )
+
+    st.markdown("#### 治理记录")
+    st.caption(
+        "记录人标识仅为当前本地会话中的自声明信息；"
+        "系统不验证真实身份，导出的 identity_verified 固定为 false。"
+    )
+    governance_widget_hash = plan.plan_sha256[:16]
+    operator = st.text_input(
+        "记录人标识（本地自声明）",
+        max_chars=100,
+        key=f"v05_governance_operator_{governance_widget_hash}",
+    )
+    operator_confirmed = st.checkbox(
+        "我确认该记录人标识仅为本地自声明，系统未验证身份。",
+        key=f"v05_governance_confirmed_{governance_widget_hash}",
+    )
+    generate_record = st.button(
+        "生成治理记录",
+        key=f"v05_governance_generate_{governance_widget_hash}",
+        disabled=not operator.strip() or not operator_confirmed,
+    )
+    if generate_record:
+        if not operator.strip() or not operator_confirmed:
+            st.error("治理记录未生成：请填写并确认本地自声明标识。")
+        else:
+            try:
+                governance_record = build_governance_record(
+                    comparison,
+                    plan,
+                    operator=operator,
+                )
+            except RemediationValidationError as error:
+                st.error(f"治理记录未生成：{error}")
+            except Exception:
+                st.error("治理记录未生成：本地治理服务暂时不可用。")
+            else:
+                state["governance_record"] = governance_record
+                st.session_state[HISTORY_COMPARISON_STATE_KEY] = state
+                st.success(
+                    f"治理记录已生成，记录哈希 "
+                    f"{governance_record.record_sha256[:12]}。"
+                )
+
+    governance_record = state.get("governance_record")
+    if governance_record is not None:
+        record_payload = governance_record.to_dict()
+        st.text(
+            "记录 ID："
+            f"{record_payload['record_id']}\n"
+            f"记录时间（UTC）：{record_payload['recorded_at']}\n"
+            f"记录人（本地自声明）：{record_payload['operator']['label']}\n"
+            "身份已验证：否\n"
+            f"绑定比较哈希：{record_payload['comparison_sha256']}\n"
+            f"绑定计划哈希：{record_payload['plan_sha256']}"
+        )
+        governance_download_name = sanitize_file_name(
+            f"{dataset_series_id}_governance_record.json",
+            default_name="governance_record.json",
+            safe_extension=".json",
+        )
+        st.download_button(
+            "下载治理记录（JSON）",
+            data=serialize_governance_record(governance_record),
+            file_name=governance_download_name,
+            mime="application/json",
+        )
+
+
+def _render_v05_comparison_ui(
+    store: InMemoryReportHistoryStore,
+    series_entries: tuple[HistoryEntry, ...],
+    *,
+    dataset_series_id: str,
+    collection_signature: str,
+) -> None:
+    """选择并比较两份固定报告；选择变化会使旧比较与任务失效。"""
+
+    st.markdown("#### 整改前后比较")
+    option_to_entry_id = {
+        _history_entry_label(entry): entry.entry_id
+        for entry in series_entries
+    }
+    option_labels = list(option_to_entry_id)
+    selector_columns = st.columns(2)
+    with selector_columns[0]:
+        baseline_selection = st.selectbox(
+            "整改前报告",
+            options=option_labels,
+            index=0,
+            key=(
+                f"v05_history_before_{collection_signature}_"
+                f"{hashlib.sha256(dataset_series_id.encode('utf-8')).hexdigest()[:8]}"
+            ),
+        )
+    with selector_columns[1]:
+        target_selection = st.selectbox(
+            "整改后报告",
+            options=option_labels,
+            index=len(option_labels) - 1,
+            key=(
+                f"v05_history_after_{collection_signature}_"
+                f"{hashlib.sha256(dataset_series_id.encode('utf-8')).hexdigest()[:8]}"
+            ),
+        )
+    baseline_id = option_to_entry_id[baseline_selection]
+    target_id = option_to_entry_id[target_selection]
+    baseline_entry = store.get(baseline_id)
+    target_entry = store.get(target_id)
+    selection_signature = (
+        dataset_series_id,
+        baseline_id,
+        baseline_entry.report_sha256 if baseline_entry else "",
+        target_id,
+        target_entry.report_sha256 if target_entry else "",
+    )
+    state = st.session_state.get(HISTORY_COMPARISON_STATE_KEY)
+    if (
+        not isinstance(state, dict)
+        or state.get("selection_signature") != selection_signature
+    ):
+        state = {
+            "selection_signature": selection_signature,
+            "comparison": None,
+            "action_plan": None,
+            "governance_record": None,
+        }
+        st.session_state[HISTORY_COMPARISON_STATE_KEY] = state
+
+    selection_hash = hashlib.sha256(
+        json.dumps(
+            selection_signature,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    same_series_confirmed = st.checkbox(
+        "我已核对两份固定报告，并明确确认它们属于同一治理对象。",
+        key=f"v05_history_same_series_confirmed_{selection_hash}",
+    )
+    run_comparison = st.button(
+        "比较固定报告",
+        key=f"v05_history_compare_{selection_hash}",
+        type="primary",
+        disabled=(
+            baseline_id == target_id
+            or not same_series_confirmed
+        ),
+    )
+    if baseline_id == target_id:
+        st.info("整改前和整改后必须选择两份不同的固定报告。")
+
+    if run_comparison:
+        if (
+            not same_series_confirmed
+            or baseline_entry is None
+            or target_entry is None
+            or baseline_entry.dataset_series_id != dataset_series_id
+            or target_entry.dataset_series_id != dataset_series_id
+        ):
+            st.error("报告选择或同一治理对象确认已失效，请重新核对。")
+        else:
+            try:
+                comparison = compare_reports(
+                    baseline_entry.report_payload,
+                    target_entry.report_payload,
+                    dataset_series_id=dataset_series_id,
+                    same_series_confirmed=same_series_confirmed,
+                )
+                action_plan = build_action_plan(comparison)
+            except ReportComparisonError as error:
+                st.error(f"固定报告未能比较：{error}")
+            except RemediationValidationError as error:
+                st.error(f"整改行动计划未能生成：{error}")
+            except Exception:
+                st.error("固定报告未能比较：本地比较或整改服务暂时不可用。")
+            else:
+                state = {
+                    "selection_signature": selection_signature,
+                    "comparison": comparison,
+                    "action_plan": action_plan,
+                    "governance_record": None,
+                }
+                st.session_state[HISTORY_COMPARISON_STATE_KEY] = state
+
+    state = st.session_state.get(HISTORY_COMPARISON_STATE_KEY, state)
+    comparison = state.get("comparison") if isinstance(state, dict) else None
+    if comparison is None:
+        st.info("明确确认并点击比较后，才会生成确定性差异和整改任务。")
+        return
+
+    _render_report_comparison(comparison)
+    comparison_download_name = sanitize_file_name(
+        f"{dataset_series_id}_report_comparison.json",
+        default_name="report_comparison.json",
+        safe_extension=".json",
+    )
+    st.download_button(
+        "下载报告比较（JSON）",
+        data=serialize_report_comparison(comparison),
+        file_name=comparison_download_name,
+        mime="application/json",
+    )
+    action_plan = state.get("action_plan")
+    if action_plan is None:
+        st.error("当前比较没有绑定有效的整改行动计划，请重新执行比较。")
+        return
+    _render_v05_remediation_ui(
+        comparison,
+        action_plan,
+        state,
+        dataset_series_id=dataset_series_id,
+    )
+
+
+def _render_v05_history(report: QualityReport | None) -> None:
+    """渲染常驻的会话历史、严格导入、趋势、删除与比较入口。"""
+
+    st.divider()
+    st.subheader("v0.5 本地历史与整改")
+    st.caption(
+        "历史仅保存在当前本地浏览器会话内，关闭会话即释放。"
+        "只有点击保存或导入后才会写入会话历史；不保存上传字节、"
+        "疑似问题位置 CSV、Agent 输出或 RulePack。当前 Demo 没有身份认证。"
+    )
+    with st.expander("查看访问、保留与容量策略"):
+        policy = DEFAULT_HISTORY_POLICY
+        st.text(
+            "访问范围：当前本地浏览器会话\n"
+            "保留期限：显式删除、清空或会话终止前\n"
+            f"最多报告：{policy.max_reports} 份\n"
+            f"单份上限：{policy.max_report_bytes // (1024 * 1024)} MiB\n"
+            f"总容量上限：{policy.max_total_bytes // (1024 * 1024)} MiB\n"
+            "删除范围：单条历史或当前会话全部历史；删除后无法从页面恢复"
+        )
+
+    store = _history_store()
+    series_placeholder = (
+        str(report.dataset.name)
+        if report is not None
+        else "例如：政务服务事项主数据"
+    )
+    input_columns = st.columns(2)
+    with input_columns[0]:
+        # 新增的常驻输入统一追加到侧栏，保持既有数据集名称和 Excel
+        # 工作表仍是旧 AppTest 中的第 1 / 2 个文本控件。
+        dataset_series_id = st.sidebar.text_input(
+            "治理对象标识",
+            placeholder=series_placeholder,
+            key="v05_history_dataset_series_id",
+            help="同一标识下的两份固定报告才允许比较；该标识只用于当前会话分组。",
+        )
+        current_version_label = st.sidebar.text_input(
+            "当前报告版本标签",
+            placeholder="例如：整改前、2026-07 月",
+            key="v05_history_current_version_label",
+        )
+        save_current = st.button(
+            "保存当前报告到会话历史",
+            key="v05_history_save_current",
+            disabled=report is None,
+            width="stretch",
+        )
+    with input_columns[1]:
+        # 放在现有上传控件之后的侧栏，既保持主评估上传始终是第一个
+        # AppTest 文件控件，也避免历史导入被误认为原始数据上传。
+        imported_file = st.sidebar.file_uploader(
+            "导入严格 QualityReport JSON",
+            type=["json"],
+            key="v05_history_import_file",
+            help=(
+                "只接受通过 Schema、稳定哈希、隐私结构和交叉引用复核的 UTF-8 JSON；"
+                "自哈希不等同于来源签名，请只导入可信来源的报告。"
+            ),
+        )
+        imported_version_label = st.sidebar.text_input(
+            "导入报告版本标签",
+            placeholder="例如：整改后、2026-08 月",
+            key="v05_history_import_version_label",
+        )
+        import_history = st.button(
+            "导入历史报告",
+            key="v05_history_import",
+            disabled=imported_file is None,
+            width="stretch",
+        )
+
+    if save_current and report is not None:
+        try:
+            entry = store.add_report(
+                report,
+                version_label=current_version_label,
+                dataset_series_id=dataset_series_id,
+            )
+        except HistoryValidationError as error:
+            st.error(f"当前报告未保存：{error}")
+        except Exception:
+            st.error("当前报告未保存：会话历史暂时不可用，请重试。")
+        else:
+            _clear_history_comparison_state()
+            st.success(
+                f"已保存固定报告“{entry.version_label}”，"
+                f"报告哈希 {entry.report_sha256[:12]}。"
+            )
+
+    if import_history and imported_file is not None:
+        try:
+            entry = store.import_json(
+                imported_file.getvalue(),
+                version_label=imported_version_label,
+                dataset_series_id=dataset_series_id,
+            )
+        except HistoryValidationError as error:
+            st.error(f"历史报告未导入：{error}")
+        except Exception:
+            st.error("历史报告未导入：文件读取或会话历史暂时不可用。")
+        else:
+            _clear_history_comparison_state()
+            st.success(
+                f"已导入固定报告“{entry.version_label}”，"
+                f"报告哈希 {entry.report_sha256[:12]}。"
+            )
+
+    entries = store.list_entries()
+    if not entries:
+        st.info("当前会话尚未保存历史报告。")
+        return
+
+    collection_signature = _history_collection_signature(entries)
+    delete_columns = st.columns(2)
+    with delete_columns[0]:
+        delete_options = {
+            _history_entry_label(entry): entry.entry_id
+            for entry in entries
+        }
+        delete_selection = st.selectbox(
+            "选择要删除的历史报告",
+            options=list(delete_options),
+            key=f"v05_history_delete_target_{collection_signature}",
+        )
+        delete_target = delete_options[delete_selection]
+        delete_confirmed = st.checkbox(
+            "我确认删除所选历史报告。",
+            key=f"v05_history_delete_confirmed_{delete_target}",
+        )
+        delete_selected = st.button(
+            "删除所选历史报告",
+            key=f"v05_history_delete_{delete_target}",
+            disabled=not delete_confirmed,
+        )
+    with delete_columns[1]:
+        clear_confirmed = st.checkbox(
+            "我确认清空当前会话的全部历史报告。",
+            key=f"v05_history_clear_confirmed_{collection_signature}",
+        )
+        clear_all = st.button(
+            "清空全部会话历史",
+            key=f"v05_history_clear_{collection_signature}",
+            disabled=not clear_confirmed,
+        )
+
+    if delete_selected:
+        target = store.get(delete_target)
+        if not delete_confirmed or target is None:
+            st.error("历史删除请求已失效，请重新选择并确认。")
+        elif store.delete(target.entry_id):
+            _clear_history_comparison_state()
+            st.success(
+                f"已删除“{target.version_label}”（{target.report_sha256[:12]}）。"
+            )
+        else:
+            st.error("所选历史报告已不存在。")
+    elif clear_all:
+        if not clear_confirmed:
+            st.error("历史清空请求未经过当前集合确认。")
+        else:
+            deleted_count = store.clear()
+            _clear_history_comparison_state()
+            st.success(f"已清空当前会话的 {deleted_count} 份历史报告。")
+
+    entries = store.list_entries()
+    if not entries:
+        st.info("当前会话尚未保存历史报告。")
+        return
+    collection_signature = _history_collection_signature(entries)
+
+    st.markdown("#### 会话历史")
+    st.dataframe(
+        pd.DataFrame(_history_summary_rows(entries)),
+        hide_index=True,
+        width="stretch",
+    )
+
+    series_ids = list(
+        dict.fromkeys(entry.dataset_series_id for entry in entries)
+    )
+    selected_series = st.selectbox(
+        "趋势治理对象",
+        options=series_ids,
+        key=f"v05_history_trend_series_{collection_signature}",
+    )
+    trend = build_version_trend(
+        entries,
+        dataset_series_id=selected_series,
+    )
+    trend_rows = [
+        {
+            "版本": item["version_label"],
+            "保存时间（UTC）": item["saved_at"],
+            "记录数": item["row_count"],
+            "字段数": item["column_count"],
+            "风险": item["risk_count"],
+            "警告": item["warning_count"],
+            "关注": item["attention_count"],
+            "提示": item["info_count"],
+            "无法评估": item["not_assessable_count"],
+        }
+        for item in trend
+    ]
+    st.markdown("#### 版本趋势")
+    st.dataframe(
+        pd.DataFrame(trend_rows),
+        hide_index=True,
+        width="stretch",
+    )
+    if len(trend_rows) >= 2:
+        chart_data = pd.DataFrame(trend_rows).set_index("版本")[
+            ["警告", "关注", "提示", "无法评估"]
+        ]
+        st.line_chart(chart_data)
+
+    series_entries = tuple(
+        entry
+        for entry in entries
+        if entry.dataset_series_id == selected_series
+    )
+    if len(series_entries) < 2:
+        st.info("同一治理对象至少需要两份固定报告，才能执行整改比较。")
+        return
+    _render_v05_comparison_ui(
+        store,
+        series_entries,
+        dataset_series_id=selected_series,
+        collection_signature=collection_signature,
+    )
+
+
 def _evaluation_request_signature(
     uploaded_file,
     dataset_name: str,
@@ -1377,3 +2281,5 @@ else:
         "序号从 1 开始且不包含表头。"
         "三种下载均不包含原始字段样例。"
     )
+
+_render_v05_history(report)

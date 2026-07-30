@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "remediation-plan.schema.json",
+  "title": "RemediationPlan v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "plan_sha256",
+    "comparison_sha256",
+    "generator",
+    "improvement_summary",
+    "tasks",
+    "next_round_suggestions"
+  ],
+  "properties": {
+    "schema_version": {"const": "0.1"},
+    "plan_id": {
+      "type": "string",
+      "pattern": "^plan-[0-9a-f]{24}$"
+    },
+    "plan_sha256": {"$ref": "#/$defs/hash"},
+    "comparison_sha256": {"$ref": "#/$defs/hash"},
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "mode"],
+      "properties": {
+        "name": {"const": "quality-remediation-agent"},
+        "version": {"const": "0.5"},
+        "mode": {"const": "local_template"}
+      }
+    },
+    "improvement_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "headline",
+        "improved_change_ids",
+        "regressed_change_ids",
+        "resolved_risk_change_ids",
+        "limitations"
+      ],
+      "properties": {
+        "headline": {"type": "string", "minLength": 1, "maxLength": 500},
+        "improved_change_ids": {"$ref": "#/$defs/changeIds"},
+        "regressed_change_ids": {"$ref": "#/$defs/changeIds"},
+        "resolved_risk_change_ids": {"$ref": "#/$defs/changeIds"},
+        "limitations": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "uniqueItems": true
+        }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {"$ref": "#/$defs/task"}
+    },
+    "next_round_suggestions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "changeIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(metric|risk|assessability|schema)-change-[0-9a-f]{24}$"
+      },
+      "uniqueItems": true
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "category",
+        "priority",
+        "status",
+        "title",
+        "detail",
+        "acceptance_criteria",
+        "suggested_owner_role",
+        "assignee",
+        "due_date",
+        "change_ids"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "pattern": "^task-[0-9a-f]{24}$"
+        },
+        "category": {
+          "enum": ["risk", "metric", "assessability", "schema"]
+        },
+        "priority": {"enum": ["high", "medium", "low"]},
+        "status": {
+          "enum": ["open", "in_progress", "done", "accepted_risk"]
+        },
+        "title": {"type": "string", "minLength": 1, "maxLength": 500},
+        "detail": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "acceptance_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+          "uniqueItems": true
+        },
+        "suggested_owner_role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "assignee": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "due_date": {
+          "type": ["string", "null"],
+          "format": "date"
+        },
+        "change_ids": {
+          "allOf": [
+            {"$ref": "#/$defs/changeIds"},
+            {"minItems": 1, "maxItems": 8}
+          ]
+        }
+      }
+    }
+  }
+}

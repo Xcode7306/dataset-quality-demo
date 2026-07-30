@@ -282,6 +282,19 @@ def draft_sha256(pack: RulePack) -> str:
     return _sha256(_draft_payload(pack))
 
 
+def rule_definition_sha256(rule: Rule) -> str:
+    """返回不绑定输入、审批人与生成时间的单条业务规则定义哈希。"""
+
+    if not isinstance(rule, Rule):
+        raise TypeError("rule 必须是 Rule。")
+    return _sha256(
+        {
+            "schema_version": RULE_PACK_SCHEMA_VERSION,
+            "rule": rule.to_dict(),
+        }
+    )
+
+
 def _rule_pack_id(pack: RulePack) -> str:
     return f"rulepack-{draft_sha256(pack)[:20]}"
 
