@@ -6,7 +6,7 @@
     "sheet_name": null
   },
   "status": "success",
-  "schema_version": "0.2",
+  "schema_version": "0.3",
   "profile": {
     "row_count": 5,
     "column_count": 7,
@@ -623,13 +623,29 @@
   "risks": [],
   "not_assessable": [],
   "evaluation_context": {
-    "engine_version": "0.4",
+    "engine_version": "0.6",
+    "metric_catalog_version": "0.6",
+    "selected_metric_ids": [
+      "file_parse_rate",
+      "dataset_scale",
+      "field_missing_rate",
+      "blank_record_rate",
+      "field_type_consistency",
+      "recognizable_format_anomaly_rate",
+      "exact_duplicate_rate",
+      "normalized_duplicate_rate",
+      "time_info_availability",
+      "update_lag_days",
+      "source_info_coverage",
+      "version_info_coverage",
+      "statistical_outlier_rate"
+    ],
     "reference_date": "2026-07-17",
     "threshold_config_version": "0.3",
     "parser_path": "csv",
     "input_sha256": "71466710b0e195a676876e07add006c8121c7b56bdf6e563d60d332e06f1c037",
     "input_size_bytes": 555,
-    "report_sha256": "836b9f948bb2b6558871f4c1bdcdad032494c3fa91d9fed451a8ca72c19b72ae"
+    "report_sha256": "f57ebcb16beb15be910ce7028e5aa05fa4007ab9eb071c01fe7c45eefe413ecd"
   },
   "execution": {
     "warnings": [],

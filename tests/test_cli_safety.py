@@ -94,7 +94,7 @@ class CliSafetyTests(unittest.TestCase):
 
             saved = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["dataset"]["name"], "测试数据集")
-            self.assertEqual(saved["schema_version"], "0.2")
+            self.assertEqual(saved["schema_version"], "0.3")
             self.assertFalse(output_path.is_symlink())
 
     def test_save_report_selects_format_from_extension(self):
@@ -223,6 +223,40 @@ class CliSafetyTests(unittest.TestCase):
             if metric["id"] == "update_lag_days"
         )
         self.assertEqual(lag_metric["value"], 39)
+
+    def test_cli_accepts_repeatable_metric_selection(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            input_path = root / "dataset.csv"
+            output_path = root / "report.json"
+            input_path.write_text(
+                "record_id,name\n1,A\n2,A\n",
+                encoding="utf-8",
+            )
+            arguments = [
+                "src.cli",
+                str(input_path),
+                "--metric",
+                "exact_duplicate_rate",
+                "--metric",
+                "db31_030300",
+                "--output",
+                str(output_path),
+            ]
+
+            with patch.object(sys, "argv", arguments), patch("builtins.print"):
+                main()
+
+            report = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            [metric["id"] for metric in report["metrics"]],
+            ["exact_duplicate_rate", "db31_030300"],
+        )
+        self.assertEqual(
+            report["evaluation_context"]["selected_metric_ids"],
+            ["exact_duplicate_rate", "db31_030300"],
+        )
 
     def test_cli_defaults_to_structured_json_and_preserves_explicit_markdown(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

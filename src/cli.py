@@ -4,6 +4,7 @@ import argparse
 from datetime import date
 from pathlib import Path
 
+from .metric_catalog import ALL_METRIC_IDS
 from .report import UnsafeReportDestinationError, get_file_identity, save_report
 from .workflow import build_profile_report
 
@@ -63,6 +64,17 @@ def main() -> None:
         help="评估基准日期（YYYY-MM-DD）；默认使用运行当天。",
     )
     parser.add_argument(
+        "--metric",
+        dest="selected_metric_ids",
+        action="append",
+        choices=ALL_METRIC_IDS,
+        metavar="ID",
+        help=(
+            "选择一个评价指标，可重复指定；未提供时保持 v0.4 默认的原 13 项。"
+            "可用 ID：" + "、".join(ALL_METRIC_IDS)
+        ),
+    )
+    parser.add_argument(
         "--output",
         default="reports/report.json",
         help=(
@@ -87,6 +99,7 @@ def main() -> None:
         args.name,
         args.sheet,
         reference_date=args.reference_date,
+        selected_metric_ids=args.selected_metric_ids,
     )
     try:
         save_report(

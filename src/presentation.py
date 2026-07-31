@@ -6,6 +6,11 @@ import json
 from collections import Counter
 from typing import Any
 
+from .metric_catalog import (
+    DB31_METRIC_IDS,
+    ORIGINAL_METRIC_IDS,
+    get_metric_definition,
+)
 from .models import MetricResult, QualityReport
 
 
@@ -43,6 +48,35 @@ ISSUE_TYPE_LABELS = {
     "rule_allowed_value_violation": "不在允许值范围",
     "rule_numeric_range_violation": "超出数值范围",
 }
+
+
+def _metric_catalog_details(metric: MetricResult) -> dict[str, str]:
+    """返回指标的来源与计算口径；兼容 RulePack 动态追加指标。"""
+
+    definition = get_metric_definition(metric.id)
+    if definition is not None:
+        return {
+            "来源": str(definition["source_label"]),
+            "标准代码": str(definition["standard_code"] or "—"),
+            "评价维度": str(definition["dimension"]),
+            "层级": str(definition["level"]),
+            "计算方式": str(definition["formula"]),
+        }
+    if metric.id.startswith(("business_", "rule_")):
+        return {
+            "来源": "已审批 RulePack",
+            "标准代码": "—",
+            "评价维度": metric.category,
+            "层级": "业务规则",
+            "计算方式": "按已审批 RulePack 中的确定性规则计算",
+        }
+    return {
+        "来源": "扩展指标",
+        "标准代码": "—",
+        "评价维度": metric.category,
+        "层级": "—",
+        "计算方式": "当前指标目录未登记计算方式",
+    }
 
 
 def format_metric_value(metric: MetricResult) -> str:
@@ -83,18 +117,21 @@ def build_summary(report: QualityReport) -> dict[str, int]:
 def build_metric_rows(report: QualityReport) -> list[dict[str, Any]]:
     """生成面向用户的指标明细表；内部引用键不在默认视图中展示。"""
 
-    return [
-        {
-            "指标名称": metric.name,
-            "字段名称": metric.field or "—",
-            "类别": metric.category,
-            "范围": "字段" if metric.scope == "field" else "数据集",
-            "状态": METRIC_STATUS_LABELS[metric.status],
-            "结果": format_metric_value(metric),
-            "原因": metric.reason or "—",
-        }
-        for metric in report.metrics
-    ]
+    rows: list[dict[str, Any]] = []
+    for metric in report.metrics:
+        rows.append(
+            {
+                "指标名称": metric.name,
+                "字段名称": metric.field or "—",
+                "类别": metric.category,
+                "范围": "字段" if metric.scope == "field" else "数据集",
+                "状态": METRIC_STATUS_LABELS[metric.status],
+                "结果": format_metric_value(metric),
+                "原因": metric.reason or "—",
+                **_metric_catalog_details(metric),
+            }
+        )
+    return rows
 
 
 def build_profile_rows(report: QualityReport) -> list[dict[str, Any]]:
@@ -252,6 +289,38 @@ def _status_summary(report: QualityReport, summary: dict[str, int]) -> str:
     return "评估完成，当前默认规则未发现警告或需要关注的现象。"
 
 
+def _metric_selection_summary(
+    report: QualityReport,
+    evaluation_context: dict[str, Any],
+) -> str:
+    """生成写入可读报告的指标来源统计。"""
+
+    selected = evaluation_context.get("selected_metric_ids")
+    if isinstance(selected, (list, tuple)):
+        selected_ids = tuple(
+            metric_id
+            for metric_id in selected
+            if isinstance(metric_id, str)
+        )
+    else:
+        present = {metric.id for metric in report.metrics}
+        selected_ids = tuple(
+            metric_id
+            for metric_id in (*ORIGINAL_METRIC_IDS, *DB31_METRIC_IDS)
+            if metric_id in present
+        )
+    original_count = sum(
+        metric_id in ORIGINAL_METRIC_IDS for metric_id in selected_ids
+    )
+    db31_count = sum(
+        metric_id in DB31_METRIC_IDS for metric_id in selected_ids
+    )
+    return (
+        f"共 {len(selected_ids)} 项（原 v0.4 指标 {original_count} 项，"
+        f"DB31/T 1523-2024 指标 {db31_count} 项）"
+    )
+
+
 def render_markdown_report(report: QualityReport) -> str:
     """生成供人阅读的 UTF-8 Markdown 质量评估报告。"""
 
@@ -279,6 +348,10 @@ def render_markdown_report(report: QualityReport) -> str:
                 ("评估基准日期", evaluation_context.get("reference_date", "—")),
                 ("阈值配置版本", evaluation_context.get("threshold_config_version", "—")),
                 ("解析路径", evaluation_context.get("parser_path", "—")),
+                (
+                    "指标选择",
+                    _metric_selection_summary(report, evaluation_context),
+                ),
             )
         ),
         "",
@@ -343,12 +416,20 @@ def render_markdown_report(report: QualityReport) -> str:
                     "状态",
                     "结果",
                     "原因",
+                    "来源",
+                    "标准代码",
+                    "评价维度",
+                    "层级",
+                    "计算方式",
                 ],
                 [
                     [
                         row["指标名称"], row["字段名称"],
                         row["类别"], row["范围"],
                         row["状态"], row["结果"], row["原因"],
+                        row["来源"], row["标准代码"],
+                        row["评价维度"], row["层级"],
+                        row["计算方式"],
                     ]
                     for row in metric_rows
                 ],

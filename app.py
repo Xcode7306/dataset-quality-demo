@@ -12,6 +12,16 @@ import streamlit as st
 
 from src.agent_models import AgentAnalysis
 from src.agent_service import run_agent
+from src.metric_catalog import (
+    ALL_METRIC_IDS,
+    DB31_METRIC_IDS,
+    DEFAULT_SELECTED_METRIC_IDS,
+    ORIGINAL_METRIC_IDS,
+    build_metric_catalog_rows,
+    get_metric_definition,
+    metric_selection_label,
+    normalize_selected_metric_ids,
+)
 from src.models import QualityReport
 from src.parser import DatasetReadError, UnsupportedFileTypeError
 from src.presentation import (
@@ -46,6 +56,7 @@ from src.upload_service import evaluate_uploaded_dataset, sanitize_file_name
 
 AGENT_STATE_KEY = "agent_ui_state"
 RULE_STATE_KEY = "rule_ui_state"
+METRIC_SELECTION_KEY = "selected_metric_ids"
 AGENT_HISTORY_LIMIT = 8
 AGENT_PRIORITY_LABELS = {
     "high": "高",
@@ -77,6 +88,12 @@ RULE_FREQUENCIES = {
     "自定义天数": ("custom", None),
 }
 
+METRIC_PRESET_BUTTON_KEYS = {
+    "original": "metric_preset_original",
+    "db31": "metric_preset_db31",
+    "all": "metric_preset_all",
+}
+
 
 st.set_page_config(
     page_title="政务数据集质量评估",
@@ -99,6 +116,38 @@ def _clear_rule_state() -> None:
         st.session_state.pop(key, None)
 
 
+def _set_metric_selection(metric_ids: tuple[str, ...]) -> None:
+    """由快捷预设在指标控件创建前更新稳定选择状态。"""
+
+    st.session_state[METRIC_SELECTION_KEY] = list(metric_ids)
+
+
+def _initialize_metric_selection_state() -> None:
+    """初始化或清理跨目录版本遗留的指标控件状态。"""
+
+    if METRIC_SELECTION_KEY not in st.session_state:
+        st.session_state[METRIC_SELECTION_KEY] = list(
+            DEFAULT_SELECTED_METRIC_IDS
+        )
+        return
+    current = st.session_state.get(METRIC_SELECTION_KEY)
+    if not isinstance(current, (list, tuple, set)):
+        st.session_state[METRIC_SELECTION_KEY] = list(
+            DEFAULT_SELECTED_METRIC_IDS
+        )
+        return
+    requested = {
+        metric_id
+        for metric_id in current
+        if isinstance(metric_id, str)
+    }
+    normalized = [
+        metric_id for metric_id in ALL_METRIC_IDS if metric_id in requested
+    ]
+    if list(current) != normalized:
+        st.session_state[METRIC_SELECTION_KEY] = normalized
+
+
 def _escape_markdown(value: object) -> str:
     """转义会触发 Markdown 链接、图片或 HTML 的不可信展示文本。"""
 
@@ -115,6 +164,61 @@ def _report_sha256(report: QualityReport) -> str:
         report.to_dict()
         .get("evaluation_context", {})
         .get("report_sha256", "")
+    )
+
+
+def _selected_metric_ids_for_report(
+    report: QualityReport,
+) -> tuple[str, ...]:
+    """优先读取报告固化的选择；兼容尚未携带该字段的旧报告。"""
+
+    context = report.to_dict().get("evaluation_context", {})
+    selected = (
+        context.get("selected_metric_ids")
+        if isinstance(context, dict)
+        else None
+    )
+    if isinstance(selected, list):
+        requested = {
+            metric_id
+            for metric_id in selected
+            if isinstance(metric_id, str)
+        }
+    else:
+        requested = {
+            metric.id
+            for metric in report.metrics
+            if get_metric_definition(metric.id) is not None
+        }
+    return tuple(
+        metric_id for metric_id in ALL_METRIC_IDS if metric_id in requested
+    )
+
+
+def _render_metric_selection_summary(report: QualityReport) -> None:
+    """展示绑定当前报告的指标来源和可评估能力统计。"""
+
+    selected = _selected_metric_ids_for_report(report)
+    original_count = sum(
+        metric_id in ORIGINAL_METRIC_IDS for metric_id in selected
+    )
+    db31_count = sum(metric_id in DB31_METRIC_IDS for metric_id in selected)
+    db31_auto_count = sum(
+        bool(definition and definition.get("auto_assessable"))
+        for metric_id in selected
+        if metric_id in DB31_METRIC_IDS
+        for definition in (get_metric_definition(metric_id),)
+    )
+    st.caption(
+        "本次指标选择："
+        f"共 {len(selected)} 项 · 原 v0.4 指标 {original_count} 项 · "
+        f"DB31/T 指标 {db31_count} 项"
+        + (
+            f"（可直接计算 {db31_auto_count} 项，"
+            f"需补充评价依据 {db31_count - db31_auto_count} 项）"
+            if db31_count
+            else ""
+        )
     )
 
 
@@ -665,6 +769,7 @@ def _render_rule_enhancement(
     dataset_name: str,
     sheet_name: str,
     reference_date: date,
+    selected_metric_ids: tuple[str, ...],
 ) -> None:
     """渲染 v0.4 引导、草案校验、明确审批和确定性重评闭环。"""
 
@@ -952,6 +1057,7 @@ def _render_rule_enhancement(
                             dataset_name=dataset_name.strip() or None,
                             sheet_name=sheet_name.strip() or None,
                             reference_date=reference_date,
+                            selected_metric_ids=selected_metric_ids,
                         )
                 except RulePackExecutionError as error:
                     st.session_state[RULE_STATE_KEY] = {
@@ -1186,7 +1292,8 @@ def _evaluation_request_signature(
     dataset_name: str,
     sheet_name: str,
     reference_date: date,
-) -> tuple[str, str, str, str, str] | None:
+    selected_metric_ids: tuple[str, ...],
+) -> tuple[str, str, str, str, str, tuple[str, ...]] | None:
     """标识当前评估请求，防止输入变化后继续展示旧报告。"""
 
     if uploaded_file is None:
@@ -1198,12 +1305,17 @@ def _evaluation_request_signature(
         dataset_name.strip(),
         sheet_name.strip(),
         reference_date.isoformat(),
+        selected_metric_ids,
     )
 
 
 st.title("政务数据集质量评估")
-st.caption("上传结构化文件，生成可复现的质量指标、风险提示和无法评估项。")
+st.caption(
+    "v0.6 · 直接基于 v0.4 演进。上传结构化文件，"
+    "从原有指标与 DB31/T 1523-2024 指标中自由选择并生成可复现报告。"
+)
 
+_initialize_metric_selection_state()
 with st.sidebar:
     st.header("开始评估")
     uploaded_file = st.file_uploader(
@@ -1242,11 +1354,80 @@ with st.sidebar:
             "工作表名称（可选）",
             placeholder="默认读取第一个工作表",
         )
+    with st.expander("选择评价指标", expanded=True):
+        st.caption(
+            "默认沿用原 v0.4 的 13 项指标。可使用快捷预设，也可在下方"
+            "搜索并自由组合；带“需补充评价依据”的标准指标会如实标记为无法评估。"
+        )
+        preset_columns = st.columns(3)
+        preset_columns[0].button(
+            "原有 13 项",
+            key=METRIC_PRESET_BUTTON_KEYS["original"],
+            width="stretch",
+            on_click=_set_metric_selection,
+            args=(ORIGINAL_METRIC_IDS,),
+        )
+        preset_columns[1].button(
+            "仅 DB31/T",
+            key=METRIC_PRESET_BUTTON_KEYS["db31"],
+            width="stretch",
+            on_click=_set_metric_selection,
+            args=(DB31_METRIC_IDS,),
+        )
+        preset_columns[2].button(
+            "全部指标",
+            key=METRIC_PRESET_BUTTON_KEYS["all"],
+            width="stretch",
+            on_click=_set_metric_selection,
+            args=(ALL_METRIC_IDS,),
+        )
+        selected_metric_values = st.multiselect(
+            "自由选择指标",
+            options=list(ALL_METRIC_IDS),
+            format_func=metric_selection_label,
+            key=METRIC_SELECTION_KEY,
+            placeholder="搜索指标名称、代码或来源",
+            help=(
+                "原有指标与 DB31/T 指标使用不同的稳定 ID；"
+                "即使含义相近也会分别保留。"
+            ),
+        )
+        selected_metric_ids = (
+            normalize_selected_metric_ids(selected_metric_values)
+            if selected_metric_values
+            else ()
+        )
+        original_selected_count = sum(
+            metric_id in ORIGINAL_METRIC_IDS
+            for metric_id in selected_metric_ids
+        )
+        db31_selected_count = sum(
+            metric_id in DB31_METRIC_IDS
+            for metric_id in selected_metric_ids
+        )
+        st.caption(
+            f"已选 {len(selected_metric_ids)} 项："
+            f"原 v0.4 指标 {original_selected_count} 项，"
+            f"DB31/T 指标 {db31_selected_count} 项。"
+        )
+        if not selected_metric_ids:
+            st.warning("请至少选择一个评价指标后再运行。")
+    with st.expander("查看指标目录与计算方式"):
+        st.dataframe(
+            pd.DataFrame(build_metric_catalog_rows()),
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "DB31/T 指标的 A、B 口径来自标准正文；"
+            "“当前能力”说明本地单表是否具备直接评价依据。"
+        )
     request_signature = _evaluation_request_signature(
         uploaded_file,
         dataset_name,
         sheet_name,
         reference_date,
+        selected_metric_ids,
     )
     if st.session_state.get("evaluation_request_signature") != request_signature:
         st.session_state["evaluation_request_signature"] = request_signature
@@ -1257,11 +1438,11 @@ with st.sidebar:
         "运行质量评估",
         type="primary",
         width="stretch",
-        disabled=uploaded_file is None,
+        disabled=uploaded_file is None or not selected_metric_ids,
     )
     st.caption("原始文件仅写入临时目录用于本次计算，评估结束后自动删除。")
 
-if run_evaluation and uploaded_file is not None:
+if run_evaluation and uploaded_file is not None and selected_metric_ids:
     _clear_agent_state()
     _clear_rule_state()
     with st.spinner("正在解析文件并计算质量指标……"):
@@ -1272,6 +1453,7 @@ if run_evaluation and uploaded_file is not None:
                 dataset_name=dataset_name.strip() or None,
                 sheet_name=sheet_name.strip() or None,
                 reference_date=reference_date,
+                selected_metric_ids=selected_metric_ids,
             )
         except (DatasetReadError, UnsupportedFileTypeError) as error:
             st.session_state.pop("quality_report", None)
@@ -1301,6 +1483,7 @@ else:
     st.caption(_escape_markdown(details))
 
     _render_summary(report)
+    _render_metric_selection_summary(report)
     (
         risk_tab,
         metric_tab,
@@ -1335,6 +1518,7 @@ else:
             dataset_name=dataset_name,
             sheet_name=sheet_name,
             reference_date=reference_date,
+            selected_metric_ids=selected_metric_ids,
         )
 
     json_download_file_name = sanitize_file_name(

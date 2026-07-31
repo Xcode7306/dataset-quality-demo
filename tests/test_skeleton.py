@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from src.metric_catalog import ALL_METRIC_IDS, ORIGINAL_METRIC_IDS
 from src.metrics import METRIC_CALCULATORS, METRIC_CATALOG, calculate_failed_metrics
 from src.models import DatasetInfo
 from src.parser import UnsupportedFileTypeError, validate_file_type
@@ -11,9 +12,9 @@ from src.report import create_empty_report, save_report
 
 
 class SkeletonTests(unittest.TestCase):
-    def test_metric_catalog_contains_13_metrics(self):
-        self.assertEqual(len(METRIC_CATALOG), 13)
-        self.assertEqual(len({item["id"] for item in METRIC_CATALOG}), 13)
+    def test_metric_catalog_contains_43_unique_metrics(self):
+        self.assertEqual(len(METRIC_CATALOG), 43)
+        self.assertEqual(len({item["id"] for item in METRIC_CATALOG}), 43)
 
     def test_metric_registry_matches_catalog(self):
         catalog_ids = [item["id"] for item in METRIC_CATALOG]
@@ -22,8 +23,20 @@ class SkeletonTests(unittest.TestCase):
 
     def test_failed_metric_report_is_derived_from_catalog(self):
         catalog_ids = [item["id"] for item in METRIC_CATALOG]
-        failed_ids = [metric.id for metric in calculate_failed_metrics("测试失败")]
+        failed_ids = [
+            metric.id
+            for metric in calculate_failed_metrics(
+                "测试失败",
+                selected_metric_ids=ALL_METRIC_IDS,
+            )
+        ]
         self.assertEqual(failed_ids, catalog_ids)
+
+    def test_failed_metric_default_preserves_v04_selection(self):
+        failed_ids = [
+            metric.id for metric in calculate_failed_metrics("测试失败")
+        ]
+        self.assertEqual(failed_ids, list(ORIGINAL_METRIC_IDS))
 
     def test_supported_file_type_is_accepted(self):
         with tempfile.NamedTemporaryFile(suffix=".csv") as file:

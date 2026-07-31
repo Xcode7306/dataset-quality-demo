@@ -7,6 +7,10 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 from .config import ENGINE_VERSION, THRESHOLD_CONFIG_VERSION
+from .metric_catalog import (
+    DEFAULT_SELECTED_METRIC_IDS,
+    METRIC_CATALOG_VERSION,
+)
 
 
 EvaluationStatus = Literal["success", "partial_success", "failed"]
@@ -36,6 +40,8 @@ def _default_evaluation_context() -> dict[str, Any]:
 
     return {
         "engine_version": ENGINE_VERSION,
+        "metric_catalog_version": METRIC_CATALOG_VERSION,
+        "selected_metric_ids": list(DEFAULT_SELECTED_METRIC_IDS),
         "reference_date": None,
         "threshold_config_version": THRESHOLD_CONFIG_VERSION,
         "parser_path": None,
@@ -111,7 +117,7 @@ class QualityReport:
 
     dataset: DatasetInfo
     status: EvaluationStatus = "success"
-    schema_version: str = "0.2"
+    schema_version: str = "0.3"
     profile: dict[str, Any] = dc_field(default_factory=dict)
     metrics: list[MetricResult] = dc_field(default_factory=list)
     risks: list[RiskItem] = dc_field(default_factory=list)

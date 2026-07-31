@@ -8,6 +8,7 @@ import unittest
 from urllib.parse import quote
 
 from src.config import RiskThresholds
+from src.metric_catalog import ORIGINAL_METRIC_IDS
 from src.models import MetricResult
 from src.rules import generate_risks
 from src.workflow import build_profile_report
@@ -118,8 +119,13 @@ class AgentReportContractTests(unittest.TestCase):
         second_payload = report.to_dict()
         context = first_payload["evaluation_context"]
 
-        self.assertEqual(report.schema_version, "0.2")
-        self.assertEqual(context["engine_version"], "0.4")
+        self.assertEqual(report.schema_version, "0.3")
+        self.assertEqual(context["engine_version"], "0.6")
+        self.assertEqual(context["metric_catalog_version"], "0.6")
+        self.assertEqual(
+            context["selected_metric_ids"],
+            list(ORIGINAL_METRIC_IDS),
+        )
         self.assertEqual(context["reference_date"], "2026-07-17")
         self.assertEqual(context["threshold_config_version"], "0.3")
         self.assertEqual(context["parser_path"], "csv")

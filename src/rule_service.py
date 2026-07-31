@@ -7,6 +7,7 @@ from datetime import date
 import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Iterable
 
 from .parser import (
     DatasetReadError,
@@ -81,6 +82,8 @@ def evaluate_uploaded_dataset_with_rule_pack(
     dataset_name: str | None = None,
     sheet_name: str | None = None,
     reference_date: date | None = None,
+    *,
+    selected_metric_ids: Iterable[str] | None = None,
 ) -> RuleEvaluationResult:
     """从上传字节重建基线，并以当前报告重新校验后执行已审批 RulePack。
 
@@ -108,6 +111,7 @@ def evaluate_uploaded_dataset_with_rule_pack(
             dataset_name=safe_dataset_name,
             sheet_name=sheet_name or None,
             reference_date=reference_date,
+            selected_metric_ids=selected_metric_ids,
         )
         _apply_upload_display_metadata(
             baseline_report,

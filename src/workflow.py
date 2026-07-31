@@ -3,8 +3,13 @@
 from datetime import date
 import hashlib
 from pathlib import Path
+from typing import Iterable
 
 from .config import ENGINE_VERSION, THRESHOLD_CONFIG_VERSION
+from .metric_catalog import (
+    METRIC_CATALOG_VERSION,
+    normalize_selected_metric_ids,
+)
 from .metrics import calculate_all_metrics, calculate_failed_metrics
 from .models import DatasetInfo, NotAssessableItem
 from .parser import DatasetReadError, UnsupportedFileTypeError, parse_dataset
@@ -72,10 +77,13 @@ def _input_fingerprint(path: Path) -> tuple[str | None, int | None]:
 def _evaluation_context(
     path: Path,
     reference_date: date,
-) -> dict[str, str | int | None]:
+    selected_metric_ids: tuple[str, ...],
+) -> dict[str, str | int | list[str] | None]:
     input_sha256, input_size_bytes = _input_fingerprint(path)
     return {
         "engine_version": ENGINE_VERSION,
+        "metric_catalog_version": METRIC_CATALOG_VERSION,
+        "selected_metric_ids": list(selected_metric_ids),
         "reference_date": reference_date.isoformat(),
         "threshold_config_version": THRESHOLD_CONFIG_VERSION,
         "parser_path": PARSER_PATHS.get(path.suffix.lower(), "unsupported"),
@@ -90,12 +98,21 @@ def build_profile_report(
     dataset_name: str | None = None,
     sheet_name: str | None = None,
     reference_date: date | None = None,
+    *,
+    selected_metric_ids: Iterable[str] | None = None,
 ):
     """构建包含数据画像和当前已实现指标的结构化报告。"""
 
     path = Path(file_path)
     effective_reference_date = reference_date or date.today()
-    evaluation_context = _evaluation_context(path, effective_reference_date)
+    normalized_metric_ids = normalize_selected_metric_ids(
+        selected_metric_ids
+    )
+    evaluation_context = _evaluation_context(
+        path,
+        effective_reference_date,
+        normalized_metric_ids,
+    )
     normalized_dataset_name = dataset_name
     metadata_warnings: list[str] = []
     if dataset_name is not None and str(dataset_name).strip():
@@ -138,7 +155,10 @@ def build_profile_report(
         report = create_empty_report(dataset)
         report.status = "failed"
         report.evaluation_context = evaluation_context
-        report.metrics = calculate_failed_metrics(error_message)
+        report.metrics = calculate_failed_metrics(
+            error_message,
+            selected_metric_ids=normalized_metric_ids,
+        )
         report.risks = generate_risks(report.metrics)
         report.execution["warnings"] = _unique_messages(
             metadata_warnings,
@@ -156,7 +176,9 @@ def build_profile_report(
     report = create_profile_report(parsed_dataset, profile)
     report.evaluation_context = evaluation_context
     report.metrics = calculate_all_metrics(
-        parsed_dataset.dataframe, reference_date=effective_reference_date
+        parsed_dataset.dataframe,
+        reference_date=effective_reference_date,
+        selected_metric_ids=normalized_metric_ids,
     )
     report.risks = generate_risks(report.metrics)
     return _sync_not_assessable(report)

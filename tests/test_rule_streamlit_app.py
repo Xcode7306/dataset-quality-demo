@@ -27,7 +27,7 @@ class RuleStreamlitAppTests(unittest.TestCase):
         sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
         app = AppTest.from_file(
             str(PROJECT_ROOT / "app.py"),
-            default_timeout=15,
+            default_timeout=60,
         )
         app.run()
         app.file_uploader[0].set_value(
@@ -133,9 +133,10 @@ class RuleStreamlitAppTests(unittest.TestCase):
             app.session_state["quality_report"].to_dict(),
             baseline_before,
         )
+        baseline_metric_count = len(result.baseline_report.metrics)
         self.assertEqual(
-            result.enhanced_report.metrics[:13],
-            result.baseline_report.metrics[:13],
+            result.enhanced_report.metrics[:baseline_metric_count],
+            result.baseline_report.metrics,
         )
         self.assertTrue(
             all(

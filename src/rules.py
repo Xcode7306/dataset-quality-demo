@@ -275,7 +275,7 @@ def generate_risks(
             float(metric.value)
             for metric in by_id.get("exact_duplicate_rate", [])
         ),
-        0.0,
+        None,
     )
     for metric in by_id.get("exact_duplicate_rate", []):
         value = float(metric.value)
@@ -306,9 +306,31 @@ def generate_risks(
 
     for metric in by_id.get("normalized_duplicate_rate", []):
         value = float(metric.value)
-        additional_rate = max(0.0, value - exact_duplicate_value)
+        if exact_duplicate_value is None:
+            decision_value = value
+            observed_name = "normalized_duplicate_rate"
+            title = "发现规范化重复记录"
+            message = (
+                "忽略自然文本中的空白、大小写和常见标点后，"
+                f"规范化重复记录占 {_percent(value)}。"
+            )
+            risk_evidence = {
+                "comparison_basis": "normalized_duplicate_rate",
+                "exact_duplicate_rate_available": False,
+            }
+        else:
+            decision_value = max(0.0, value - exact_duplicate_value)
+            observed_name = "additional_duplicate_rate"
+            title = "发现额外的规范化重复"
+            message = (
+                "忽略空白、大小写和常见标点后，"
+                f"额外发现 {_percent(decision_value)} 的重复记录。"
+            )
+            risk_evidence = {
+                "additional_duplicate_rate": decision_value,
+            }
         level = _high_is_risky(
-            additional_rate,
+            decision_value,
             thresholds.duplicate_attention,
             thresholds.duplicate_warning,
         )
@@ -323,13 +345,13 @@ def generate_risks(
                     metric,
                     "normalized_duplicates_detected",
                     level,
-                    "发现额外的规范化重复",
-                    f"忽略空白、大小写和常见标点后，额外发现 {_percent(additional_rate)} 的重复记录。",
-                    observed_name="additional_duplicate_rate",
-                    observed_value=additional_rate,
+                    title,
+                    message,
+                    observed_name=observed_name,
+                    observed_value=decision_value,
                     operator=operator,
                     threshold=threshold,
-                    evidence={"additional_duplicate_rate": additional_rate},
+                    evidence=risk_evidence,
                 )
             )
 

@@ -83,7 +83,7 @@ def infer_basic_type(series: pd.Series) -> str:
 def profile_dataframe(dataframe: pd.DataFrame, sample_size: int = 3) -> dict[str, Any]:
     """生成零配置基础数据画像。
 
-    此处只做客观统计，不计算 13 项质量指标，也不做风险判断。
+    此处只做客观统计，不计算用户所选质量指标，也不做风险判断。
     """
 
     # 保留 sample_size 参数以兼容既有调用方，但报告默认不再

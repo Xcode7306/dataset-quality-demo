@@ -1,7 +1,8 @@
-"""13 项零配置自动质量指标的目录与计算入口。"""
+"""原 v0.4 指标与 DB31/T 1523-2024 指标的计算及选择入口。"""
 
 from collections import Counter, defaultdict
 from datetime import date
+from functools import partial
 import math
 import re
 from typing import Any, Callable, Iterable, Mapping
@@ -21,25 +22,14 @@ from .field_semantics import (
     VERSION_FIELD_PATTERN,
     field_matches,
 )
+from .metric_catalog import (
+    DB31_METRIC_IDS,
+    METRIC_BY_ID,
+    METRIC_CATALOG,
+    normalize_selected_metric_ids,
+)
 from .models import MetricResult
 from .profiler import infer_value_type, is_missing_value
-
-
-METRIC_CATALOG = [
-    {"id": "file_parse_rate", "name": "文件可解析率", "category": "可读取性"},
-    {"id": "dataset_scale", "name": "数据规模", "category": "规模"},
-    {"id": "field_missing_rate", "name": "字段缺失率", "category": "完整性"},
-    {"id": "blank_record_rate", "name": "空白记录率", "category": "完整性"},
-    {"id": "field_type_consistency", "name": "字段类型一致率", "category": "类型一致性"},
-    {"id": "recognizable_format_anomaly_rate", "name": "可识别格式异常率", "category": "格式规范性"},
-    {"id": "exact_duplicate_rate", "name": "完全重复率", "category": "唯一性"},
-    {"id": "normalized_duplicate_rate", "name": "规范化重复率", "category": "唯一性"},
-    {"id": "time_info_availability", "name": "时间信息可用率", "category": "及时性"},
-    {"id": "update_lag_days", "name": "更新滞后天数", "category": "及时性"},
-    {"id": "source_info_coverage", "name": "来源信息覆盖率", "category": "可溯性"},
-    {"id": "version_info_coverage", "name": "版本信息覆盖率", "category": "可溯性"},
-    {"id": "statistical_outlier_rate", "name": "统计异常值比例", "category": "数据异常"},
-]
 
 
 IDENTIFIER_FIELD_PATTERN = re.compile(
@@ -241,6 +231,8 @@ def _not_assessable(
     scope: str,
     reason: str,
     field: str | None = None,
+    *,
+    evidence: Mapping[str, Any] | None = None,
 ) -> MetricResult:
     return MetricResult(
         id=metric_id,
@@ -251,6 +243,7 @@ def _not_assessable(
         unit=None,
         scope=scope,  # type: ignore[arg-type]
         field=field,
+        evidence=dict(evidence or {}),
         reason=reason,
     )
 
@@ -627,6 +620,164 @@ def calculate_normalized_duplicate_rate(dataframe: pd.DataFrame) -> MetricResult
     return _calculate_duplicate_rate(dataframe, normalize=True)
 
 
+def _db31_catalog_evidence(metric_id: str) -> dict[str, Any]:
+    """生成 DB31/T 指标共用且可安全序列化的目录证据。"""
+
+    definition = METRIC_BY_ID[metric_id]
+    proxy_metric_ids = [
+        str(item)
+        for item in definition.get("available_proxy_metric_ids", ())
+    ]
+    return {
+        "standard": "DB31/T 1523-2024",
+        "standard_code": str(definition["standard_code"]),
+        "standard_level": str(definition["level"]),
+        "parent_metric_id": definition.get("parent_id"),
+        "formula": str(definition["formula"]),
+        "score_direction": str(definition["direction"]),
+        "available_proxy_metric_ids": proxy_metric_ids,
+        "proxy": {
+            "metric_ids": proxy_metric_ids,
+            "standard_equivalent": False,
+        },
+    }
+
+
+def _db31_not_assessable_result(
+    metric_id: str,
+    *,
+    reason: str | None = None,
+    reason_code: str | None = None,
+    required_inputs: Iterable[str] | None = None,
+    evaluation_blocker: str | None = None,
+) -> MetricResult:
+    """为缺少外部评价依据的 DB31/T 指标生成稳定 NA 结果。"""
+
+    definition = METRIC_BY_ID[metric_id]
+    required = [
+        str(item)
+        for item in (
+            definition.get("required_inputs", ())
+            if required_inputs is None
+            else required_inputs
+        )
+    ]
+    stable_reason_code = (
+        reason_code
+        or str(definition.get("reason_code") or "missing_evaluation_basis")
+    )
+    if reason is None:
+        required_label = "、".join(required) or "本指标所需的评价依据"
+        reason = (
+            f"当前输入缺少{required_label}，无法按 DB31/T 1523-2024 "
+            f"计算“{definition['name']}”。"
+        )
+    evidence = {
+        **_db31_catalog_evidence(metric_id),
+        "reason_code": stable_reason_code,
+        "required_inputs": required,
+        "method": "not_assessable_without_required_context",
+    }
+    if evaluation_blocker:
+        evidence["evaluation_blocker"] = evaluation_blocker
+    return _not_assessable(
+        metric_id,
+        str(definition["name"]),
+        str(definition["category"]),
+        "dataset",
+        reason,
+        evidence=evidence,
+    )
+
+
+def _calculate_db31_exact_record_score(
+    dataframe: pd.DataFrame,
+    metric_id: str,
+    *,
+    exact_duplicate: MetricResult | None = None,
+) -> MetricResult:
+    """按内容记录精确相等口径计算 DB31/T 重复或唯一性得分。"""
+
+    definition = METRIC_BY_ID[metric_id]
+    if exact_duplicate is None:
+        exact_duplicate = calculate_exact_duplicate_rate(dataframe)
+    if exact_duplicate.status != "evaluated":
+        return _db31_not_assessable_result(
+            metric_id,
+            reason=(
+                "数据集不包含记录，DB31/T 1523-2024 公式的分母 B 为 0，"
+                f"无法计算“{definition['name']}”。"
+            ),
+            reason_code="zero_denominator",
+            required_inputs=("至少一条可评价记录",),
+        )
+
+    checked_count = int(exact_duplicate.evidence["checked_count"])
+    duplicate_count = int(exact_duplicate.evidence["issue_count"])
+    conforming_count = checked_count - duplicate_count
+    score = round(conforming_count / checked_count, 6)
+    formula_variables = (
+        {
+            "A_duplicate_record_count": duplicate_count,
+            "B_evaluated_record_count": checked_count,
+        }
+        if metric_id == "db31_030300"
+        else {
+            "A_unique_record_count": conforming_count,
+            "B_evaluated_record_count": checked_count,
+        }
+    )
+    evidence = {
+        **_db31_catalog_evidence(metric_id),
+        "value_semantics": "quality_score",
+        "method": "exact_content_record_comparison",
+        "grain": "record",
+        "equality": "exact",
+        "checked_count": checked_count,
+        "conforming_count": conforming_count,
+        "issue_count": duplicate_count,
+        "raw_issue_rate": exact_duplicate.value,
+        "formula_variables": formula_variables,
+        "duplicate_group_count": int(
+            exact_duplicate.evidence["duplicate_group_count"]
+        ),
+        "duplicate_groups": list(
+            exact_duplicate.evidence.get("duplicate_groups", [])
+        ),
+        "compared_fields": list(
+            exact_duplicate.evidence.get("compared_fields", [])
+        ),
+        "source_metric_id": "exact_duplicate_rate",
+    }
+    return MetricResult(
+        id=metric_id,
+        name=str(definition["name"]),
+        category=str(definition["category"]),
+        status="evaluated",
+        value=score,
+        unit="ratio",
+        scope="dataset",
+        evidence=evidence,
+        issue_locations=list(exact_duplicate.issue_locations),
+    )
+
+
+def calculate_db31_data_duplicate_score(
+    dataframe: pd.DataFrame,
+) -> MetricResult:
+    """计算 030300 数据重复率的标准质量得分（越高越好）。"""
+
+    return _calculate_db31_exact_record_score(dataframe, "db31_030300")
+
+
+def calculate_db31_data_uniqueness(
+    dataframe: pd.DataFrame,
+) -> MetricResult:
+    """计算 030400 数据唯一性得分（越高越好）。"""
+
+    return _calculate_db31_exact_record_score(dataframe, "db31_030400")
+
+
 def _collect_parsed_dates(
     dataframe: pd.DataFrame, fields: list[str]
 ) -> list[tuple[int, str, pd.Timestamp]]:
@@ -999,9 +1150,29 @@ def _version_coverage_results(dataframe: pd.DataFrame) -> list[MetricResult]:
     return [calculate_version_info_coverage(dataframe)]
 
 
+def _db31_duplicate_score_results(
+    dataframe: pd.DataFrame,
+) -> list[MetricResult]:
+    return [calculate_db31_data_duplicate_score(dataframe)]
+
+
+def _db31_uniqueness_results(
+    dataframe: pd.DataFrame,
+) -> list[MetricResult]:
+    return [calculate_db31_data_uniqueness(dataframe)]
+
+
+def _db31_not_assessable_results(
+    _: pd.DataFrame,
+    *,
+    metric_id: str,
+) -> list[MetricResult]:
+    return [_db31_not_assessable_result(metric_id)]
+
+
 # 指标执行注册表是增删指标的唯一编排入口。
 # 每个计算器始终返回 list[MetricResult]，因此数据集级和字段级指标可统一调度。
-METRIC_CALCULATORS: tuple[tuple[str, MetricCalculator], ...] = (
+_ORIGINAL_METRIC_CALCULATORS: tuple[tuple[str, MetricCalculator], ...] = (
     ("file_parse_rate", _file_parse_results),
     ("dataset_scale", _dataset_scale_results),
     ("field_missing_rate", calculate_field_missing_rates),
@@ -1017,34 +1188,108 @@ METRIC_CALCULATORS: tuple[tuple[str, MetricCalculator], ...] = (
     ("statistical_outlier_rate", calculate_statistical_outlier_rates),
 )
 
+_DB31_DIRECT_CALCULATORS: Mapping[str, MetricCalculator] = {
+    "db31_030300": _db31_duplicate_score_results,
+    "db31_030400": _db31_uniqueness_results,
+}
+
+_DB31_METRIC_CALCULATORS: tuple[tuple[str, MetricCalculator], ...] = tuple(
+    (
+        metric_id,
+        _DB31_DIRECT_CALCULATORS.get(
+            metric_id,
+            partial(_db31_not_assessable_results, metric_id=metric_id),
+        ),
+    )
+    for metric_id in DB31_METRIC_IDS
+)
+
+METRIC_CALCULATORS: tuple[tuple[str, MetricCalculator], ...] = (
+    *_ORIGINAL_METRIC_CALCULATORS,
+    *_DB31_METRIC_CALCULATORS,
+)
+
 
 def calculate_all_metrics(
-    dataframe: pd.DataFrame, reference_date: date | None = None
+    dataframe: pd.DataFrame,
+    reference_date: date | None = None,
+    selected_metric_ids: Iterable[str] | None = None,
 ) -> list[MetricResult]:
-    """按注册表顺序计算所有已启用的零配置指标。"""
+    """按目录顺序计算所选指标；未选择时保持原 v0.4 的 13 项。"""
 
+    normalized_metric_ids = normalize_selected_metric_ids(selected_metric_ids)
+    selected = set(normalized_metric_ids)
+    shared_exact_duplicate = (
+        calculate_exact_duplicate_rate(dataframe)
+        if selected
+        & {
+            "db31_030300",
+            "db31_030400",
+        }
+        else None
+    )
     results: list[MetricResult] = []
     for metric_id, calculator in METRIC_CALCULATORS:
-        if metric_id == "update_lag_days":
+        if metric_id not in selected:
+            continue
+        if (
+            metric_id == "exact_duplicate_rate"
+            and shared_exact_duplicate is not None
+        ):
+            results.append(shared_exact_duplicate)
+        elif (
+            metric_id in {"db31_030300", "db31_030400"}
+            and shared_exact_duplicate is not None
+        ):
+            results.append(
+                _calculate_db31_exact_record_score(
+                    dataframe,
+                    metric_id,
+                    exact_duplicate=shared_exact_duplicate,
+                )
+            )
+        elif metric_id == "update_lag_days":
             results.extend(_update_lag_results(dataframe, reference_date))
         else:
             results.extend(calculator(dataframe))
     return results
 
 
-def calculate_failed_metrics(reason: str) -> list[MetricResult]:
-    """解析失败时根据指标目录动态生成可评估性状态。"""
+def calculate_failed_metrics(
+    reason: str,
+    selected_metric_ids: Iterable[str] | None = None,
+) -> list[MetricResult]:
+    """解析失败时按同一选择集生成指标状态。"""
 
+    normalized_metric_ids = normalize_selected_metric_ids(selected_metric_ids)
     unavailable_reason = f"文件未成功解析，无法计算：{reason}"
-    unavailable_metrics = [
-        _not_assessable(
-            item["id"],
-            item["name"],
-            item["category"],
-            "dataset",
-            unavailable_reason,
+    results: list[MetricResult] = []
+    for metric_id in normalized_metric_ids:
+        if metric_id == "file_parse_rate":
+            results.append(calculate_file_parse_rate(successful=False))
+            continue
+        item = METRIC_BY_ID[metric_id]
+        if metric_id in DB31_METRIC_IDS:
+            results.append(
+                _db31_not_assessable_result(
+                    metric_id,
+                    reason=unavailable_reason,
+                    reason_code=(
+                        None
+                        if item.get("reason_code")
+                        else "file_parse_failed"
+                    ),
+                    evaluation_blocker="file_parse_failed",
+                )
+            )
+            continue
+        results.append(
+            _not_assessable(
+                metric_id,
+                str(item["name"]),
+                str(item["category"]),
+                "dataset",
+                unavailable_reason,
+            )
         )
-        for item in METRIC_CATALOG
-        if item["id"] != "file_parse_rate"
-    ]
-    return [calculate_file_parse_rate(successful=False), *unavailable_metrics]
+    return results

@@ -6,7 +6,7 @@
     "sheet_name": "服务事项"
   },
   "status": "success",
-  "schema_version": "0.2",
+  "schema_version": "0.3",
   "profile": {
     "row_count": 5,
     "column_count": 7,
@@ -623,13 +623,29 @@
   "risks": [],
   "not_assessable": [],
   "evaluation_context": {
-    "engine_version": "0.4",
+    "engine_version": "0.6",
+    "metric_catalog_version": "0.6",
+    "selected_metric_ids": [
+      "file_parse_rate",
+      "dataset_scale",
+      "field_missing_rate",
+      "blank_record_rate",
+      "field_type_consistency",
+      "recognizable_format_anomaly_rate",
+      "exact_duplicate_rate",
+      "normalized_duplicate_rate",
+      "time_info_availability",
+      "update_lag_days",
+      "source_info_coverage",
+      "version_info_coverage",
+      "statistical_outlier_rate"
+    ],
     "reference_date": "2026-07-17",
     "threshold_config_version": "0.3",
     "parser_path": "excel:xlsx",
     "input_sha256": "64f2737184155304e9c9fa4aed8a9308cade7b470bb187d783194b58a4a49781",
     "input_size_bytes": 6496,
-    "report_sha256": "2367d90d8cfe506893d0a9e2b5d893e3f3dc86a8bfe189a1eedc6a68da94de05"
+    "report_sha256": "1d0cdd583b1c517a80b9f8a598869117896062b529d522561d2b01a3d4cdbeff"
   },
   "execution": {
     "warnings": [],

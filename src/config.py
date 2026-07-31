@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 
-ENGINE_VERSION = "0.4"
+ENGINE_VERSION = "0.6"
 RISK_RULE_VERSION = "0.3"
 THRESHOLD_CONFIG_VERSION = "0.3"
 

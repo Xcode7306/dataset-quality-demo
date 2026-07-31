@@ -10,6 +10,12 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from streamlit.testing.v1 import AppTest
 
+from src.metric_catalog import (
+    ALL_METRIC_IDS,
+    DB31_METRIC_IDS,
+    ORIGINAL_METRIC_IDS,
+)
+
 
 PROJECT_ROOT = Path(__file__).parents[1]
 REFERENCE_DATE = date(2026, 7, 17)
@@ -20,8 +26,14 @@ class StreamlitAppTests(unittest.TestCase):
     def _button_by_label(app, label):
         return next(button for button in app.button if button.label == label)
 
+    @staticmethod
+    def _multiselect_by_label(app, label):
+        return next(
+            element for element in app.multiselect if element.label == label
+        )
+
     def _new_app(self):
-        app = AppTest.from_file(str(PROJECT_ROOT / "app.py"), default_timeout=15)
+        app = AppTest.from_file(str(PROJECT_ROOT / "app.py"), default_timeout=60)
         app.run()
         self.assertFalse(app.exception)
         return app
@@ -99,6 +111,182 @@ class StreamlitAppTests(unittest.TestCase):
         )
         self.assertEqual(
             lag_metric.evidence["reference_date"], REFERENCE_DATE.isoformat()
+        )
+
+    def test_metric_selector_defaults_to_v04_and_supports_all_presets(self):
+        app = self._new_app()
+        selector = self._multiselect_by_label(app, "自由选择指标")
+
+        self.assertEqual(tuple(selector.value), ORIGINAL_METRIC_IDS)
+
+        self._button_by_label(app, "仅 DB31/T").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(
+            tuple(
+                self._multiselect_by_label(
+                    app,
+                    "自由选择指标",
+                ).value
+            ),
+            DB31_METRIC_IDS,
+        )
+
+        self._button_by_label(app, "全部指标").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(
+            tuple(
+                self._multiselect_by_label(
+                    app,
+                    "自由选择指标",
+                ).value
+            ),
+            ALL_METRIC_IDS,
+        )
+
+        self._button_by_label(app, "原有 13 项").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(
+            tuple(
+                self._multiselect_by_label(
+                    app,
+                    "自由选择指标",
+                ).value
+            ),
+            ORIGINAL_METRIC_IDS,
+        )
+
+    def test_custom_metric_mix_is_the_exact_report_selection(self):
+        sample = PROJECT_ROOT / "sample_data" / "bad_dataset.csv"
+        app = self._new_app()
+        selector = self._multiselect_by_label(app, "自由选择指标")
+        selector.set_value(
+            [
+                "db31_030300",
+                "exact_duplicate_rate",
+                "db31_010101",
+                "db31_030400",
+            ]
+        )
+        app.run()
+        self._upload_and_run(
+            app,
+            sample.name,
+            sample.read_bytes(),
+            "text/csv",
+        )
+
+        report = app.session_state["quality_report"]
+        expected = [
+            "exact_duplicate_rate",
+            "db31_010101",
+            "db31_030300",
+            "db31_030400",
+        ]
+        self.assertEqual(
+            [metric.id for metric in report.metrics],
+            expected,
+        )
+        self.assertEqual(
+            report.evaluation_context["selected_metric_ids"],
+            expected,
+        )
+        self.assertEqual(
+            next(
+                metric
+                for metric in report.metrics
+                if metric.id == "db31_010101"
+            ).status,
+            "not_assessable",
+        )
+        self.assertEqual(
+            len({metric.metric_key for metric in report.metrics}),
+            4,
+        )
+        metric_table = next(
+            table.value
+            for table in app.dataframe
+            if {
+                "指标名称",
+                "字段名称",
+                "来源",
+                "标准代码",
+                "计算方式",
+            }.issubset(set(table.value.columns))
+        )
+        self.assertEqual(
+            set(metric_table["来源"]),
+            {"原 v0.4 指标", "DB31/T 1523-2024"},
+        )
+
+    def test_empty_metric_selection_disables_run_and_clears_old_state(self):
+        sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
+        app = self._new_app()
+        self._upload_and_run(
+            app,
+            sample.name,
+            sample.read_bytes(),
+            "text/csv",
+        )
+        self._button_by_label(app, "概括结果").click().run()
+        self._button_by_label(app, "开始配置业务规则").click().run()
+        self.assertIn("quality_report", app.session_state.filtered_state)
+        self.assertIn("agent_ui_state", app.session_state.filtered_state)
+        self.assertIn("rule_ui_state", app.session_state.filtered_state)
+
+        self._multiselect_by_label(
+            app,
+            "自由选择指标",
+        ).set_value([])
+        app.run()
+
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            self._button_by_label(app, "运行质量评估").disabled
+        )
+        self.assertNotIn("quality_report", app.session_state.filtered_state)
+        self.assertNotIn("agent_ui_state", app.session_state.filtered_state)
+        self.assertNotIn("rule_ui_state", app.session_state.filtered_state)
+        self.assertEqual(len(app.download_button), 0)
+        self.assertTrue(
+            any(
+                "至少选择一个评价指标" in warning.value
+                for warning in app.warning
+            )
+        )
+
+    def test_reordering_the_same_selection_keeps_the_current_report(self):
+        sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
+        app = self._new_app()
+        selector = self._multiselect_by_label(app, "自由选择指标")
+        selector.set_value(
+            ["exact_duplicate_rate", "db31_030300"]
+        )
+        app.run()
+        self._upload_and_run(
+            app,
+            sample.name,
+            sample.read_bytes(),
+            "text/csv",
+        )
+        report_hash = app.session_state["quality_report"].to_dict()[
+            "evaluation_context"
+        ]["report_sha256"]
+
+        self._multiselect_by_label(
+            app,
+            "自由选择指标",
+        ).set_value(
+            ["db31_030300", "exact_duplicate_rate"]
+        )
+        app.run()
+
+        self.assertFalse(app.exception)
+        self.assertIn("quality_report", app.session_state.filtered_state)
+        self.assertEqual(
+            app.session_state["quality_report"].to_dict()[
+                "evaluation_context"
+            ]["report_sha256"],
+            report_hash,
         )
 
     def test_supported_formats_run_through_full_report_surface(self):

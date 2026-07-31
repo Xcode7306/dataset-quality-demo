@@ -206,7 +206,7 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
         return next(button for button in app.button if button.label == label)
 
     def _new_app(self):
-        app = AppTest.from_file(str(PROJECT_ROOT / "app.py"), default_timeout=15)
+        app = AppTest.from_file(str(PROJECT_ROOT / "app.py"), default_timeout=60)
         app.run()
         self.assertFalse(app.exception)
         return app

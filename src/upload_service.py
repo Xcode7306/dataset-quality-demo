@@ -4,6 +4,7 @@ import re
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Iterable
 
 from .models import QualityReport
 from .parser import DatasetReadError, SUPPORTED_EXTENSIONS, UnsupportedFileTypeError
@@ -115,6 +116,8 @@ def evaluate_uploaded_dataset(
     dataset_name: str | None = None,
     sheet_name: str | None = None,
     reference_date: date | None = None,
+    *,
+    selected_metric_ids: Iterable[str] | None = None,
 ) -> QualityReport:
     """在临时目录中评估上传内容，并返回与 CLI 相同的报告对象。
 
@@ -154,6 +157,7 @@ def evaluate_uploaded_dataset(
             dataset_name=safe_dataset_name,
             sheet_name=sheet_name or None,
             reference_date=reference_date,
+            selected_metric_ids=selected_metric_ids,
         )
         report.dataset.file_name = safe_file_name
         if file_name_replaced:
