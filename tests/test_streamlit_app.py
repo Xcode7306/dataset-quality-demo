@@ -12,7 +12,7 @@ from streamlit.testing.v1 import AppTest
 
 from src.metric_catalog import (
     ALL_METRIC_IDS,
-    DB31_METRIC_IDS,
+    METRIC_BY_ID,
     ORIGINAL_METRIC_IDS,
 )
 
@@ -27,9 +27,20 @@ class StreamlitAppTests(unittest.TestCase):
         return next(button for button in app.button if button.label == label)
 
     @staticmethod
-    def _multiselect_by_label(app, label):
+    def _metric_checkbox(app, metric_id):
+        definition = METRIC_BY_ID[metric_id]
         return next(
-            element for element in app.multiselect if element.label == label
+            element
+            for element in app.checkbox
+            if element.label == definition["name"]
+        )
+
+    @classmethod
+    def _selected_metric_ids(cls, app):
+        return tuple(
+            metric_id
+            for metric_id in ALL_METRIC_IDS
+            if cls._metric_checkbox(app, metric_id).value
         )
 
     def _new_app(self):
@@ -113,60 +124,48 @@ class StreamlitAppTests(unittest.TestCase):
             lag_metric.evidence["reference_date"], REFERENCE_DATE.isoformat()
         )
 
-    def test_metric_selector_defaults_to_v04_and_supports_all_presets(self):
+    def test_metric_selector_uses_one_unified_card_list_and_presets(self):
         app = self._new_app()
-        selector = self._multiselect_by_label(app, "自由选择指标")
-
-        self.assertEqual(tuple(selector.value), ORIGINAL_METRIC_IDS)
-
-        self._button_by_label(app, "仅 DB31/T").click().run()
-        self.assertFalse(app.exception)
-        self.assertEqual(
-            tuple(
-                self._multiselect_by_label(
-                    app,
-                    "自由选择指标",
-                ).value
-            ),
-            DB31_METRIC_IDS,
+        self.assertEqual(len(app.multiselect), 0)
+        self.assertEqual(len(app.checkbox), len(ALL_METRIC_IDS))
+        self.assertEqual(self._selected_metric_ids(app), ORIGINAL_METRIC_IDS)
+        self.assertTrue(
+            any("metric-help-icon" in item.value for item in app.markdown)
+        )
+        self.assertTrue(
+            any("data-tooltip" in item.value for item in app.markdown)
+        )
+        self.assertFalse(
+            any("原 v0.4" in checkbox.label for checkbox in app.checkbox)
+        )
+        self.assertFalse(
+            any("DB31/T" in checkbox.label for checkbox in app.checkbox)
         )
 
         self._button_by_label(app, "全部指标").click().run()
         self.assertFalse(app.exception)
-        self.assertEqual(
-            tuple(
-                self._multiselect_by_label(
-                    app,
-                    "自由选择指标",
-                ).value
-            ),
-            ALL_METRIC_IDS,
-        )
+        self.assertEqual(self._selected_metric_ids(app), ALL_METRIC_IDS)
 
-        self._button_by_label(app, "原有 13 项").click().run()
+        self._button_by_label(app, "清空选择").click().run()
         self.assertFalse(app.exception)
-        self.assertEqual(
-            tuple(
-                self._multiselect_by_label(
-                    app,
-                    "自由选择指标",
-                ).value
-            ),
-            ORIGINAL_METRIC_IDS,
-        )
+        self.assertEqual(self._selected_metric_ids(app), ())
+
+        self._button_by_label(app, "默认指标").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(self._selected_metric_ids(app), ORIGINAL_METRIC_IDS)
 
     def test_custom_metric_mix_is_the_exact_report_selection(self):
         sample = PROJECT_ROOT / "sample_data" / "bad_dataset.csv"
         app = self._new_app()
-        selector = self._multiselect_by_label(app, "自由选择指标")
-        selector.set_value(
-            [
-                "db31_030300",
-                "exact_duplicate_rate",
-                "db31_010101",
-                "db31_030400",
-            ]
-        )
+        for metric_id in ORIGINAL_METRIC_IDS:
+            self._metric_checkbox(app, metric_id).set_value(False)
+        for metric_id in (
+            "db31_030300",
+            "exact_duplicate_rate",
+            "db31_010101",
+            "db31_030400",
+        ):
+            self._metric_checkbox(app, metric_id).set_value(True)
         app.run()
         self._upload_and_run(
             app,
@@ -208,15 +207,11 @@ class StreamlitAppTests(unittest.TestCase):
             if {
                 "指标名称",
                 "字段名称",
-                "来源",
-                "标准代码",
                 "计算方式",
             }.issubset(set(table.value.columns))
         )
-        self.assertEqual(
-            set(metric_table["来源"]),
-            {"原 v0.4 指标", "DB31/T 1523-2024"},
-        )
+        self.assertNotIn("来源", metric_table.columns)
+        self.assertNotIn("标准代码", metric_table.columns)
 
     def test_empty_metric_selection_disables_run_and_clears_old_state(self):
         sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
@@ -233,10 +228,14 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertIn("agent_ui_state", app.session_state.filtered_state)
         self.assertIn("rule_ui_state", app.session_state.filtered_state)
 
-        self._multiselect_by_label(
-            app,
-            "自由选择指标",
-        ).set_value([])
+        app.file_uploader[0].set_value(None)
+        app.run()
+        self.assertFalse(app.exception)
+        self.assertNotIn("quality_report", app.session_state.filtered_state)
+        self.assertEqual(len(app.checkbox), len(ALL_METRIC_IDS))
+
+        for metric_id in ALL_METRIC_IDS:
+            self._metric_checkbox(app, metric_id).set_value(False)
         app.run()
 
         self.assertFalse(app.exception)
@@ -254,13 +253,13 @@ class StreamlitAppTests(unittest.TestCase):
             )
         )
 
-    def test_reordering_the_same_selection_keeps_the_current_report(self):
+    def test_evaluation_hides_cards_until_the_uploaded_file_is_removed(self):
         sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
         app = self._new_app()
-        selector = self._multiselect_by_label(app, "自由选择指标")
-        selector.set_value(
-            ["exact_duplicate_rate", "db31_030300"]
-        )
+        for metric_id in ORIGINAL_METRIC_IDS:
+            self._metric_checkbox(app, metric_id).set_value(False)
+        self._metric_checkbox(app, "exact_duplicate_rate").set_value(True)
+        self._metric_checkbox(app, "db31_030300").set_value(True)
         app.run()
         self._upload_and_run(
             app,
@@ -268,26 +267,14 @@ class StreamlitAppTests(unittest.TestCase):
             sample.read_bytes(),
             "text/csv",
         )
-        report_hash = app.session_state["quality_report"].to_dict()[
-            "evaluation_context"
-        ]["report_sha256"]
-
-        self._multiselect_by_label(
-            app,
-            "自由选择指标",
-        ).set_value(
-            ["db31_030300", "exact_duplicate_rate"]
-        )
+        self.assertEqual(len(app.checkbox), 0)
+        self.assertIn("quality_report", app.session_state.filtered_state)
+        app.file_uploader[0].set_value(None)
         app.run()
 
         self.assertFalse(app.exception)
-        self.assertIn("quality_report", app.session_state.filtered_state)
-        self.assertEqual(
-            app.session_state["quality_report"].to_dict()[
-                "evaluation_context"
-            ]["report_sha256"],
-            report_hash,
-        )
+        self.assertEqual(len(app.checkbox), len(ALL_METRIC_IDS))
+        self.assertNotIn("quality_report", app.session_state.filtered_state)
 
     def test_supported_formats_run_through_full_report_surface(self):
         samples = PROJECT_ROOT / "sample_data"
@@ -476,6 +463,12 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertTrue(state["history"][0]["is_question"])
         self.assertGreaterEqual(len(app.chat_message), 2)
 
+        app.file_uploader[0].set_value(None)
+        app.run()
+        app.file_uploader[0].set_value(
+            (sample.name, sample.read_bytes(), "application/json")
+        )
+        app.run()
         self._button_by_label(app, "运行质量评估").click().run()
 
         self.assertFalse(app.exception)

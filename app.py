@@ -5,6 +5,7 @@ import json
 import math
 import os
 from datetime import date
+from html import escape as escape_html
 from pathlib import Path
 
 import pandas as pd
@@ -14,12 +15,10 @@ from src.agent_models import AgentAnalysis
 from src.agent_service import run_agent
 from src.metric_catalog import (
     ALL_METRIC_IDS,
-    DB31_METRIC_IDS,
     DEFAULT_SELECTED_METRIC_IDS,
-    ORIGINAL_METRIC_IDS,
     build_metric_catalog_rows,
     get_metric_definition,
-    metric_selection_label,
+    metric_description,
     normalize_selected_metric_ids,
 )
 from src.models import QualityReport
@@ -57,6 +56,7 @@ from src.upload_service import evaluate_uploaded_dataset, sanitize_file_name
 AGENT_STATE_KEY = "agent_ui_state"
 RULE_STATE_KEY = "rule_ui_state"
 METRIC_SELECTION_KEY = "selected_metric_ids"
+METRIC_SELECTION_WIDGET_PREFIX = "metric_selection_checkbox_"
 AGENT_HISTORY_LIMIT = 8
 AGENT_PRIORITY_LABELS = {
     "high": "高",
@@ -89,9 +89,9 @@ RULE_FREQUENCIES = {
 }
 
 METRIC_PRESET_BUTTON_KEYS = {
-    "original": "metric_preset_original",
-    "db31": "metric_preset_db31",
+    "default": "metric_preset_default",
     "all": "metric_preset_all",
+    "clear": "metric_preset_clear",
 }
 
 
@@ -116,36 +116,229 @@ def _clear_rule_state() -> None:
         st.session_state.pop(key, None)
 
 
-def _set_metric_selection(metric_ids: tuple[str, ...]) -> None:
-    """由快捷预设在指标控件创建前更新稳定选择状态。"""
+def _metric_checkbox_key(metric_id: str) -> str:
+    """为每一张指标卡生成稳定且独立的复选框状态键。"""
 
-    st.session_state[METRIC_SELECTION_KEY] = list(metric_ids)
+    return f"{METRIC_SELECTION_WIDGET_PREFIX}{metric_id}"
+
+
+def _set_metric_selection(metric_ids: tuple[str, ...]) -> None:
+    """由快捷预设在指标卡控件创建前同步更新所有选择状态。"""
+
+    normalized = normalize_selected_metric_ids(metric_ids)
+    st.session_state[METRIC_SELECTION_KEY] = list(normalized)
+    selected = set(normalized)
+    for metric_id in ALL_METRIC_IDS:
+        st.session_state[_metric_checkbox_key(metric_id)] = (
+            metric_id in selected
+        )
+
+
+def _clear_metric_selection() -> None:
+    """清空所有指标卡的选择状态。"""
+
+    st.session_state[METRIC_SELECTION_KEY] = []
+    for metric_id in ALL_METRIC_IDS:
+        st.session_state[_metric_checkbox_key(metric_id)] = False
 
 
 def _initialize_metric_selection_state() -> None:
-    """初始化或清理跨目录版本遗留的指标控件状态。"""
+    """初始化指标卡状态，并兼容旧版多选框保存的选择结果。"""
 
-    if METRIC_SELECTION_KEY not in st.session_state:
-        st.session_state[METRIC_SELECTION_KEY] = list(
-            DEFAULT_SELECTED_METRIC_IDS
-        )
-        return
-    current = st.session_state.get(METRIC_SELECTION_KEY)
-    if not isinstance(current, (list, tuple, set)):
-        st.session_state[METRIC_SELECTION_KEY] = list(
-            DEFAULT_SELECTED_METRIC_IDS
-        )
-        return
-    requested = {
-        metric_id
-        for metric_id in current
-        if isinstance(metric_id, str)
+    widget_keys = {
+        metric_id: _metric_checkbox_key(metric_id)
+        for metric_id in ALL_METRIC_IDS
     }
+    if any(key in st.session_state for key in widget_keys.values()):
+        requested = {
+            metric_id
+            for metric_id, key in widget_keys.items()
+            if bool(st.session_state.get(key, False))
+        }
+    else:
+        current = st.session_state.get(METRIC_SELECTION_KEY)
+        if not isinstance(current, (list, tuple, set)):
+            current = DEFAULT_SELECTED_METRIC_IDS
+        requested = {
+            metric_id for metric_id in current if isinstance(metric_id, str)
+        }
+
     normalized = [
         metric_id for metric_id in ALL_METRIC_IDS if metric_id in requested
     ]
-    if list(current) != normalized:
-        st.session_state[METRIC_SELECTION_KEY] = normalized
+    st.session_state[METRIC_SELECTION_KEY] = normalized
+    for metric_id, key in widget_keys.items():
+        if key not in st.session_state:
+            st.session_state[key] = metric_id in requested
+
+
+def _selected_metric_ids_from_cards() -> tuple[str, ...]:
+    """从指标卡读取选择，并按照固定目录顺序固化到会话状态。"""
+
+    selected = tuple(
+        metric_id
+        for metric_id in ALL_METRIC_IDS
+        if bool(st.session_state.get(_metric_checkbox_key(metric_id), False))
+    )
+    st.session_state[METRIC_SELECTION_KEY] = list(selected)
+    return selected
+
+
+def _render_metric_card(metric_id: str) -> None:
+    """在主页面渲染一张带悬停释义的可选指标卡。"""
+
+    definition = get_metric_definition(metric_id)
+    if definition is None:
+        return
+    capability = (
+        "当前可直接计算"
+        if definition["auto_assessable"]
+        else "需补充评价依据"
+    )
+
+    with st.container(border=True):
+        title_column, help_column = st.columns((12, 1))
+        with title_column:
+            st.checkbox(
+                str(definition["name"]),
+                key=_metric_checkbox_key(metric_id),
+            )
+        with help_column:
+            description = escape_html(metric_description(metric_id), quote=True)
+            st.markdown(
+                (
+                    '<span class="metric-help-icon" '
+                    f'data-tooltip="{description}" '
+                    f'aria-label="{description}" role="img" tabindex="0">?</span>'
+                ),
+                unsafe_allow_html=True,
+            )
+        st.caption(f"{definition['dimension']} · {capability}")
+        st.caption(f"计算方式：{definition['formula']}")
+
+
+def _render_metric_cards(metric_ids: tuple[str, ...]) -> None:
+    """按三列布局绘制统一的指标卡列表。"""
+
+    for start_index in range(0, len(metric_ids), 3):
+        for column, metric_id in zip(
+            st.columns(3), metric_ids[start_index : start_index + 3]
+        ):
+            with column:
+                _render_metric_card(metric_id)
+
+
+def _render_metric_selection_panel() -> tuple[str, ...]:
+    """在主内容区展示统一的指标卡、预设和计算方式目录。"""
+
+    st.subheader("选择评价指标")
+    st.caption(
+        "默认已选中一组基础指标。点击卡片即可自由组合；将鼠标悬停在每张卡片"
+        "右上角的“？”上可查看指标含义。缺少必要评价依据的指标会在报告中如实"
+        "标记为无法评估。"
+    )
+    preset_columns = st.columns(3)
+    preset_columns[0].button(
+        "默认指标",
+        key=METRIC_PRESET_BUTTON_KEYS["default"],
+        width="stretch",
+        on_click=_set_metric_selection,
+        args=(DEFAULT_SELECTED_METRIC_IDS,),
+    )
+    preset_columns[1].button(
+        "全部指标",
+        key=METRIC_PRESET_BUTTON_KEYS["all"],
+        width="stretch",
+        on_click=_set_metric_selection,
+        args=(ALL_METRIC_IDS,),
+    )
+    preset_columns[2].button(
+        "清空选择",
+        key=METRIC_PRESET_BUTTON_KEYS["clear"],
+        width="stretch",
+        on_click=_clear_metric_selection,
+    )
+
+    st.markdown(
+        """
+        <style>
+        .metric-help-icon {
+            align-items: center;
+            border: 1px solid #64748b;
+            border-radius: 50%;
+            color: #334155;
+            cursor: help;
+            display: inline-flex;
+            font-size: 0.85rem;
+            font-weight: 700;
+            height: 1.45rem;
+            justify-content: center;
+            line-height: 1;
+            margin-top: 0.12rem;
+            position: relative;
+            width: 1.45rem;
+        }
+        .metric-help-icon::after {
+            background: #0f172a;
+            border-radius: 0.35rem;
+            color: #ffffff;
+            content: attr(data-tooltip);
+            font-size: 0.8rem;
+            font-weight: 400;
+            line-height: 1.4;
+            max-width: 18rem;
+            opacity: 0;
+            padding: 0.5rem 0.65rem;
+            pointer-events: none;
+            position: absolute;
+            right: 0;
+            text-align: left;
+            top: calc(100% + 0.4rem);
+            transform: translateY(-0.2rem);
+            transition: opacity 80ms ease, transform 80ms ease;
+            visibility: hidden;
+            width: max-content;
+            z-index: 1000;
+        }
+        .metric-help-icon:hover {
+            background: #e2e8f0;
+            border-color: #0f172a;
+            color: #0f172a;
+        }
+        .metric-help-icon:hover::after,
+        .metric-help-icon:focus::after {
+            opacity: 1;
+            transform: translateY(0);
+            visibility: visible;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander(f"评价指标（{len(ALL_METRIC_IDS)} 项）", expanded=True):
+        _render_metric_cards(ALL_METRIC_IDS)
+
+    selected_metric_ids = _selected_metric_ids_from_cards()
+    st.caption(f"已选 {len(selected_metric_ids)} 项。")
+    if not selected_metric_ids:
+        st.warning("请至少选择一个评价指标后再运行。")
+
+    with st.expander("查看指标目录与计算方式"):
+        catalog = pd.DataFrame(build_metric_catalog_rows()).drop(
+            columns=["来源", "标准代码", "层级", "指标 ID"],
+            errors="ignore",
+        )
+        st.dataframe(
+            catalog,
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "“当前能力”说明本地单表是否具备直接评价依据。"
+        )
+
+    return selected_metric_ids
 
 
 def _escape_markdown(value: object) -> str:
@@ -196,29 +389,18 @@ def _selected_metric_ids_for_report(
 
 
 def _render_metric_selection_summary(report: QualityReport) -> None:
-    """展示绑定当前报告的指标来源和可评估能力统计。"""
+    """展示绑定当前报告的统一指标选择与可评估能力统计。"""
 
     selected = _selected_metric_ids_for_report(report)
-    original_count = sum(
-        metric_id in ORIGINAL_METRIC_IDS for metric_id in selected
-    )
-    db31_count = sum(metric_id in DB31_METRIC_IDS for metric_id in selected)
-    db31_auto_count = sum(
+    auto_assessable_count = sum(
         bool(definition and definition.get("auto_assessable"))
         for metric_id in selected
-        if metric_id in DB31_METRIC_IDS
         for definition in (get_metric_definition(metric_id),)
     )
     st.caption(
         "本次指标选择："
-        f"共 {len(selected)} 项 · 原 v0.4 指标 {original_count} 项 · "
-        f"DB31/T 指标 {db31_count} 项"
-        + (
-            f"（可直接计算 {db31_auto_count} 项，"
-            f"需补充评价依据 {db31_count - db31_auto_count} 项）"
-            if db31_count
-            else ""
-        )
+        f"共 {len(selected)} 项 · 当前可直接计算 {auto_assessable_count} 项 · "
+        f"需补充评价依据 {len(selected) - auto_assessable_count} 项"
     )
 
 
@@ -1230,7 +1412,11 @@ def _render_metrics(report: QualityReport) -> None:
     if not rows:
         st.info("当前报告不包含指标明细。")
         return
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    visible_rows = pd.DataFrame(rows).drop(
+        columns=["来源", "标准代码", "层级"],
+        errors="ignore",
+    )
+    st.dataframe(visible_rows, width="stretch", hide_index=True)
     st.caption("指标值由确定性 Python 规则计算；“无法评估”不会被替换为 0。")
     with st.expander("查看指标引用键（技术信息）"):
         st.dataframe(
@@ -1311,11 +1497,20 @@ def _evaluation_request_signature(
 
 st.title("政务数据集质量评估")
 st.caption(
-    "v0.6 · 直接基于 v0.4 演进。上传结构化文件，"
-    "从原有指标与 DB31/T 1523-2024 指标中自由选择并生成可复现报告。"
+    "v0.6 · 上传结构化文件，选择评价指标并生成可复现报告。"
 )
 
 _initialize_metric_selection_state()
+report_is_displayed = st.session_state.get("quality_report") is not None
+if not report_is_displayed:
+    selected_metric_ids = _render_metric_selection_panel()
+else:
+    selected_metric_ids = tuple(
+        metric_id
+        for metric_id in ALL_METRIC_IDS
+        if metric_id in st.session_state.get(METRIC_SELECTION_KEY, [])
+    )
+
 with st.sidebar:
     st.header("开始评估")
     uploaded_file = st.file_uploader(
@@ -1354,74 +1549,6 @@ with st.sidebar:
             "工作表名称（可选）",
             placeholder="默认读取第一个工作表",
         )
-    with st.expander("选择评价指标", expanded=True):
-        st.caption(
-            "默认沿用原 v0.4 的 13 项指标。可使用快捷预设，也可在下方"
-            "搜索并自由组合；带“需补充评价依据”的标准指标会如实标记为无法评估。"
-        )
-        preset_columns = st.columns(3)
-        preset_columns[0].button(
-            "原有 13 项",
-            key=METRIC_PRESET_BUTTON_KEYS["original"],
-            width="stretch",
-            on_click=_set_metric_selection,
-            args=(ORIGINAL_METRIC_IDS,),
-        )
-        preset_columns[1].button(
-            "仅 DB31/T",
-            key=METRIC_PRESET_BUTTON_KEYS["db31"],
-            width="stretch",
-            on_click=_set_metric_selection,
-            args=(DB31_METRIC_IDS,),
-        )
-        preset_columns[2].button(
-            "全部指标",
-            key=METRIC_PRESET_BUTTON_KEYS["all"],
-            width="stretch",
-            on_click=_set_metric_selection,
-            args=(ALL_METRIC_IDS,),
-        )
-        selected_metric_values = st.multiselect(
-            "自由选择指标",
-            options=list(ALL_METRIC_IDS),
-            format_func=metric_selection_label,
-            key=METRIC_SELECTION_KEY,
-            placeholder="搜索指标名称、代码或来源",
-            help=(
-                "原有指标与 DB31/T 指标使用不同的稳定 ID；"
-                "即使含义相近也会分别保留。"
-            ),
-        )
-        selected_metric_ids = (
-            normalize_selected_metric_ids(selected_metric_values)
-            if selected_metric_values
-            else ()
-        )
-        original_selected_count = sum(
-            metric_id in ORIGINAL_METRIC_IDS
-            for metric_id in selected_metric_ids
-        )
-        db31_selected_count = sum(
-            metric_id in DB31_METRIC_IDS
-            for metric_id in selected_metric_ids
-        )
-        st.caption(
-            f"已选 {len(selected_metric_ids)} 项："
-            f"原 v0.4 指标 {original_selected_count} 项，"
-            f"DB31/T 指标 {db31_selected_count} 项。"
-        )
-        if not selected_metric_ids:
-            st.warning("请至少选择一个评价指标后再运行。")
-    with st.expander("查看指标目录与计算方式"):
-        st.dataframe(
-            pd.DataFrame(build_metric_catalog_rows()),
-            width="stretch",
-            hide_index=True,
-        )
-        st.caption(
-            "DB31/T 指标的 A、B 口径来自标准正文；"
-            "“当前能力”说明本地单表是否具备直接评价依据。"
-        )
     request_signature = _evaluation_request_signature(
         uploaded_file,
         dataset_name,
@@ -1430,16 +1557,22 @@ with st.sidebar:
         selected_metric_ids,
     )
     if st.session_state.get("evaluation_request_signature") != request_signature:
+        had_report = st.session_state.get("quality_report") is not None
         st.session_state["evaluation_request_signature"] = request_signature
         st.session_state.pop("quality_report", None)
         _clear_agent_state()
         _clear_rule_state()
-    run_evaluation = st.button(
-        "运行质量评估",
-        type="primary",
-        width="stretch",
-        disabled=uploaded_file is None or not selected_metric_ids,
-    )
+        if had_report:
+            st.rerun()
+    if not report_is_displayed:
+        run_evaluation = st.button(
+            "运行质量评估",
+            type="primary",
+            width="stretch",
+            disabled=uploaded_file is None or not selected_metric_ids,
+        )
+    else:
+        run_evaluation = False
     st.caption("原始文件仅写入临时目录用于本次计算，评估结束后自动删除。")
 
 if run_evaluation and uploaded_file is not None and selected_metric_ids:
@@ -1455,6 +1588,7 @@ if run_evaluation and uploaded_file is not None and selected_metric_ids:
                 reference_date=reference_date,
                 selected_metric_ids=selected_metric_ids,
             )
+            st.rerun()
         except (DatasetReadError, UnsupportedFileTypeError) as error:
             st.session_state.pop("quality_report", None)
             _clear_agent_state()

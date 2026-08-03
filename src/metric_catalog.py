@@ -20,6 +20,55 @@ class MetricSelectionError(ValueError):
     """指标选择为空、包含未知 ID 或类型不合法。"""
 
 
+METRIC_DESCRIPTIONS: Mapping[str, str] = MappingProxyType(
+    {
+        "file_parse_rate": "上传文件能否被当前解析器成功读取。",
+        "dataset_scale": "解析后可参与质量评估的数据记录数量。",
+        "field_missing_rate": "每个字段中缺失值占该字段记录数的比例。",
+        "blank_record_rate": "可识别内容字段全部为空的记录占比。",
+        "field_type_consistency": "字段非空值中占比最高的基础类型所占比例。",
+        "recognizable_format_anomaly_rate": "按字段名可识别的日期、数值、URL 或邮箱字段中，格式异常值的比例。",
+        "exact_duplicate_rate": "排除技术标识列后，与首次出现记录内容完全相同的后续记录占比。",
+        "normalized_duplicate_rate": "忽略自然文本的空白、大小写和常见标点后，后续重复记录占比。",
+        "time_info_availability": "至少包含一个可解析日期或时间的记录占比。",
+        "update_lag_days": "评估基准日期与最近可解析更新时间之间的天数。",
+        "source_info_coverage": "包含可识别来源部门、链接或原始标识信息的记录占比。",
+        "version_info_coverage": "包含版本、更新时间或处理记录信息的记录占比。",
+        "statistical_outlier_rate": "按 IQR 规则识别的数值异常在被检查数值中的比例。",
+        "db31_010100": "数据符合类型、格式和长度等数据标准的程度。",
+        "db31_010101": "数据元素符合预期数据类型约束的程度。",
+        "db31_010102": "数据元素符合预期格式约束的程度。",
+        "db31_010103": "数据元素符合预期长度约束的程度。",
+        "db31_010200": "数据符合目标实体、字段、关系和模式定义的程度。",
+        "db31_010300": "数据内容符合独立元数据定义的程度。",
+        "db31_010400": "数据符合公共服务业务规则的程度。",
+        "db31_010500": "数据符合权威参考数据或权威参考源规则的程度。",
+        "db31_010600": "数据符合安全、权限、脱敏和隐私规则的程度。",
+        "db31_020100": "按业务规则要求应赋值的数据元素填写完整、无缺失的程度。",
+        "db31_020200": "按业务规则要求应赋值的数据记录填写完整、无缺失的程度。",
+        "db31_030100": "数据内容与预期值或真实值相符的程度。",
+        "db31_030200": "数据类型、范围、长度和精度等格式满足预期要求的程度。",
+        "db31_030300": "特定字段、记录、文件或数据集意外重复较少的程度。",
+        "db31_030400": "特定字段、记录、文件或数据集保持唯一的程度。",
+        "db31_030500": "数据中无效或不符合定义的脏数据较少的程度。",
+        "db31_030600": "数据与明确的权威数据参照保持一致的程度。",
+        "db31_040100": "同一数据在不同位置、应用、用户或版本中保持一致的程度。",
+        "db31_040200": "根据关联数据一致性约束检查表内和跨表一致性的程度。",
+        "db31_040201": "同一表中跨列元素应相等的关系保持一致的程度。",
+        "db31_040202": "同一表中跨列元素逻辑关系保持一致的程度。",
+        "db31_040203": "关联表之间元素等值关系保持一致的程度。",
+        "db31_040204": "关联表之间元素逻辑关系保持一致的程度。",
+        "db31_040300": "内容数据记录的数据项与独立元数据保持一致的程度。",
+        "db31_050100": "基于日期范围的记录数或频率分布符合业务需求的程度。",
+        "db31_050200": "应及时公开或提供的数据处于有效期限内的程度。",
+        "db31_050300": "同一实体数据元素间相对时序关系正确的程度。",
+        "db31_050400": "在数据授权有效周期内提供数据使用的程度。",
+        "db31_060100": "数据在需要的时间可被获取的程度。",
+        "db31_060200": "数据适配目标应用场景并可被使用的程度。",
+    }
+)
+
+
 def _legacy(
     metric_id: str,
     name: str,
@@ -39,6 +88,7 @@ def _legacy(
         "level": "原有",
         "parent_id": None,
         "formula": formula,
+        "description": METRIC_DESCRIPTIONS[metric_id],
         "direction": direction,
         "auto_assessable": True,
         "reason_code": None,
@@ -71,6 +121,7 @@ def _db31(
         "level": level,
         "parent_id": f"db31_{parent_code}" if parent_code else None,
         "formula": formula,
+        "description": METRIC_DESCRIPTIONS[f"db31_{code}"],
         "direction": "higher_is_better",
         "auto_assessable": auto_assessable,
         "reason_code": reason_code,
@@ -498,6 +549,12 @@ def get_metric_definition(metric_id: str) -> Mapping[str, Any] | None:
     return METRIC_BY_ID.get(metric_id)
 
 
+def metric_description(metric_id: str) -> str:
+    """返回指标在页面提示中使用的简明含义。"""
+
+    return str(METRIC_BY_ID[metric_id]["description"])
+
+
 def normalize_selected_metric_ids(
     selected_metric_ids: Iterable[str] | None,
 ) -> tuple[str, ...]:
@@ -561,6 +618,7 @@ def build_metric_catalog_rows() -> list[dict[str, str]]:
                 "一级维度": str(item["dimension"]),
                 "层级": str(item["level"]),
                 "指标名称": str(item["name"]),
+                "指标含义": str(item["description"]),
                 "计算方式": str(item["formula"]),
                 "当前能力": (
                     "可直接计算"

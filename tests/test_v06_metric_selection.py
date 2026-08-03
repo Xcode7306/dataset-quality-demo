@@ -19,6 +19,7 @@ from src.metric_catalog import (
     METRIC_CATALOG,
     MetricSelectionError,
     ORIGINAL_METRIC_IDS,
+    metric_description,
     normalize_selected_metric_ids,
 )
 from src.metrics import (
@@ -86,6 +87,19 @@ class MetricCatalogTests(unittest.TestCase):
                 )
             },
             {"db31_040200"},
+        )
+
+    def test_every_metric_has_a_concise_hover_description(self):
+        self.assertTrue(
+            all(
+                isinstance(METRIC_BY_ID[metric_id]["description"], str)
+                and METRIC_BY_ID[metric_id]["description"].strip()
+                for metric_id in ALL_METRIC_IDS
+            )
+        )
+        self.assertEqual(
+            metric_description("db31_030300"),
+            "特定字段、记录、文件或数据集意外重复较少的程度。",
         )
 
     def test_selection_is_validated_deduplicated_and_catalog_ordered(self):

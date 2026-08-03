@@ -294,6 +294,12 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
         app = self._new_app()
         self._upload_and_run(app, sample.name, sample.read_bytes(), "text/csv")
 
+        app.file_uploader[0].set_value(None)
+        app.run()
+        app.file_uploader[0].set_value(
+            (sample.name, sample.read_bytes(), "text/csv")
+        )
+        app.run()
         with patch(
             "src.upload_service.evaluate_uploaded_dataset",
             side_effect=OSError("临时文件写入失败"),
