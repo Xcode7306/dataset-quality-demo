@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import json
 from typing import Any, Literal, Mapping, Sequence
 
+from .model_api import extract_message_content, parse_json_object_text
 
 AgentIntent = Literal["summary", "priority", "not_assessable", "question"]
 ActionPriority = Literal["high", "medium", "low"]
@@ -309,20 +310,197 @@ def _require_array(
     return value
 
 
-def parse_provider_draft(payload: Any) -> dict[str, Any]:
+def _compatibility_citations(value: Any) -> list[str]:
+    if isinstance(value, list):
+        citations = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if citations:
+            return list(dict.fromkeys(citations))[:8]
+    return ["report:summary"]
+
+
+def _compatibility_text(value: Any) -> str:
+    return extract_message_content(value).strip()
+
+
+def _compatibility_draft_from_text(text: str) -> dict[str, Any]:
+    answer_text = text.strip()[:3000]
+    if not answer_text:
+        raise AgentOutputValidationError("模型未返回可展示的解读文本。")
+    return {
+        "facts": [
+            {
+                "text": "模型已根据当前报告生成解读。",
+                "citation_ids": ["report:summary"],
+            }
+        ],
+        "actions": [
+            {
+                "priority": "low",
+                "title": "结合模型解读进行复核",
+                "detail": answer_text[:2000],
+                "citation_ids": ["report:summary"],
+            }
+        ],
+        "limitations": [
+            {
+                "text": "以上内容由用户配置的模型生成；确定性指标和风险仍以当前报告为准。",
+                "citation_ids": ["report:summary"],
+            }
+        ],
+        "answer": {
+            "text": answer_text,
+            "citation_ids": ["report:summary"],
+        },
+    }
+
+
+def _compatibility_draft_from_object(root: Mapping[str, Any]) -> dict[str, Any]:
+    nested = root
+    for key in ("data", "result", "response"):
+        candidate = nested.get(key)
+        if isinstance(candidate, Mapping):
+            nested = candidate
+            break
+
+    default_citation = ["report:summary"]
+    facts: list[dict[str, Any]] = []
+    raw_facts = nested.get("facts")
+    if isinstance(raw_facts, list):
+        for item in raw_facts[:8]:
+            if isinstance(item, Mapping):
+                text = _compatibility_text(item.get("text") or item.get("content"))
+                citations = _compatibility_citations(item.get("citation_ids"))
+            else:
+                text = _compatibility_text(item)
+                citations = default_citation
+            if text:
+                facts.append({"text": text[:2000], "citation_ids": citations})
+
+    answer_value = nested.get("answer")
+    answer_text = _compatibility_text(answer_value)
+    if not answer_text:
+        answer_text = _compatibility_text(
+            nested.get("content")
+            or nested.get("text")
+            or nested.get("message")
+            or nested.get("output")
+            or nested.get("summary")
+        )
+    if not answer_text and facts:
+        answer_text = facts[0]["text"]
+    if not answer_text:
+        # 有些兼容接口会返回自定义 JSON 字段，而不是标准 answer。
+        # 将其原样压缩为模型回答，避免接口成功但 UI 因字段名差异丢失结果。
+        try:
+            answer_text = json.dumps(
+                nested,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )[:3000]
+        except (TypeError, ValueError):
+            answer_text = "模型已返回结构化解读，但未提供标准 answer 字段。"
+    if not answer_text.strip():
+        raise AgentOutputValidationError("模型未返回可展示的解读内容。")
+    answer_citations = (
+        _compatibility_citations(answer_value.get("citation_ids"))
+        if isinstance(answer_value, Mapping)
+        else default_citation
+    )
+
+    actions: list[dict[str, Any]] = []
+    raw_actions = nested.get("actions")
+    if isinstance(raw_actions, list):
+        for item in raw_actions[:8]:
+            if not isinstance(item, Mapping):
+                continue
+            detail = _compatibility_text(item.get("detail") or item.get("text"))
+            title = _compatibility_text(item.get("title")) or "结合模型解读进行复核"
+            priority = item.get("priority")
+            if priority not in {"high", "medium", "low"}:
+                priority = "low"
+            if detail:
+                actions.append(
+                    {
+                        "priority": priority,
+                        "title": title[:300],
+                        "detail": detail[:2000],
+                        "citation_ids": _compatibility_citations(
+                            item.get("citation_ids")
+                        ),
+                    }
+                )
+    if not actions:
+        actions.append(
+            {
+                "priority": "low",
+                "title": "结合模型解读进行复核",
+                "detail": answer_text[:2000],
+                "citation_ids": answer_citations,
+            }
+        )
+
+    limitations: list[dict[str, Any]] = []
+    raw_limitations = nested.get("limitations")
+    if isinstance(raw_limitations, list):
+        for item in raw_limitations[:8]:
+            if isinstance(item, Mapping):
+                text = _compatibility_text(item.get("text") or item.get("content"))
+                citations = _compatibility_citations(item.get("citation_ids"))
+            else:
+                text = _compatibility_text(item)
+                citations = default_citation
+            if text:
+                limitations.append(
+                    {"text": text[:2000], "citation_ids": citations}
+                )
+    if not limitations:
+        limitations.append(
+            {
+                "text": "以上内容由用户配置的模型生成；确定性指标和风险仍以当前报告为准。",
+                "citation_ids": default_citation,
+            }
+        )
+    if not facts:
+        facts.append(
+            {
+                "text": "模型已根据当前报告生成解读。",
+                "citation_ids": default_citation,
+            }
+        )
+    return {
+        "facts": facts,
+        "actions": actions,
+        "limitations": limitations,
+        "answer": {
+            "text": answer_text[:3000],
+            "citation_ids": answer_citations,
+        },
+    }
+
+
+def parse_provider_draft(
+    payload: Any,
+    *,
+    allow_compatibility: bool = False,
+) -> dict[str, Any]:
     """将模型返回值解析成严格、规范化的 Agent 草稿。
 
-    该函数故意不进行宽松修复。非法 JSON、额外字段、缺失引用或超长内容
-    都由上层触发模板回退，避免把未验证内容带入最终分析。
+    默认路径保持严格校验；兼容普通 Chat Completions 的路径会把常见文本或
+    部分 JSON 结果规范化为展示草稿，但引用仍由上层限制在当前报告范围内。
     """
 
     if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except (TypeError, ValueError) as error:
-            raise AgentOutputValidationError("模型未返回合法 JSON。") from error
+        parsed = parse_json_object_text(payload)
+        if parsed is None:
+            if allow_compatibility:
+                return _compatibility_draft_from_text(payload)
+            raise AgentOutputValidationError("模型未返回合法 JSON。")
+        payload = parsed
     root = _require_object(payload, "root")
-    _require_exact_keys(root, _DRAFT_KEYS, "root")
+    if allow_compatibility:
+        root = _compatibility_draft_from_object(root)
+    else:
+        _require_exact_keys(root, _DRAFT_KEYS, "root")
 
     facts: list[dict[str, Any]] = []
     for index, raw_fact in enumerate(_require_array(root["facts"], "facts")):

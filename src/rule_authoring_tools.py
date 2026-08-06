@@ -1,0 +1,121 @@
+"""v0.7 规则编制工具。
+
+这些工具只从指标目录和脱敏画像构建上下文，不读取原始单元格值，也不执行
+审批、文件写入或正式规则重评。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+from .metric_catalog import get_metric_definition
+
+
+def _report_payload(report: Any) -> Mapping[str, Any]:
+    to_dict = getattr(report, "to_dict", None)
+    if not callable(to_dict):
+        raise TypeError("report 必须提供 to_dict()。")
+    payload = to_dict()
+    if not isinstance(payload, Mapping):
+        raise TypeError("report.to_dict() 必须返回对象。")
+    return payload
+
+
+def get_metric_definition_tool(metric_id: str) -> dict[str, Any]:
+    definition = get_metric_definition(metric_id)
+    if definition is None:
+        return {"metric_id": metric_id, "found": False}
+    keys = (
+        "id",
+        "name",
+        "category",
+        "dimension",
+        "description",
+        "formula",
+        "direction",
+        "auto_assessable",
+        "reason_code",
+        "required_inputs",
+        "available_proxy_metric_ids",
+    )
+    return {
+        "metric_id": metric_id,
+        "found": True,
+        **{
+            key: list(definition[key])
+            if key in {"required_inputs", "available_proxy_metric_ids"}
+            else definition.get(key)
+            for key in keys
+        },
+    }
+
+
+def list_available_fields_tool(report: Any) -> dict[str, Any]:
+    payload = _report_payload(report)
+    profile = payload.get("profile")
+    columns = profile.get("columns", []) if isinstance(profile, Mapping) else []
+    fields = []
+    if isinstance(columns, list):
+        for column in columns:
+            if not isinstance(column, Mapping) or not isinstance(column.get("name"), str):
+                continue
+            fields.append(
+                {
+                    "name": column["name"],
+                    "inferred_type": str(column.get("inferred_type", "unknown")),
+                    "missing_rate": column.get("missing_rate"),
+                    "non_missing_count": column.get("non_missing_count"),
+                }
+            )
+    return {"fields": fields}
+
+
+def get_profile_summary_tool(report: Any) -> dict[str, Any]:
+    payload = _report_payload(report)
+    profile = payload.get("profile")
+    if not isinstance(profile, Mapping):
+        return {"row_count": 0, "column_count": 0, "warnings": []}
+    return {
+        "row_count": profile.get("row_count", 0),
+        "column_count": profile.get("column_count", 0),
+        "warnings": list(profile.get("warnings", []))
+        if isinstance(profile.get("warnings", []), list)
+        else [],
+        "recognized_fields": {
+            str(key): list(value)
+            for key, value in profile.get("recognized_fields", {}).items()
+            if isinstance(value, list)
+        }
+        if isinstance(profile.get("recognized_fields"), Mapping)
+        else {},
+    }
+
+
+def build_rule_authoring_context(report: Any, metric_id: str) -> dict[str, Any]:
+    """返回给 Provider 的最小上下文白名单。"""
+
+    payload = _report_payload(report)
+    context = payload.get("evaluation_context")
+    context = context if isinstance(context, Mapping) else {}
+    metric = get_metric_definition_tool(metric_id)
+    fields = list_available_fields_tool(report)["fields"]
+    return {
+        "report_sha256": context.get("report_sha256"),
+        "input_sha256": context.get("input_sha256"),
+        "reference_date": context.get("reference_date"),
+        "metric_catalog_version": context.get("metric_catalog_version"),
+        "selected_metric_ids": list(context.get("selected_metric_ids", []))
+        if isinstance(context.get("selected_metric_ids", []), list)
+        else [],
+        "metric": metric,
+        "fields": fields,
+        "profile_summary": get_profile_summary_tool(report),
+    }
+
+
+__all__ = [
+    "build_rule_authoring_context",
+    "get_metric_definition_tool",
+    "get_profile_summary_tool",
+    "list_available_fields_tool",
+]
