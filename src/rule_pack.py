@@ -23,6 +23,9 @@ MAX_RULES = 100
 MAX_PRIMARY_KEY_FIELDS = 5
 MAX_ALLOWED_VALUES = 100
 MAX_RULE_NUMBER_ABS = 10**308
+MAX_REGEX_PATTERN_LENGTH = 200
+MAX_STRING_LENGTH = 10_000
+MAX_CONDITION_VALUES = 100
 
 RuleType = Literal[
     "primary_key",
@@ -30,6 +33,15 @@ RuleType = Literal[
     "update_freshness",
     "allowed_values",
     "numeric_range",
+    "regex_format",
+    "string_length",
+    "conditional_required",
+    "field_comparison",
+]
+RulePackSourceType = Literal[
+    "local_guided",
+    "user_natural_language",
+    "standard_retrieval",
 ]
 RulePackStatus = Literal["draft", "approved"]
 JsonScalar = str | int | float | bool
@@ -41,10 +53,20 @@ SUPPORTED_RULE_TYPES: frozenset[str] = frozenset(
         "update_freshness",
         "allowed_values",
         "numeric_range",
+        "regex_format",
+        "string_length",
+        "conditional_required",
+        "field_comparison",
     }
 )
 SUPPORTED_FREQUENCIES: frozenset[str] = frozenset(
     {"daily", "weekly", "monthly", "quarterly", "yearly", "custom"}
+)
+SUPPORTED_COMPARISON_OPERATORS: frozenset[str] = frozenset(
+    {"lt", "lte", "gt", "gte", "eq", "neq"}
+)
+SUPPORTED_COMPARISON_TYPES: frozenset[str] = frozenset(
+    {"auto", "numeric", "datetime", "text"}
 )
 
 _VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
@@ -76,6 +98,13 @@ class Rule:
     allowed_values: tuple[JsonScalar, ...] = ()
     minimum: int | float | None = None
     maximum: int | float | None = None
+    regex_pattern: str | None = None
+    min_length: int | None = None
+    max_length: int | None = None
+    condition_field: str | None = None
+    condition_values: tuple[JsonScalar, ...] = ()
+    comparison_operator: str | None = None
+    comparison_type: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +116,13 @@ class Rule:
             "allowed_values": list(self.allowed_values),
             "minimum": self.minimum,
             "maximum": self.maximum,
+            "regex_pattern": self.regex_pattern,
+            "min_length": self.min_length,
+            "max_length": self.max_length,
+            "condition_field": self.condition_field,
+            "condition_values": list(self.condition_values),
+            "comparison_operator": self.comparison_operator,
+            "comparison_type": self.comparison_type,
         }
 
 
@@ -99,6 +135,10 @@ class FieldSemanticMapping:
     update_time_field: str | None = None
     categorical_fields: tuple[str, ...] = ()
     numeric_fields: tuple[str, ...] = ()
+    formatted_fields: tuple[str, ...] = ()
+    length_checked_fields: tuple[str, ...] = ()
+    conditional_required_fields: tuple[str, ...] = ()
+    compared_fields: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -107,14 +147,18 @@ class FieldSemanticMapping:
             "update_time_field": self.update_time_field,
             "categorical_fields": list(self.categorical_fields),
             "numeric_fields": list(self.numeric_fields),
+            "formatted_fields": list(self.formatted_fields),
+            "length_checked_fields": list(self.length_checked_fields),
+            "conditional_required_fields": list(self.conditional_required_fields),
+            "compared_fields": list(self.compared_fields),
         }
 
 
 @dataclass(frozen=True)
 class RulePackSource:
-    """规则草案来源；v0.4 默认是无需模型的本地引导。"""
+    """规则草案来源；保留本地引导并支持 v0.7/v0.8 自然语言编制。"""
 
-    type: Literal["local_guided"]
+    type: RulePackSourceType
     generator: str
     generated_at: str
 
@@ -351,6 +395,33 @@ def _number_decimal(value: int | float) -> Decimal:
         raise ValueError("数值边界无法表示为有限十进制数。") from error
 
 
+def _regex_errors(pattern: Any) -> list[str]:
+    """校验受限正则，避免把 DSL 变成无界表达式执行入口。"""
+
+    errors: list[str] = []
+    if not isinstance(pattern, str) or not pattern:
+        return ["正则规则必须包含非空 pattern。"]
+    if len(pattern) > MAX_REGEX_PATTERN_LENGTH:
+        errors.append(
+            f"正则 pattern 不能超过 {MAX_REGEX_PATTERN_LENGTH} 个字符。"
+        )
+    try:
+        pattern.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        errors.append("正则 pattern 包含无法编码的字符。")
+    # v0.8 只开放常见字符类、分组和量词；拒绝会扩大执行语义或增加回溯
+    # 风险的 lookaround、条件分支、反向引用和命名组。
+    if re.search(r"\(\?|\\(?:[1-9][0-9]*|g<|k<)", pattern):
+        errors.append("正则 pattern 不支持 lookaround、条件分支、命名组或反向引用。")
+    if re.search(r"\([^)]*[+*][^)]*\)[+*]", pattern):
+        errors.append("正则 pattern 不支持可能造成大量回溯的嵌套量词。")
+    try:
+        re.compile(pattern)
+    except re.error as error:
+        errors.append(f"正则 pattern 无法编译：{error}。")
+    return errors
+
+
 def _scalar_key(value: Any) -> tuple[str, Any]:
     if isinstance(value, bool):
         return ("boolean", value)
@@ -367,6 +438,10 @@ def _mapping_from_rules(rules: Sequence[Rule]) -> FieldSemanticMapping:
     update_time_field: str | None = None
     categorical_fields: list[str] = []
     numeric_fields: list[str] = []
+    formatted_fields: list[str] = []
+    length_checked_fields: list[str] = []
+    conditional_required_fields: list[str] = []
+    compared_fields: list[str] = []
     for rule in rules:
         if rule.type == "primary_key":
             primary_key_fields = tuple(rule.fields)
@@ -378,12 +453,26 @@ def _mapping_from_rules(rules: Sequence[Rule]) -> FieldSemanticMapping:
             categorical_fields.append(rule.fields[0])
         elif rule.type == "numeric_range" and rule.fields:
             numeric_fields.append(rule.fields[0])
+        elif rule.type == "regex_format" and rule.fields:
+            formatted_fields.append(rule.fields[0])
+        elif rule.type == "string_length" and rule.fields:
+            length_checked_fields.append(rule.fields[0])
+        elif rule.type == "conditional_required" and len(rule.fields) == 2:
+            conditional_required_fields.append(rule.fields[1])
+        elif rule.type == "field_comparison" and rule.fields:
+            compared_fields.extend(rule.fields)
     return FieldSemanticMapping(
         primary_key_fields=primary_key_fields,
         required_fields=tuple(dict.fromkeys(required_fields)),
         update_time_field=update_time_field,
         categorical_fields=tuple(dict.fromkeys(categorical_fields)),
         numeric_fields=tuple(dict.fromkeys(numeric_fields)),
+        formatted_fields=tuple(dict.fromkeys(formatted_fields)),
+        length_checked_fields=tuple(dict.fromkeys(length_checked_fields)),
+        conditional_required_fields=tuple(
+            dict.fromkeys(conditional_required_fields)
+        ),
+        compared_fields=tuple(dict.fromkeys(compared_fields)),
     )
 
 
@@ -459,6 +548,13 @@ def _rule_errors(
         or bool(rule.allowed_values)
         or rule.minimum is not None
         or rule.maximum is not None
+        or rule.regex_pattern is not None
+        or rule.min_length is not None
+        or rule.max_length is not None
+        or rule.condition_field is not None
+        or bool(rule.condition_values)
+        or rule.comparison_operator is not None
+        or rule.comparison_type is not None
     )
     if rule.type == "primary_key":
         if not 1 <= len(rule.fields) <= MAX_PRIMARY_KEY_FIELDS:
@@ -545,6 +641,129 @@ def _rule_errors(
             field = rule.fields[0]
             if field in field_set and inferred_types.get(field) != "numeric":
                 errors.append(f"字段“{field}”未被画像识别为数值字段。")
+    elif rule.type == "regex_format":
+        if len(rule.fields) != 1:
+            errors.append("每条格式规则必须且只能包含一个字段。")
+        errors.extend(_regex_errors(rule.regex_pattern))
+        if any(
+            value is not None
+            for value in (
+                rule.frequency,
+                rule.max_age_days,
+                rule.minimum,
+                rule.maximum,
+                rule.min_length,
+                rule.max_length,
+                rule.condition_field,
+                rule.comparison_operator,
+                rule.comparison_type,
+            )
+        ) or rule.allowed_values or rule.condition_values:
+            errors.append("格式规则不能包含其他规则参数。")
+    elif rule.type == "string_length":
+        if len(rule.fields) != 1:
+            errors.append("每条字符长度规则必须且只能包含一个字段。")
+        if rule.min_length is None and rule.max_length is None:
+            errors.append("字符长度规则至少需要一个长度边界。")
+        for label, value in (
+            ("min_length", rule.min_length),
+            ("max_length", rule.max_length),
+        ):
+            if (
+                value is not None
+                and (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 0 <= value <= MAX_STRING_LENGTH
+                )
+            ):
+                errors.append(
+                    f"字符长度规则的 {label} 必须为 0 到 {MAX_STRING_LENGTH} 的整数。"
+                )
+        if (
+            isinstance(rule.min_length, int)
+            and not isinstance(rule.min_length, bool)
+            and isinstance(rule.max_length, int)
+            and not isinstance(rule.max_length, bool)
+            and rule.min_length > rule.max_length
+        ):
+            errors.append("字符长度规则的 min_length 不能大于 max_length。")
+        if any(
+            value is not None
+            for value in (
+                rule.frequency,
+                rule.max_age_days,
+                rule.minimum,
+                rule.maximum,
+                rule.regex_pattern,
+                rule.condition_field,
+                rule.comparison_operator,
+                rule.comparison_type,
+            )
+        ) or rule.allowed_values or rule.condition_values:
+            errors.append("字符长度规则不能包含其他规则参数。")
+    elif rule.type == "conditional_required":
+        if len(rule.fields) != 2:
+            errors.append("条件必填规则必须包含条件字段和被要求字段。")
+        if rule.condition_field != (rule.fields[0] if rule.fields else None):
+            errors.append("条件必填规则的 condition_field 必须等于第一个字段。")
+        if not 1 <= len(rule.condition_values) <= MAX_CONDITION_VALUES:
+            errors.append(
+                f"条件必填规则必须包含 1 到 {MAX_CONDITION_VALUES} 个条件值。"
+            )
+        seen_values: set[tuple[str, Any]] = set()
+        for value in rule.condition_values:
+            try:
+                key = _scalar_key(value)
+            except ValueError as error:
+                errors.append(str(error))
+                continue
+            if key in seen_values:
+                errors.append("条件值列表包含类型语义相同的重复值。")
+            seen_values.add(key)
+        if any(
+            value is not None
+            for value in (
+                rule.frequency,
+                rule.max_age_days,
+                rule.minimum,
+                rule.maximum,
+                rule.regex_pattern,
+                rule.min_length,
+                rule.max_length,
+                rule.comparison_operator,
+                rule.comparison_type,
+            )
+        ) or rule.allowed_values:
+            errors.append("条件必填规则不能包含其他规则参数。")
+    elif rule.type == "field_comparison":
+        if len(rule.fields) != 2:
+            errors.append("跨字段比较规则必须包含左侧和右侧两个字段。")
+        if rule.comparison_operator not in SUPPORTED_COMPARISON_OPERATORS:
+            errors.append("跨字段比较规则的 comparison_operator 不在白名单中。")
+        if rule.comparison_type not in SUPPORTED_COMPARISON_TYPES:
+            errors.append("跨字段比较规则的 comparison_type 不在白名单中。")
+        if any(
+            value is not None
+            for value in (
+                rule.frequency,
+                rule.max_age_days,
+                rule.minimum,
+                rule.maximum,
+                rule.regex_pattern,
+                rule.min_length,
+                rule.max_length,
+                rule.condition_field,
+            )
+        ) or rule.allowed_values or rule.condition_values:
+            errors.append("跨字段比较规则不能包含其他规则参数。")
+        if len(rule.fields) == 2 and rule.comparison_type in {"numeric", "datetime"}:
+            expected_type = rule.comparison_type
+            for field in rule.fields:
+                if field in field_set and inferred_types.get(field) != expected_type:
+                    errors.append(
+                        f"字段“{field}”未被画像识别为 {expected_type} 字段。"
+                    )
     return errors
 
 
@@ -623,11 +842,19 @@ def validate_rule_pack(
     if not isinstance(pack.source, RulePackSource):
         errors.append("RulePack source 结构无效。")
     else:
-        if (
-            pack.source.type != "local_guided"
-            or pack.source.generator != RULE_PACK_GENERATOR
-        ):
-            errors.append("RulePack source 不在当前本地引导白名单中。")
+        expected_generators = {
+            "local_guided": {RULE_PACK_GENERATOR},
+            # v0.7 草案必须继续可读取；v0.8 新建草案使用 v0.8 生成器。
+            "user_natural_language": {
+                "quality-rule-agent-v0.7",
+                "quality-rule-agent-v0.8",
+            },
+            "standard_retrieval": {"quality-rule-agent-v0.9"},
+        }
+        if pack.source.type not in expected_generators:
+            errors.append("RulePack source.type 不在当前白名单中。")
+        elif pack.source.generator not in expected_generators[pack.source.type]:
+            errors.append("RulePack source.generator 与来源类型不匹配。")
         if not _is_valid_iso_utc(pack.source.generated_at):
             errors.append("RulePack source.generated_at 必须是 UTC 时间。")
 
@@ -756,8 +983,10 @@ def build_rule_pack(
     version: str,
     rules: Sequence[Rule],
     generated_at: datetime | str | None = None,
+    source_type: RulePackSourceType = "local_guided",
+    generator: str | None = None,
 ) -> RulePack:
-    """基于当前零配置报告创建仍未生效的本地引导草案。"""
+    """基于当前零配置报告创建仍未生效的 RulePack 草案。"""
 
     payload = _report_payload(report)
     if payload is None:
@@ -765,9 +994,16 @@ def build_rule_pack(
     context = payload.get("evaluation_context")
     if not isinstance(context, Mapping):
         raise RulePackValidationError(("当前报告缺少 evaluation_context。",))
+    allowed_generators = {
+        "local_guided": RULE_PACK_GENERATOR,
+        "user_natural_language": "quality-rule-agent-v0.7",
+        "standard_retrieval": "quality-rule-agent-v0.9",
+    }
+    if source_type not in allowed_generators:
+        raise RulePackValidationError(("RulePack 来源类型不在当前白名单中。",))
     source = RulePackSource(
-        type="local_guided",
-        generator=RULE_PACK_GENERATOR,
+        type=source_type,
+        generator=generator or allowed_generators[source_type],
         generated_at=_format_utc(generated_at),
     )
     typed_rules = tuple(rules)

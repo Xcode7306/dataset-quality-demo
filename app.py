@@ -12,11 +12,18 @@ import pandas as pd
 import streamlit as st
 
 from src.agent_models import AgentAnalysis
+from src.agent_providers import (
+    DEFAULT_DEEPSEEK_MODEL,
+    DEEPSEEK_CHAT_COMPLETIONS_URL,
+    DeepSeekChatProvider,
+    OpenAICompatibleChatProvider,
+)
 from src.agent_service import run_agent
 from src.metric_catalog import (
     ALL_METRIC_IDS,
     DEFAULT_SELECTED_METRIC_IDS,
     build_metric_catalog_rows,
+    default_evaluation_basis,
     get_metric_definition,
     metric_description,
     normalize_selected_metric_ids,
@@ -35,6 +42,21 @@ from src.presentation import (
 )
 from src.resource_limits import MAX_INPUT_FILE_MIB
 from src.rule_engine import RulePackExecutionError
+from src.rule_authoring_service import (
+    build_rule_pack_from_draft,
+    compile_custom_rule_draft,
+    compile_rule_draft,
+    validate_rule_draft,
+)
+from src.rule_authoring_providers import (
+    DeepSeekRuleAuthoringProvider,
+    OpenAICompatibleRuleAuthoringProvider,
+    RuleAuthoringProviderError,
+    RuleAuthoringProviderUnavailable,
+    build_rule_input_guidance,
+)
+from src.rule_dsl import RuleDraftValidationError
+from src.rule_authoring_tools import build_rule_authoring_context
 from src.rule_pack import (
     Rule,
     MAX_RULE_NUMBER_ABS,
@@ -46,6 +68,7 @@ from src.rule_pack import (
     validate_rule_pack,
 )
 from src.rule_service import (
+    dry_run_uploaded_dataset_with_rule_pack,
     evaluate_uploaded_dataset_with_rule_pack,
     serialize_rule_evaluation_result,
     serialize_rule_issue_locations_csv,
@@ -55,8 +78,14 @@ from src.upload_service import evaluate_uploaded_dataset, sanitize_file_name
 
 AGENT_STATE_KEY = "agent_ui_state"
 RULE_STATE_KEY = "rule_ui_state"
+RULE_AUTHORING_STATE_KEY = "rule_authoring_ui_state"
+CUSTOM_RULE_STATE_KEY = "custom_rule_ui_state"
 METRIC_SELECTION_KEY = "selected_metric_ids"
 METRIC_SELECTION_WIDGET_PREFIX = "metric_selection_checkbox_"
+METRIC_EVIDENCE_WIDGET_PREFIX = "metric_evidence_"
+MODEL_API_URL_KEY = "model_api_url"
+MODEL_API_KEY_KEY = "model_api_key"
+MODEL_NAME_KEY = "model_name"
 AGENT_HISTORY_LIMIT = 8
 AGENT_PRIORITY_LABELS = {
     "high": "高",
@@ -78,6 +107,9 @@ RULE_WIDGET_KEYS = (
     "rule_numeric_maximum",
     "rule_approver",
     "rule_approval_confirmed",
+    "custom_rule_intent",
+    "custom_rule_approver",
+    "custom_rule_approval_confirmed",
 )
 RULE_FREQUENCIES = {
     "每日（1 天）": ("daily", 1),
@@ -112,6 +144,8 @@ def _clear_rule_state() -> None:
     """清除当前报告的规则草案、审批、增强结果及表单缓存。"""
 
     st.session_state.pop(RULE_STATE_KEY, None)
+    st.session_state.pop(RULE_AUTHORING_STATE_KEY, None)
+    st.session_state.pop(CUSTOM_RULE_STATE_KEY, None)
     for key in RULE_WIDGET_KEYS:
         st.session_state.pop(key, None)
 
@@ -120,6 +154,152 @@ def _metric_checkbox_key(metric_id: str) -> str:
     """为每一张指标卡生成稳定且独立的复选框状态键。"""
 
     return f"{METRIC_SELECTION_WIDGET_PREFIX}{metric_id}"
+
+
+def _metric_evidence_key(metric_id: str) -> str:
+    """为指标卡下的评价依据输入生成稳定控件键。"""
+
+    return f"{METRIC_EVIDENCE_WIDGET_PREFIX}{metric_id}"
+
+
+def _initialize_model_api_state() -> None:
+    """初始化页面模型配置；API Key 不从环境变量回填到输入框。"""
+
+    if MODEL_API_URL_KEY not in st.session_state:
+        st.session_state[MODEL_API_URL_KEY] = os.environ.get(
+            "DEEPSEEK_API_URL",
+            DEEPSEEK_CHAT_COMPLETIONS_URL,
+        )
+    if MODEL_API_KEY_KEY not in st.session_state:
+        st.session_state[MODEL_API_KEY_KEY] = ""
+    if MODEL_NAME_KEY not in st.session_state:
+        st.session_state[MODEL_NAME_KEY] = os.environ.get(
+            "DEEPSEEK_MODEL",
+            DEFAULT_DEEPSEEK_MODEL,
+        )
+
+
+def _model_api_configuration() -> tuple[dict[str, str] | None, str | None]:
+    """读取页面配置，并兼容旧版 DeepSeek 环境变量配置。"""
+
+    api_url = str(st.session_state.get(MODEL_API_URL_KEY, "")).strip()
+    api_key = str(st.session_state.get(MODEL_API_KEY_KEY, "")).strip()
+    model = str(st.session_state.get(MODEL_NAME_KEY, "")).strip()
+    if api_key:
+        if not api_url or not model:
+            return None, "请同时填写 API 地址、API Key 和模型名称。"
+        if not api_url.startswith(("http://", "https://")):
+            return None, "API 地址必须以 http:// 或 https:// 开头。"
+        return {
+            "api_url": api_url,
+            "api_key": api_key,
+            "model": model,
+            "source": "page",
+        }, None
+
+    if os.environ.get("QUALITY_AGENT_PROVIDER", "").strip().casefold() == "deepseek":
+        environment_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        if not environment_key:
+            return {
+                "api_url": api_url or DEEPSEEK_CHAT_COMPLETIONS_URL,
+                "api_key": "",
+                "model": model or DEFAULT_DEEPSEEK_MODEL,
+                "source": "environment",
+            }, "当前选择了 DeepSeek 外部模式，但尚未配置 API Key。"
+        return {
+            "api_url": os.environ.get(
+                "DEEPSEEK_API_URL",
+                DEEPSEEK_CHAT_COMPLETIONS_URL,
+            ),
+            "api_key": environment_key,
+            "model": os.environ.get("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL,
+            "source": "environment",
+        }, None
+    return None, None
+
+
+def _render_model_api_settings() -> None:
+    """在初始页面提供可选的自定义模型 API 配置。"""
+
+    with st.expander("大模型 API 配置", expanded=False):
+        st.text_input(
+            "API 地址",
+            key=MODEL_API_URL_KEY,
+            help=(
+                "可填写完整的 /chat/completions 地址，也可填写服务根地址；"
+                "系统会自动补全 /chat/completions。"
+            ),
+        )
+        st.text_input(
+            "API Key",
+            type="password",
+            key=MODEL_API_KEY_KEY,
+            help="仅保存在当前 Streamlit 会话内存中，不写入报告和审计信息。",
+        )
+        st.text_input(
+            "模型名称",
+            key=MODEL_NAME_KEY,
+            help="填写该 API 对应的模型标识，例如 deepseek-v4-flash。",
+        )
+        configuration, issue = _model_api_configuration()
+        if issue and configuration and configuration.get("source") == "environment":
+            st.info(
+                "仍可使用页面输入覆盖环境变量配置；当前未检测到可用的环境变量 API Key。"
+            )
+        elif issue:
+            st.warning(issue)
+        elif configuration and configuration.get("source") == "page":
+            st.success("已配置自定义大模型 API；点击 Agent 操作时将调用该模型。")
+        elif configuration:
+            st.info("已使用部署环境中的 DeepSeek 配置。")
+        else:
+            st.caption(
+                "未填写 API Key 时仅使用本地模板作暂行演示；正式运行请先配置模型。"
+            )
+
+
+def _build_agent_provider():
+    configuration, issue = _model_api_configuration()
+    if issue and (
+        str(st.session_state.get(MODEL_API_KEY_KEY, "")).strip()
+        or configuration is not None
+    ):
+        raise ValueError(issue)
+    if not configuration or not configuration.get("api_key"):
+        return None
+    if configuration["source"] == "page":
+        return OpenAICompatibleChatProvider(
+            api_key=configuration["api_key"],
+            api_url=configuration["api_url"],
+            model=configuration["model"],
+        )
+    return DeepSeekChatProvider(
+        api_key=configuration["api_key"],
+        api_url=configuration["api_url"],
+        model=configuration["model"],
+    )
+
+
+def _build_rule_authoring_provider():
+    configuration, issue = _model_api_configuration()
+    if issue and (
+        str(st.session_state.get(MODEL_API_KEY_KEY, "")).strip()
+        or configuration is not None
+    ):
+        raise ValueError(issue)
+    if not configuration or not configuration.get("api_key"):
+        return None
+    if configuration["source"] == "page":
+        return OpenAICompatibleRuleAuthoringProvider(
+            api_key=configuration["api_key"],
+            api_url=configuration["api_url"],
+            model=configuration["model"],
+        )
+    return DeepSeekRuleAuthoringProvider(
+        api_key=configuration["api_key"],
+        api_url=configuration["api_url"],
+        model=configuration["model"],
+    )
 
 
 def _set_metric_selection(metric_ids: tuple[str, ...]) -> None:
@@ -172,6 +352,15 @@ def _initialize_metric_selection_state() -> None:
             st.session_state[key] = metric_id in requested
 
 
+def _initialize_metric_evidence_state() -> None:
+    """初始化评价依据输入；已有规则显示默认值，其余指标保持空白。"""
+
+    for metric_id in ALL_METRIC_IDS:
+        key = _metric_evidence_key(metric_id)
+        if key not in st.session_state:
+            st.session_state[key] = default_evaluation_basis(metric_id)
+
+
 def _selected_metric_ids_from_cards() -> tuple[str, ...]:
     """从指标卡读取选择，并按照固定目录顺序固化到会话状态。"""
 
@@ -193,7 +382,7 @@ def _render_metric_card(metric_id: str) -> None:
     capability = (
         "当前可直接计算"
         if definition["auto_assessable"]
-        else "需补充评价依据"
+        else "需补充评价标准"
     )
 
     with st.container(border=True):
@@ -215,6 +404,13 @@ def _render_metric_card(metric_id: str) -> None:
             )
         st.caption(f"{definition['dimension']} · {capability}")
         st.caption(f"计算方式：{definition['formula']}")
+        st.text_area(
+            "评价依据",
+            key=_metric_evidence_key(metric_id),
+            height=82,
+            max_chars=4000,
+            help="输入业务评价依据，评估报告生成后可由 Agent 解析为规则草案。",
+        )
 
 
 def _render_metric_cards(metric_ids: tuple[str, ...]) -> None:
@@ -234,8 +430,8 @@ def _render_metric_selection_panel() -> tuple[str, ...]:
     st.subheader("选择评价指标")
     st.caption(
         "默认已选中一组基础指标。点击卡片即可自由组合；将鼠标悬停在每张卡片"
-        "右上角的“？”上可查看指标含义。缺少必要评价依据的指标会在报告中如实"
-        "标记为无法评估。"
+        "右上角的“？”上可查看指标含义。已有规则会预填评价依据；勾选但未补全"
+        "评价依据的指标不能启动评估。"
     )
     preset_columns = st.columns(3)
     preset_columns[0].button(
@@ -323,6 +519,20 @@ def _render_metric_selection_panel() -> tuple[str, ...]:
     st.caption(f"已选 {len(selected_metric_ids)} 项。")
     if not selected_metric_ids:
         st.warning("请至少选择一个评价指标后再运行。")
+    else:
+        missing_metric_evidence_ids = _missing_metric_evidence_ids(
+            selected_metric_ids
+        )
+        if missing_metric_evidence_ids:
+            missing_names = "、".join(
+                str(get_metric_definition(metric_id)["name"])
+                for metric_id in missing_metric_evidence_ids
+                if get_metric_definition(metric_id) is not None
+            )
+            st.warning(
+                "已勾选指标缺少评价依据，请补全评价规则后再运行："
+                f"{missing_names}"
+            )
 
     with st.expander("查看指标目录与计算方式"):
         catalog = pd.DataFrame(build_metric_catalog_rows()).drop(
@@ -348,6 +558,51 @@ def _escape_markdown(value: object) -> str:
     for character in ("\\", "`", "*", "_", "[", "]", "(", ")", "<", ">", "#", "!", "|"):
         text = text.replace(character, f"\\{character}")
     return text
+
+
+def _model_error_detail(error: Exception) -> str:
+    """返回可展示的模型错误，并隐藏当前会话中的 API Key。"""
+
+    detail = str(error).strip() or "模型没有返回可识别的结果。"
+    secrets = {
+        str(st.session_state.get(MODEL_API_KEY_KEY, "")).strip(),
+        str(os.environ.get("DEEPSEEK_API_KEY", "")).strip(),
+    }
+    for secret in secrets:
+        if secret:
+            detail = detail.replace(secret, "[已隐藏]")
+    return detail[:800]
+
+
+def _rule_missing_guidance(
+    report: QualityReport,
+    metric_id: str,
+    user_intent: str,
+) -> tuple[str, ...]:
+    """生成针对当前指标的缺失规则提示，供模型失败时直接补充。"""
+
+    try:
+        context = build_rule_authoring_context(report, metric_id)
+        return build_rule_input_guidance(
+            context,
+            user_intent=user_intent,
+        )
+    except Exception:
+        return (
+            "请补充字段名称、规则条件，以及允许值、更新时间或数值范围等可执行参数。",
+        )
+
+
+def _render_rule_missing_guidance(
+    report: QualityReport,
+    metric_id: str,
+    user_intent: str,
+) -> None:
+    """在规则编译失败后告诉用户还需要补充什么。"""
+
+    st.warning("当前补充评价依据还不能转换为可执行规则，请补充以下信息：")
+    for item in _rule_missing_guidance(report, metric_id, user_intent):
+        st.text(f"• {item}")
 
 
 def _report_sha256(report: QualityReport) -> str:
@@ -392,16 +647,37 @@ def _render_metric_selection_summary(report: QualityReport) -> None:
     """展示绑定当前报告的统一指标选择与可评估能力统计。"""
 
     selected = _selected_metric_ids_for_report(report)
-    auto_assessable_count = sum(
-        bool(definition and definition.get("auto_assessable"))
+    standard_metric_ids = tuple(
+        metric_id
         for metric_id in selected
-        for definition in (get_metric_definition(metric_id),)
+        if (
+            (definition := get_metric_definition(metric_id)) is not None
+            and not bool(definition.get("auto_assessable"))
+        )
     )
+    auto_assessable_count = len(selected) - len(standard_metric_ids)
     st.caption(
         "本次指标选择："
         f"共 {len(selected)} 项 · 当前可直接计算 {auto_assessable_count} 项 · "
-        f"需补充评价依据 {len(selected) - auto_assessable_count} 项"
+        f"需补充评价标准 {len(standard_metric_ids)} 项"
     )
+    if standard_metric_ids:
+        st.warning(
+            "以下指标需要补充评价标准；请进入“补充评价标准”页面填写所需依据，"
+            "再由规则 Agent 解析、试运行并重新评估："
+        )
+        for metric_id in standard_metric_ids:
+            definition = get_metric_definition(metric_id)
+            if definition is None:
+                continue
+            required_inputs = tuple(
+                str(item) for item in definition.get("required_inputs", ())
+            )
+            requirement = "、".join(required_inputs) or "具体评价口径"
+            st.markdown(
+                f"- **{_escape_markdown(definition['name'])}**：需要提供"
+                f"{_escape_markdown(requirement)}。"
+            )
 
 
 def _agent_state_for(report: QualityReport) -> dict:
@@ -437,6 +713,72 @@ def _rule_state_for(report: QualityReport) -> dict:
         }
         st.session_state[RULE_STATE_KEY] = state
     return state
+
+
+def _rule_authoring_state_for(report: QualityReport) -> dict:
+    """返回绑定当前报告的 v0.7 指标规则编制状态。"""
+
+    report_sha256 = _report_sha256(report)
+    state = st.session_state.get(RULE_AUTHORING_STATE_KEY)
+    if not isinstance(state, dict) or state.get("report_sha256") != report_sha256:
+        state = {
+            "report_sha256": report_sha256,
+            "drafts": {},
+            "draft_signatures": {},
+            "validations": {},
+            "dry_runs": {},
+            "approved_packs": {},
+            "results": {},
+            "execution_errors": {},
+            "confirmed_pack_sha256": {},
+        }
+        st.session_state[RULE_AUTHORING_STATE_KEY] = state
+    return state
+
+
+def _metric_evidence_text(metric_id: str) -> str:
+    value = st.session_state.get(_metric_evidence_key(metric_id), "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _missing_metric_evidence_ids(
+    metric_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    """返回已选择但尚未填写评价依据的指标。"""
+
+    return tuple(
+        metric_id for metric_id in metric_ids if not _metric_evidence_text(metric_id)
+    )
+
+
+def _reset_metric_authoring_state(
+    state: dict,
+    metric_id: str,
+    *,
+    draft_signature: str | None = None,
+) -> dict:
+    """当用户修改评价依据时清除该指标的后续节点。"""
+
+    updated = dict(state)
+    for collection_name in (
+        "drafts",
+        "validations",
+        "dry_runs",
+        "approved_packs",
+        "results",
+        "execution_errors",
+        "confirmed_pack_sha256",
+    ):
+        collection = dict(updated.get(collection_name, {}))
+        collection.pop(metric_id, None)
+        updated[collection_name] = collection
+    signatures = dict(updated.get("draft_signatures", {}))
+    if draft_signature is None:
+        signatures.pop(metric_id, None)
+    else:
+        signatures[metric_id] = draft_signature
+    updated["draft_signatures"] = signatures
+    return updated
 
 
 def _clear_rule_approval_widgets() -> None:
@@ -490,12 +832,7 @@ def _render_agent_analysis(analysis: AgentAnalysis) -> None:
     if analysis.audit.mode == "model" and not analysis.audit.fallback_used:
         st.success(f"模型增强模式 · {analysis.audit.model}")
     elif analysis.audit.fallback_used:
-        if analysis.audit.fallback_reason == "provider_unavailable":
-            st.info("DeepSeek 未配置或暂不可用，已使用本地模板生成可追溯解读。")
-        elif analysis.audit.fallback_reason == "provider_error":
-            st.info("外部模型调用失败，已使用本地模板生成可追溯解读。")
-        else:
-            st.info("模型结果未通过安全校验，已使用本地模板生成可追溯解读。")
+        st.info("当前使用本地模板暂行演示模式；此结果不是外部模型生成的报告。")
     else:
         st.info("当前使用本地模板模式；无需 API，也不会向外部发送报告。")
 
@@ -563,11 +900,15 @@ def _run_agent_request(
         "history": list(state.get("history", [])),
     }
     with st.spinner("Agent 正在核对报告证据……"):
-        analysis = run_agent(
-            report,
-            intent=intent,
-            question=question,
-        )
+        provider = _build_agent_provider()
+        agent_kwargs = {
+            "intent": intent,
+            "question": question,
+        }
+        if provider is not None:
+            agent_kwargs["provider"] = provider
+            agent_kwargs["allow_template_fallback"] = False
+        analysis = run_agent(report, **agent_kwargs)
     history = list(state.get("history", []))
     if question is not None:
         history = [
@@ -593,13 +934,14 @@ def _render_agent(report: QualityReport) -> None:
         "Agent 只读取当前 QualityReport，不重新计算指标、不改变风险等级，"
         "也不会修改或清洗原始数据。"
     )
-    if (
-        os.environ.get("QUALITY_AGENT_PROVIDER", "")
-        .strip()
-        .casefold()
-        == "deepseek"
-    ):
-        if os.environ.get("DEEPSEEK_API_KEY", "").strip():
+    configuration, configuration_issue = _model_api_configuration()
+    if configuration and configuration.get("source") == "page":
+        st.warning(
+            "当前已配置自定义大模型 API。点击快捷入口或提交问题时，"
+            "会发送经过白名单过滤的报告投影；不发送原始单元格值。"
+        )
+    elif configuration and configuration.get("source") == "environment":
+        if configuration.get("api_key"):
             st.warning(
                 "当前部署已配置 DeepSeek 外部模式。点击快捷入口或提交问题时，"
                 "会发送经过白名单过滤的报告投影；不发送原始单元格值。"
@@ -607,10 +949,14 @@ def _render_agent(report: QualityReport) -> None:
         else:
             st.warning(
                 "当前部署已选择 DeepSeek 外部模式，但尚未配置 "
-                "DEEPSEEK_API_KEY；请求会回退到本地模板，不会向外发送报告。"
+                "DEEPSEEK_API_KEY；调用前必须补充 API Key，不会回退到本地模板。"
             )
+    elif configuration_issue:
+        st.warning(configuration_issue)
     else:
-        st.caption("当前部署使用本地模板；点击后也不会向外部发送报告。")
+        st.caption(
+            "当前未配置 API Key，仅使用本地模板作为暂行演示；正式使用 Agent 前请完成模型配置。"
+        )
     action_columns = st.columns(3)
     summarize = action_columns[0].button(
         "概括结果",
@@ -633,6 +979,7 @@ def _render_agent(report: QualityReport) -> None:
         max_chars=500,
     )
 
+    request_failed = False
     try:
         if summarize:
             _run_agent_request(
@@ -659,8 +1006,12 @@ def _render_agent(report: QualityReport) -> None:
                 prompt_label=question,
                 question=question,
             )
-    except Exception:
-        st.error("Agent 解读暂时不可用；确定性评估报告不受影响，请稍后重试。")
+    except Exception as error:
+        request_failed = True
+        st.error(
+            "外部模型解读失败，未生成模板替代结果："
+            f"{_escape_markdown(_model_error_detail(error))}"
+        )
 
     state = _agent_state_for(report)
     history = state.get("history", [])
@@ -679,7 +1030,8 @@ def _render_agent(report: QualityReport) -> None:
 
     latest_analysis = state.get("latest_analysis")
     if latest_analysis is None:
-        st.info("选择一个快捷入口或提交问题后，才会开始 Agent 解读。")
+        if not request_failed:
+            st.info("选择一个快捷入口或提交问题后，才会开始 Agent 解读。")
         return
     _render_agent_analysis(latest_analysis)
 
@@ -942,6 +1294,628 @@ def _render_rule_result(result) -> None:
             }
         )
         st.caption("审批人是本地自声明标识，系统未验证其身份。")
+
+
+def _render_rule_dry_run(preview: dict) -> None:
+    """展示 v0.7 试运行摘要，不展示原始单元格值。"""
+
+    counts = preview.get("counts", {}) if isinstance(preview, dict) else {}
+    st.success("规则试运行完成；尚未审批，也未改变当前基础报告。")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "规则包": preview.get("rule_pack_id", "—"),
+                    "版本": preview.get("rule_pack_version", "—"),
+                    "检查数量": counts.get("checked", 0),
+                    "符合数量": counts.get("compliant", 0),
+                    "疑似问题": counts.get("issues", 0),
+                    "无法评估": counts.get("not_assessable", 0),
+                }
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+    metric_rows = preview.get("metrics", []) if isinstance(preview, dict) else []
+    if metric_rows:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "规则结果": item.get("name", "—"),
+                        "字段": item.get("field") or "—",
+                        "状态": item.get("status", "—"),
+                        "结果": item.get("value")
+                        if item.get("value") is not None
+                        else "—",
+                        "检查数量": item.get("checked_count", "—"),
+                        "疑似问题": item.get("issue_count", "—"),
+                        "原因": item.get("reason") or "—",
+                    }
+                    for item in metric_rows
+                    if isinstance(item, dict)
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def _render_custom_rule_authoring(
+    report: QualityReport,
+    *,
+    uploaded_file,
+    dataset_name: str,
+    sheet_name: str,
+    reference_date: date,
+    selected_metric_ids: tuple[str, ...],
+) -> None:
+    """渲染 v0.8 自然语言自定义规则闭环。"""
+
+    st.subheader("自定义规则（v0.8）")
+    st.caption(
+        "用自然语言新增一条业务规则。当前支持格式/正则、字符长度、"
+        "条件必填和跨字段比较；规则仍须经过确定性校验、试运行和人工批准。"
+    )
+    if uploaded_file is None:
+        st.info("当前上传内容已不可用，请重新选择文件。")
+        return
+
+    state = st.session_state.get(CUSTOM_RULE_STATE_KEY, {})
+    basis = str(st.session_state.get("custom_rule_intent", "")).strip()
+    signature = _rule_form_signature(
+        {
+            "report_sha256": report.evaluation_context.get("report_sha256"),
+            "input_sha256": report.evaluation_context.get("input_sha256"),
+            "intent": basis,
+        }
+    )
+    if state.get("signature") and state.get("signature") != signature:
+        state = {}
+        st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    st.sidebar.text_input(
+        "自定义规则描述",
+        key="custom_rule_intent",
+        max_chars=4000,
+        help="例如：状态为注销时，注销日期必须填写；开始日期不得晚于结束日期。",
+    )
+    basis = str(st.session_state.get("custom_rule_intent", "")).strip()
+    signature = _rule_form_signature(
+        {
+            "report_sha256": report.evaluation_context.get("report_sha256"),
+            "input_sha256": report.evaluation_context.get("input_sha256"),
+            "intent": basis,
+        }
+    )
+    if state.get("signature") and state.get("signature") != signature:
+        state = {}
+        st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    if st.button(
+        "AI 解析自定义规则",
+        key="compile_custom_rule_v08",
+        width="stretch",
+        disabled=not bool(basis),
+    ):
+        try:
+            provider = _build_rule_authoring_provider()
+            compile_kwargs = {
+                "user_intent": basis,
+                "allow_template_fallback": provider is None,
+            }
+            if provider is not None:
+                compile_kwargs["provider"] = provider
+            draft = compile_custom_rule_draft(report, **compile_kwargs)
+        except (RuleAuthoringProviderUnavailable, RuleAuthoringProviderError, RuleDraftValidationError, ValueError) as error:
+            state = {
+                "signature": signature,
+                "error": _model_error_detail(error),
+            }
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+            st.error(f"自定义规则解析失败：{_escape_markdown(str(error))}")
+        else:
+            state = {
+                "signature": signature,
+                "draft": draft,
+                "dry_run": None,
+                "approved_pack": None,
+                "result": None,
+                "error": None,
+            }
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    state = st.session_state.get(CUSTOM_RULE_STATE_KEY, state)
+    if state.get("error"):
+        st.error(f"自定义规则未完成：{_escape_markdown(state['error'])}")
+    draft = state.get("draft")
+    if draft is None:
+        st.caption("填写规则描述后，点击“AI 解析自定义规则”。")
+        return
+
+    if draft.provider.fallback_used:
+        st.info("当前未配置外部模型，使用本地模板生成候选草案；正式使用前请配置 API。")
+    elif draft.provider.mode == "model":
+        st.success(f"模型已生成候选自定义规则：{draft.provider.model or draft.provider.provider}")
+    st.caption(f"草案状态：{draft.status}")
+
+    if draft.status == "needs_clarification":
+        st.warning("当前自定义规则缺少可执行信息，请补充后重新解析。")
+        for question in draft.clarification_questions:
+            st.text(f"需要补充：{question}")
+        return
+    if draft.status == "rejected":
+        st.error(_escape_markdown(draft.unsupported_reason or "当前需求暂不支持。"))
+        return
+    if draft.rule_spec is None:
+        st.error("Provider 未生成可展示的自定义规则草案。")
+        return
+
+    with st.expander("查看自定义规则草案", expanded=True):
+        st.json(draft.rule_spec.to_dict())
+    validation = validate_rule_draft(draft, report)
+    if not validation.valid:
+        st.error("自定义规则未通过确定性校验，不能试运行。")
+        for error in validation.errors:
+            st.text(error)
+        return
+    st.success("自定义规则已通过字段、参数和当前报告画像校验。")
+    try:
+        pack = build_rule_pack_from_draft(draft, report)
+    except RuleDraftValidationError as error:
+        st.error(f"RulePack 转换失败：{_escape_markdown(str(error))}")
+        return
+
+    if st.button("试运行自定义规则", key="dry_run_custom_rule_v08", width="stretch"):
+        try:
+            preview = dry_run_uploaded_dataset_with_rule_pack(
+                uploaded_file.getvalue(),
+                uploaded_file.name,
+                pack,
+                dataset_name=dataset_name.strip() or None,
+                sheet_name=sheet_name.strip() or None,
+                reference_date=reference_date,
+                selected_metric_ids=selected_metric_ids,
+            )
+        except Exception as error:
+            st.error(f"自定义规则试运行未完成：{_escape_markdown(str(error))}")
+        else:
+            state["dry_run"] = preview.to_dict()
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    preview = state.get("dry_run")
+    if preview is None:
+        st.info("规则草案已校验；点击“试运行自定义规则”查看影响摘要。")
+        return
+    _render_rule_dry_run(preview)
+
+    approver = st.text_input(
+        "审批人标识（自定义规则，本地自声明）",
+        max_chars=100,
+        key="custom_rule_approver",
+    )
+    confirmed = st.checkbox(
+        "我已核对当前自定义规则和试运行摘要，并批准本次确定性重评。",
+        key="custom_rule_approval_confirmed",
+    )
+    approve_clicked = st.button(
+        "批准并重新评估（自定义规则）",
+        key="approve_custom_rule_v08",
+        type="primary",
+        width="stretch",
+        disabled=not approver.strip() or not confirmed,
+    )
+    if approve_clicked:
+        try:
+            approved_pack = approve_rule_pack(
+                pack,
+                report,
+                approver=approver,
+            )
+            result = evaluate_uploaded_dataset_with_rule_pack(
+                uploaded_file.getvalue(),
+                uploaded_file.name,
+                approved_pack,
+                dataset_name=dataset_name.strip() or None,
+                sheet_name=sheet_name.strip() or None,
+                reference_date=reference_date,
+                selected_metric_ids=selected_metric_ids,
+            )
+        except (RulePackValidationError, RulePackExecutionError, ValueError) as error:
+            st.error(f"自定义规则未执行：{_escape_markdown(str(error))}")
+        else:
+            state["approved_pack"] = approved_pack
+            state["result"] = result
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    if state.get("result") is not None:
+        _render_rule_result(state["result"])
+
+
+def _render_rule_authoring(
+    report: QualityReport,
+    *,
+    uploaded_file,
+    dataset_name: str,
+    sheet_name: str,
+    reference_date: date,
+    selected_metric_ids: tuple[str, ...],
+) -> None:
+    """渲染 v0.7“评价依据 → RuleDraft → 试运行 → 审批重评”闭环。"""
+
+    st.subheader("补充评价标准")
+    st.caption(
+        "针对需要外部标准的指标补充评价依据，再由 Agent 生成受限规则草案。"
+        "流程为：补充标准 → AI 解析 → 确定性试运行 → 批准并重新评估。"
+        "模型只负责理解和编译；校验、试运行、审批和正式重评仍由本地确定性代码完成。"
+    )
+    if report.status != "success":
+        st.info("零配置评估成功后才能编制指标规则。")
+        return
+    if uploaded_file is None:
+        st.info("当前上传内容已不可用，请重新选择文件。")
+        return
+    if not selected_metric_ids:
+        st.info("请先选择至少一个指标。")
+        return
+
+    _render_custom_rule_authoring(
+        report,
+        uploaded_file=uploaded_file,
+        dataset_name=dataset_name,
+        sheet_name=sheet_name,
+        reference_date=reference_date,
+        selected_metric_ids=selected_metric_ids,
+    )
+    st.divider()
+
+    state = _rule_authoring_state_for(report)
+    standard_metric_ids = tuple(
+        metric_id
+        for metric_id in selected_metric_ids
+        if (
+            (definition := get_metric_definition(metric_id)) is not None
+            and not bool(definition.get("auto_assessable"))
+        )
+    )
+    if standard_metric_ids:
+        st.warning(
+            "需要补充评价标准的指标已优先列出。请根据每项指标下方的“需要提供”"
+            "说明填写具体字段、取值范围、格式或参照规则。"
+        )
+    else:
+        st.success("当前选中指标均已有本地确定性评价依据，可直接评估。")
+    ordered_metric_ids = (
+        *standard_metric_ids,
+        *(metric_id for metric_id in selected_metric_ids if metric_id not in standard_metric_ids),
+    )
+    for metric_id in ordered_metric_ids:
+        definition = get_metric_definition(metric_id)
+        if definition is None:
+            continue
+        with st.container(border=True):
+            st.markdown(f"#### {_escape_markdown(definition['name'])}")
+            st.caption(
+                f"{_escape_markdown(definition['dimension'])} · "
+                f"{_escape_markdown(definition['description'])}"
+            )
+            if not bool(definition.get("auto_assessable")):
+                required_inputs = tuple(
+                    str(item) for item in definition.get("required_inputs", ())
+                )
+                requirement = "、".join(required_inputs) or "具体评价口径"
+                st.warning(
+                    "该指标需要补充标准；需要提供："
+                    f"{_escape_markdown(requirement)}。"
+                )
+            st.text_area(
+                "评价依据",
+                key=_metric_evidence_key(metric_id),
+                height=100,
+                max_chars=4000,
+                help="评价依据只用于生成当前指标的规则草案。",
+            )
+            basis = _metric_evidence_text(metric_id)
+            basis_signature = _rule_form_signature(
+                {"metric_id": metric_id, "evidence": basis}
+            )
+            draft = state.get("drafts", {}).get(metric_id)
+            if draft is not None and state.get("draft_signatures", {}).get(metric_id) != basis_signature:
+                state = _reset_metric_authoring_state(
+                    state,
+                    metric_id,
+                )
+                st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                draft = None
+                st.info("评价依据已变化，旧规则草案、试运行和审批状态已清除。")
+
+            compile_clicked = st.button(
+                "AI 解析依据",
+                key=f"compile_metric_rule_{metric_id}",
+                width="stretch",
+                disabled=not bool(basis),
+            )
+            if compile_clicked:
+                provider = None
+                try:
+                    provider = _build_rule_authoring_provider()
+                    compile_kwargs = {
+                        "target_metric_id": metric_id,
+                        "user_intent": basis,
+                        # 仅无 API 的暂行演示模式允许本地模板；一旦配置
+                        # 外部模型，失败必须返回页面，不能伪装成模型草案。
+                        "allow_template_fallback": provider is None,
+                    }
+                    if provider is not None:
+                        compile_kwargs["provider"] = provider
+                    draft = compile_rule_draft(report, **compile_kwargs)
+                except (RuleAuthoringProviderUnavailable, RuleAuthoringProviderError) as error:
+                    state = _reset_metric_authoring_state(state, metric_id)
+                    execution_errors = dict(state.get("execution_errors", {}))
+                    execution_errors[metric_id] = str(error)
+                    state["execution_errors"] = execution_errors
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                    st.error(
+                        "AI 解析评价依据失败，未生成本地模板替代规则："
+                        f"{_escape_markdown(_model_error_detail(error))}"
+                    )
+                    _render_rule_missing_guidance(report, metric_id, basis)
+                except RuleDraftValidationError as error:
+                    state = _reset_metric_authoring_state(state, metric_id)
+                    execution_errors = dict(state.get("execution_errors", {}))
+                    execution_errors[metric_id] = str(error)
+                    state["execution_errors"] = execution_errors
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                    st.error(_escape_markdown(f"规则编制未完成：{error}"))
+                    _render_rule_missing_guidance(report, metric_id, basis)
+                    draft = None
+                except ValueError as error:
+                    state = _reset_metric_authoring_state(state, metric_id)
+                    execution_errors = dict(state.get("execution_errors", {}))
+                    execution_errors[metric_id] = str(error)
+                    state["execution_errors"] = execution_errors
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                    st.error(
+                        "模型配置或规则解析失败："
+                        f"{_escape_markdown(_model_error_detail(error))}"
+                    )
+                    draft = None
+                else:
+                    drafts = dict(state.get("drafts", {}))
+                    drafts[metric_id] = draft
+                    signatures = dict(state.get("draft_signatures", {}))
+                    signatures[metric_id] = basis_signature
+                    state = {
+                        **state,
+                        "drafts": drafts,
+                        "draft_signatures": signatures,
+                        "validations": {
+                            key: value
+                            for key, value in state.get("validations", {}).items()
+                            if key != metric_id
+                        },
+                        "dry_runs": {
+                            key: value
+                            for key, value in state.get("dry_runs", {}).items()
+                            if key != metric_id
+                        },
+                        "approved_packs": {
+                            key: value
+                            for key, value in state.get("approved_packs", {}).items()
+                            if key != metric_id
+                        },
+                        "results": {
+                            key: value
+                            for key, value in state.get("results", {}).items()
+                            if key != metric_id
+                        },
+                        "execution_errors": {
+                            key: value
+                            for key, value in state.get("execution_errors", {}).items()
+                            if key != metric_id
+                        },
+                    }
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+
+            draft = state.get("drafts", {}).get(metric_id)
+            if draft is None:
+                if not basis:
+                    st.caption("填写评价依据后，才能启动规则编制。")
+                continue
+
+            if draft.provider.fallback_used:
+                st.info(
+                    "当前未配置外部模型，使用本地模板生成候选草案；正式使用前请配置 API。"
+                )
+            elif draft.provider.mode == "model":
+                st.success(f"模型已生成候选草案：{draft.provider.model or draft.provider.provider}")
+            else:
+                st.info("当前使用本地模板生成候选草案。")
+
+            st.caption(f"草案状态：{draft.status}")
+            if draft.evidence:
+                with st.expander("查看评价依据与模型假设"):
+                    st.markdown("**用户原始依据**")
+                    st.text(basis)
+                    for item in draft.evidence:
+                        st.text(f"{item.type} · {item.text}")
+                    if draft.assumptions:
+                        st.markdown("**系统/模型假设**")
+                        for item in draft.assumptions:
+                            st.text(item)
+
+            if draft.status == "needs_clarification":
+                st.warning("当前依据缺少可执行规则所需信息。")
+                clarification_questions = tuple(
+                    dict.fromkeys(
+                        (
+                            *draft.clarification_questions,
+                            *_rule_missing_guidance(report, metric_id, basis),
+                        )
+                    )
+                )[:5]
+                for question in clarification_questions:
+                    st.text(f"需要补充：{question}")
+                continue
+            if draft.status == "rejected":
+                st.error(_escape_markdown(draft.unsupported_reason or "当前需求暂不支持。"))
+                _render_rule_missing_guidance(report, metric_id, basis)
+                continue
+            if draft.rule_spec is None:
+                st.error("Provider 未生成可展示的规则草案。")
+                continue
+
+            with st.expander("查看结构化规则草案", expanded=True):
+                st.json(draft.rule_spec.to_dict())
+            draft_download_name = sanitize_file_name(
+                f"{report.dataset.name}_{metric_id}_rule_draft.json",
+                default_name=f"{metric_id}_rule_draft.json",
+                safe_extension=".json",
+            )
+            st.download_button(
+                "下载 RuleDraft（JSON）",
+                data=json.dumps(
+                    draft.to_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                ).encode("utf-8"),
+                file_name=draft_download_name,
+                mime="application/json",
+                key=f"download_metric_rule_draft_{metric_id}",
+            )
+            validation = validate_rule_draft(draft, report)
+            validations = dict(state.get("validations", {}))
+            validations[metric_id] = validation
+            state = {**state, "validations": validations}
+            st.session_state[RULE_AUTHORING_STATE_KEY] = state
+            if not validation.valid:
+                st.error("规则草案未通过确定性校验，不能试运行。")
+                for error in validation.errors:
+                    st.text(error)
+                continue
+            st.success("规则草案已通过字段、参数和当前报告画像校验。")
+            try:
+                pack = build_rule_pack_from_draft(draft, report)
+            except RuleDraftValidationError as error:
+                st.error(_escape_markdown(f"RulePack 转换失败：{error}"))
+                continue
+
+            st.caption("正式执行前必须先完成试运行和人工审批。")
+            dry_run_clicked = st.button(
+                "试运行规则",
+                key=f"dry_run_metric_rule_{metric_id}",
+                width="stretch",
+            )
+            if dry_run_clicked:
+                try:
+                    with st.spinner("正在使用确定性规则引擎进行试运行……"):
+                        preview = dry_run_uploaded_dataset_with_rule_pack(
+                            uploaded_file.getvalue(),
+                            uploaded_file.name,
+                            pack,
+                            dataset_name=dataset_name.strip() or None,
+                            sheet_name=sheet_name.strip() or None,
+                            reference_date=reference_date,
+                            selected_metric_ids=selected_metric_ids,
+                        )
+                except RulePackExecutionError as error:
+                    errors = dict(state.get("execution_errors", {}))
+                    errors[metric_id] = str(error)
+                    state = {**state, "execution_errors": errors}
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                    st.error(_escape_markdown(f"试运行未完成：{error}"))
+                except Exception:
+                    errors = dict(state.get("execution_errors", {}))
+                    errors[metric_id] = "试运行未完成，请核对当前上传文件后重试。"
+                    state = {**state, "execution_errors": errors}
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                    st.error(errors[metric_id])
+                else:
+                    dry_runs = dict(state.get("dry_runs", {}))
+                    dry_runs[metric_id] = preview.to_dict()
+                    state = {**state, "dry_runs": dry_runs}
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+
+            preview = state.get("dry_runs", {}).get(metric_id)
+            if preview is None:
+                st.info("规则草案已校验；点击“试运行规则”查看影响摘要。")
+                continue
+            _render_rule_dry_run(preview)
+
+            approver = st.text_input(
+                "审批人标识（AI规则，本地自声明）",
+                max_chars=100,
+                key=f"v07_rule_approver_{metric_id}",
+            )
+            confirmed = st.checkbox(
+                "我已核对当前规则、评价依据和试运行摘要，并批准本次确定性重评。",
+                key=f"v07_rule_approval_confirmed_{metric_id}",
+            )
+            pack_hash = draft_sha256(pack)
+            confirmations = dict(state.get("confirmed_pack_sha256", {}))
+            if confirmed:
+                confirmations[metric_id] = pack_hash
+            else:
+                confirmations.pop(metric_id, None)
+            state = {**state, "confirmed_pack_sha256": confirmations}
+            st.session_state[RULE_AUTHORING_STATE_KEY] = state
+            approve_clicked = st.button(
+                "补充完成并重新评估（AI规则）",
+                key=f"approve_metric_rule_{metric_id}",
+                type="primary",
+                width="stretch",
+                disabled=(
+                    not approver.strip()
+                    or not confirmed
+                    or confirmations.get(metric_id) != pack_hash
+                ),
+            )
+            if approve_clicked:
+                try:
+                    approved_pack = approve_rule_pack(
+                        pack,
+                        report,
+                        approver=approver,
+                    )
+                    with st.spinner("正在重新解析当前输入并执行已审批 AI 规则……"):
+                        result = evaluate_uploaded_dataset_with_rule_pack(
+                            uploaded_file.getvalue(),
+                            uploaded_file.name,
+                            approved_pack,
+                            dataset_name=dataset_name.strip() or None,
+                            sheet_name=sheet_name.strip() or None,
+                            reference_date=reference_date,
+                            selected_metric_ids=selected_metric_ids,
+                        )
+                except (RulePackValidationError, RulePackExecutionError) as error:
+                    errors = dict(state.get("execution_errors", {}))
+                    errors[metric_id] = str(error)
+                    state = {**state, "execution_errors": errors}
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                    st.error(_escape_markdown(f"AI规则未执行：{error}"))
+                except Exception:
+                    errors = dict(state.get("execution_errors", {}))
+                    errors[metric_id] = "AI规则未能完成重评；基础报告不受影响。"
+                    state = {**state, "execution_errors": errors}
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                    st.error(errors[metric_id])
+                else:
+                    approved_packs = dict(state.get("approved_packs", {}))
+                    results = dict(state.get("results", {}))
+                    approved_packs[metric_id] = approved_pack
+                    results[metric_id] = result
+                    state = {
+                        **state,
+                        "approved_packs": approved_packs,
+                        "results": results,
+                    }
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+
+            result = state.get("results", {}).get(metric_id)
+            if result is not None:
+                _render_rule_result(result)
 
 
 def _render_rule_enhancement(
@@ -1497,10 +2471,12 @@ def _evaluation_request_signature(
 
 st.title("政务数据集质量评估")
 st.caption(
-    "v0.6 · 上传结构化文件，选择评价指标并生成可复现报告。"
+    "v0.8 · 上传结构化文件，补充评价依据或创建自定义规则。"
 )
 
 _initialize_metric_selection_state()
+_initialize_metric_evidence_state()
+_initialize_model_api_state()
 report_is_displayed = st.session_state.get("quality_report") is not None
 if not report_is_displayed:
     selected_metric_ids = _render_metric_selection_panel()
@@ -1510,6 +2486,7 @@ else:
         for metric_id in ALL_METRIC_IDS
         if metric_id in st.session_state.get(METRIC_SELECTION_KEY, [])
     )
+missing_metric_evidence_ids = _missing_metric_evidence_ids(selected_metric_ids)
 
 with st.sidebar:
     st.header("开始评估")
@@ -1549,6 +2526,7 @@ with st.sidebar:
             "工作表名称（可选）",
             placeholder="默认读取第一个工作表",
         )
+    _render_model_api_settings()
     request_signature = _evaluation_request_signature(
         uploaded_file,
         dataset_name,
@@ -1565,17 +2543,28 @@ with st.sidebar:
         if had_report:
             st.rerun()
     if not report_is_displayed:
+        if missing_metric_evidence_ids:
+            st.warning("请先补全所有已勾选指标的评价规则。")
         run_evaluation = st.button(
             "运行质量评估",
             type="primary",
             width="stretch",
-            disabled=uploaded_file is None or not selected_metric_ids,
+            disabled=(
+                uploaded_file is None
+                or not selected_metric_ids
+                or bool(missing_metric_evidence_ids)
+            ),
         )
     else:
         run_evaluation = False
     st.caption("原始文件仅写入临时目录用于本次计算，评估结束后自动删除。")
 
-if run_evaluation and uploaded_file is not None and selected_metric_ids:
+if (
+    run_evaluation
+    and uploaded_file is not None
+    and selected_metric_ids
+    and not missing_metric_evidence_ids
+):
     _clear_agent_state()
     _clear_rule_state()
     with st.spinner("正在解析文件并计算质量指标……"):
@@ -1624,6 +2613,7 @@ else:
         profile_tab,
         execution_tab,
         agent_tab,
+        authoring_tab,
         rule_tab,
     ) = st.tabs(
         [
@@ -1632,6 +2622,7 @@ else:
             "字段画像",
             "无法评估与运行信息",
             "Agent 解读",
+            "补充评价标准",
             "规则增强",
         ]
     )
@@ -1645,6 +2636,15 @@ else:
         _render_execution(report)
     with agent_tab:
         _render_agent(report)
+    with authoring_tab:
+        _render_rule_authoring(
+            report,
+            uploaded_file=uploaded_file,
+            dataset_name=dataset_name,
+            sheet_name=sheet_name,
+            reference_date=reference_date,
+            selected_metric_ids=selected_metric_ids,
+        )
     with rule_tab:
         _render_rule_enhancement(
             report,

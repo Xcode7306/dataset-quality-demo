@@ -19,6 +19,7 @@ from src.metric_catalog import (
     METRIC_CATALOG,
     MetricSelectionError,
     ORIGINAL_METRIC_IDS,
+    default_evaluation_basis,
     metric_description,
     normalize_selected_metric_ids,
 )
@@ -100,6 +101,26 @@ class MetricCatalogTests(unittest.TestCase):
         self.assertEqual(
             metric_description("db31_030300"),
             "特定字段、记录、文件或数据集意外重复较少的程度。",
+        )
+
+    def test_default_evaluation_basis_matches_rule_capability(self):
+        self.assertEqual(
+            default_evaluation_basis("file_parse_rate"),
+            "默认：文件能够被当前解析器成功读取。",
+        )
+        self.assertTrue(
+            all(
+                default_evaluation_basis(metric_id).strip()
+                for metric_id in ALL_METRIC_IDS
+                if METRIC_BY_ID[metric_id]["auto_assessable"]
+            )
+        )
+        self.assertTrue(
+            all(
+                not default_evaluation_basis(metric_id).strip()
+                for metric_id in ALL_METRIC_IDS
+                if not METRIC_BY_ID[metric_id]["auto_assessable"]
+            )
         )
 
     def test_selection_is_validated_deduplicated_and_catalog_ordered(self):

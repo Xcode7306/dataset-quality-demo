@@ -543,6 +543,39 @@ ALL_METRIC_IDS: tuple[str, ...] = tuple(
 DEFAULT_SELECTED_METRIC_IDS: tuple[str, ...] = ORIGINAL_METRIC_IDS
 
 
+# 已有确定性计算逻辑的指标提供可编辑的默认评价依据；其余指标必须由
+# 用户结合业务标准补充，避免把通用示例误当成实际评价规则。
+DEFAULT_EVALUATION_BASES: Mapping[str, str] = MappingProxyType(
+    {
+        "file_parse_rate": "文件能够被当前解析器成功读取。",
+        "dataset_scale": "以解析后的有效记录数作为数据规模。",
+        "field_missing_rate": "按字段缺失值数除以该字段记录数计算字段缺失率。",
+        "blank_record_rate": "内容字段全部为空的记录视为空白记录。",
+        "field_type_consistency": "按字段非空值的基础类型推断，主要类型占比作为类型一致率。",
+        "recognizable_format_anomaly_rate": (
+            "按字段名识别日期、数值、URL 和邮箱字段，统计可识别的格式异常值。"
+        ),
+        "exact_duplicate_rate": (
+            "排除技术标识列后，内容完全相同的后续记录视为重复记录。"
+        ),
+        "normalized_duplicate_rate": (
+            "忽略文本空白、大小写和常见标点后，后续相同记录视为规范化重复记录。"
+        ),
+        "time_info_availability": "记录至少包含一个可解析的日期或时间字段。",
+        "update_lag_days": "以评估基准日期减去最近可解析更新时间，计算更新滞后天数。",
+        "source_info_coverage": (
+            "包含可识别来源部门、链接或原始标识信息的记录计入来源信息覆盖率。"
+        ),
+        "version_info_coverage": (
+            "包含版本、更新时间或处理记录信息的记录计入版本信息覆盖率。"
+        ),
+        "statistical_outlier_rate": "对被检查的数值字段使用 IQR 规则识别统计异常值。",
+        "db31_030300": "按当前单表重复识别规则计算数据重复率。",
+        "db31_030400": "按当前单表唯一性识别规则计算数据唯一性。",
+    }
+)
+
+
 def get_metric_definition(metric_id: str) -> Mapping[str, Any] | None:
     """按稳定 ID 获取只读目录项。"""
 
@@ -553,6 +586,13 @@ def metric_description(metric_id: str) -> str:
     """返回指标在页面提示中使用的简明含义。"""
 
     return str(METRIC_BY_ID[metric_id]["description"])
+
+
+def default_evaluation_basis(metric_id: str) -> str:
+    """返回已有确定性指标的默认评价依据，没有则返回空字符串。"""
+
+    basis = str(DEFAULT_EVALUATION_BASES.get(metric_id, ""))
+    return f"默认：{basis}" if basis else ""
 
 
 def normalize_selected_metric_ids(

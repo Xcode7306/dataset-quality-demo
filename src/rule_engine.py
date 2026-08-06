@@ -14,6 +14,7 @@ from decimal import Decimal, InvalidOperation
 import json
 import math
 from numbers import Integral, Number
+import re
 from typing import Any, Iterable, Mapping
 
 import pandas as pd
@@ -32,6 +33,7 @@ from .rule_pack import (
 RULE_EVALUATION_SCHEMA_VERSION = "0.4"
 MAX_RULE_INSPECTION_CELLS = 2_000_000
 MAX_RULE_ISSUE_LOCATIONS = 200_000
+MAX_REGEX_INPUT_LENGTH = 10_000
 
 
 class RulePackExecutionError(ValueError):
@@ -110,6 +112,38 @@ class RuleEvaluationResult:
             indent=indent,
             allow_nan=False,
         )
+
+
+@dataclass(frozen=True)
+class RuleDryRunResult:
+    """v0.7 审批前试运行摘要；不携带原始值或问题位置明细。"""
+
+    rule_pack_id: str
+    rule_pack_version: str
+    metrics: tuple[Mapping[str, Any], ...]
+    checked_count: int
+    compliant_count: int
+    issue_count: int
+    not_assessable_count: int
+    issue_location_count: int
+    schema_version: str = "0.7"
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "schema_version": self.schema_version,
+            "rule_pack_id": self.rule_pack_id,
+            "rule_pack_version": self.rule_pack_version,
+            "metrics": [dict(metric) for metric in self.metrics],
+            "counts": {
+                "checked": self.checked_count,
+                "compliant": self.compliant_count,
+                "issues": self.issue_count,
+                "not_assessable": self.not_assessable_count,
+                "issue_locations": self.issue_location_count,
+            },
+        }
+        json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        return payload
 
 
 def _record_location(
@@ -682,6 +716,7 @@ def _numeric_range_metric(
         if rule.minimum is not None
         else None
     )
+
     maximum = (
         Decimal(str(rule.maximum))
         if rule.maximum is not None
@@ -740,6 +775,321 @@ def _numeric_range_metric(
     )
 
 
+def _regex_format_metric(
+    dataframe: pd.DataFrame,
+    pack: RulePack,
+    rule: Rule,
+    *,
+    remaining_issue_locations: int,
+) -> MetricResult:
+    field = rule.fields[0]
+    row_count = int(len(dataframe))
+    if row_count == 0:
+        return _not_assessable(
+            "business_regex_format_compliance",
+            "格式符合率",
+            scope="field",
+            field=field,
+            reason="数据集不包含记录，无法评估格式符合率。",
+        )
+    try:
+        pattern = re.compile(str(rule.regex_pattern))
+    except re.error as error:  # pragma: no cover - RulePack 校验已覆盖
+        raise RulePackExecutionError([f"正则规则无法编译：{error}。"])
+    non_missing_rows = [
+        (record_number, value)
+        for record_number, value in enumerate(dataframe[field].tolist(), start=1)
+        if not is_missing_value(value)
+    ]
+    if not non_missing_rows:
+        return _not_assessable(
+            "business_regex_format_compliance",
+            "格式符合率",
+            scope="field",
+            field=field,
+            reason="字段没有非缺失值，无法评估格式符合率。",
+        )
+    violation_records: list[int] = []
+    for record_number, value in non_missing_rows:
+        text = str(value)
+        if len(text) > MAX_REGEX_INPUT_LENGTH or pattern.fullmatch(text) is None:
+            violation_records.append(record_number)
+    _ensure_issue_location_budget(len(violation_records), remaining_issue_locations)
+    checked_count = len(non_missing_rows)
+    compliant_count = checked_count - len(violation_records)
+    return MetricResult(
+        id="business_regex_format_compliance",
+        name="格式符合率",
+        category="业务规则",
+        status="evaluated",
+        value=round(compliant_count / checked_count, 6),
+        unit="ratio",
+        scope="field",
+        field=field,
+        evidence=_rule_evidence(
+            pack,
+            rule,
+            checked_count=checked_count,
+            excluded_missing_count=row_count - checked_count,
+            compliant_count=compliant_count,
+            issue_count=len(violation_records),
+            pattern=rule.regex_pattern,
+            max_input_length=MAX_REGEX_INPUT_LENGTH,
+        ),
+        issue_locations=[
+            _record_location(
+                record_number,
+                [field],
+                "rule_regex_format_violation",
+            )
+            for record_number in violation_records
+        ],
+    )
+
+
+def _string_length_metric(
+    dataframe: pd.DataFrame,
+    pack: RulePack,
+    rule: Rule,
+    *,
+    remaining_issue_locations: int,
+) -> MetricResult:
+    field = rule.fields[0]
+    row_count = int(len(dataframe))
+    if row_count == 0:
+        return _not_assessable(
+            "business_string_length_compliance",
+            "字符长度符合率",
+            scope="field",
+            field=field,
+            reason="数据集不包含记录，无法评估字符长度符合率。",
+        )
+    non_missing_rows = [
+        (record_number, value)
+        for record_number, value in enumerate(dataframe[field].tolist(), start=1)
+        if not is_missing_value(value)
+    ]
+    if not non_missing_rows:
+        return _not_assessable(
+            "business_string_length_compliance",
+            "字符长度符合率",
+            scope="field",
+            field=field,
+            reason="字段没有非缺失值，无法评估字符长度符合率。",
+        )
+    minimum = rule.min_length
+    maximum = rule.max_length
+    violation_records = [
+        record_number
+        for record_number, value in non_missing_rows
+        if (
+            (minimum is not None and len(str(value)) < minimum)
+            or (maximum is not None and len(str(value)) > maximum)
+        )
+    ]
+    _ensure_issue_location_budget(len(violation_records), remaining_issue_locations)
+    checked_count = len(non_missing_rows)
+    compliant_count = checked_count - len(violation_records)
+    return MetricResult(
+        id="business_string_length_compliance",
+        name="字符长度符合率",
+        category="业务规则",
+        status="evaluated",
+        value=round(compliant_count / checked_count, 6),
+        unit="ratio",
+        scope="field",
+        field=field,
+        evidence=_rule_evidence(
+            pack,
+            rule,
+            checked_count=checked_count,
+            excluded_missing_count=row_count - checked_count,
+            compliant_count=compliant_count,
+            issue_count=len(violation_records),
+            minimum=minimum,
+            maximum=maximum,
+            length_unit="unicode_code_points",
+        ),
+        issue_locations=[
+            _record_location(
+                record_number,
+                [field],
+                "rule_string_length_violation",
+            )
+            for record_number in violation_records
+        ],
+    )
+
+
+def _conditional_required_metric(
+    dataframe: pd.DataFrame,
+    pack: RulePack,
+    rule: Rule,
+    *,
+    remaining_issue_locations: int,
+) -> MetricResult:
+    condition_field, required_field = rule.fields
+    active_rows: list[int] = []
+    missing_records: list[int] = []
+    condition_keys = {_comparison_key(value) for value in rule.condition_values}
+    for record_number, (condition, required) in enumerate(
+        dataframe[[condition_field, required_field]].itertuples(
+            index=False,
+            name=None,
+        ),
+        start=1,
+    ):
+        if is_missing_value(condition) or _comparison_key(condition) not in condition_keys:
+            continue
+        active_rows.append(record_number)
+        if is_missing_value(required):
+            missing_records.append(record_number)
+    if not active_rows:
+        return _not_assessable(
+            "business_conditional_required_compliance",
+            "条件必填符合率",
+            scope="field",
+            field=required_field,
+            reason="没有记录满足条件必填规则的触发条件，无法评估。",
+        )
+    _ensure_issue_location_budget(len(missing_records), remaining_issue_locations)
+    checked_count = len(active_rows)
+    compliant_count = checked_count - len(missing_records)
+    return MetricResult(
+        id="business_conditional_required_compliance",
+        name="条件必填符合率",
+        category="业务规则",
+        status="evaluated",
+        value=round(compliant_count / checked_count, 6),
+        unit="ratio",
+        scope="field",
+        field=required_field,
+        evidence=_rule_evidence(
+            pack,
+            rule,
+            condition_field=condition_field,
+            condition_values=list(rule.condition_values),
+            checked_count=checked_count,
+            compliant_count=compliant_count,
+            issue_count=len(missing_records),
+            excluded_non_matching_count=len(dataframe) - checked_count,
+        ),
+        issue_locations=[
+            _record_location(
+                record_number,
+                [condition_field, required_field],
+                "rule_conditional_required_missing",
+            )
+            for record_number in missing_records
+        ],
+    )
+
+
+def _comparison_value(value: Any, comparison_type: str) -> Any | None:
+    if is_missing_value(value):
+        return None
+    if comparison_type in {"numeric", "auto"}:
+        numeric = _parse_numeric_value(value)
+        if numeric is not None:
+            return ("numeric", numeric)
+        if comparison_type == "numeric":
+            return None
+    if comparison_type in {"datetime", "auto"}:
+        parsed = _parse_datetime(value)
+        if parsed is not None:
+            return ("datetime", parsed)
+        if comparison_type == "datetime":
+            return None
+    if comparison_type in {"text", "auto"}:
+        return ("text", str(value))
+    return None
+
+
+def _comparison_satisfied(left: Any, right: Any, operator: str) -> bool:
+    if operator == "lt":
+        return left < right
+    if operator == "lte":
+        return left <= right
+    if operator == "gt":
+        return left > right
+    if operator == "gte":
+        return left >= right
+    if operator == "eq":
+        return left == right
+    if operator == "neq":
+        return left != right
+    return False  # pragma: no cover - RulePack 校验已覆盖
+
+
+def _field_comparison_metric(
+    dataframe: pd.DataFrame,
+    pack: RulePack,
+    rule: Rule,
+    *,
+    remaining_issue_locations: int,
+) -> MetricResult:
+    left_field, right_field = rule.fields
+    row_count = int(len(dataframe))
+    if row_count == 0:
+        return _not_assessable(
+            "business_field_comparison_compliance",
+            "跨字段比较符合率",
+            scope="dataset",
+            reason="数据集不包含记录，无法评估跨字段比较规则。",
+        )
+    comparison_type = str(rule.comparison_type or "auto")
+    violation_records: list[int] = []
+    unparseable_records: list[int] = []
+    for record_number, (left, right) in enumerate(
+        dataframe[[left_field, right_field]].itertuples(index=False, name=None),
+        start=1,
+    ):
+        left_value = _comparison_value(left, comparison_type)
+        right_value = _comparison_value(right, comparison_type)
+        if left_value is None or right_value is None:
+            unparseable_records.append(record_number)
+            violation_records.append(record_number)
+            continue
+        if left_value[0] != right_value[0] or not _comparison_satisfied(
+            left_value[1],
+            right_value[1],
+            str(rule.comparison_operator),
+        ):
+            violation_records.append(record_number)
+    _ensure_issue_location_budget(len(violation_records), remaining_issue_locations)
+    compliant_count = row_count - len(violation_records)
+    return MetricResult(
+        id="business_field_comparison_compliance",
+        name="跨字段比较符合率",
+        category="业务规则",
+        status="evaluated",
+        value=round(compliant_count / row_count, 6),
+        unit="ratio",
+        scope="dataset",
+        evidence=_rule_evidence(
+            pack,
+            rule,
+            fields=[left_field, right_field],
+            operator=rule.comparison_operator,
+            comparison_type=comparison_type,
+            checked_count=row_count,
+            compliant_count=compliant_count,
+            issue_count=len(violation_records),
+            unparseable_count=len(unparseable_records),
+        ),
+        issue_locations=[
+            _record_location(
+                record_number,
+                [left_field, right_field],
+                (
+                    "rule_field_comparison_unparseable"
+                    if record_number in set(unparseable_records)
+                    else "rule_field_comparison_violation"
+                ),
+            )
+            for record_number in violation_records
+        ],
+    )
 def _calculate_business_metrics(
     dataframe: pd.DataFrame,
     baseline_report: QualityReport,
@@ -816,6 +1166,42 @@ def _calculate_business_metrics(
                     remaining_issue_locations=remaining_issue_locations,
                 )
             ]
+        elif rule.type == "regex_format":
+            rule_metrics = [
+                _regex_format_metric(
+                    dataframe,
+                    pack,
+                    rule,
+                    remaining_issue_locations=remaining_issue_locations,
+                )
+            ]
+        elif rule.type == "string_length":
+            rule_metrics = [
+                _string_length_metric(
+                    dataframe,
+                    pack,
+                    rule,
+                    remaining_issue_locations=remaining_issue_locations,
+                )
+            ]
+        elif rule.type == "conditional_required":
+            rule_metrics = [
+                _conditional_required_metric(
+                    dataframe,
+                    pack,
+                    rule,
+                    remaining_issue_locations=remaining_issue_locations,
+                )
+            ]
+        elif rule.type == "field_comparison":
+            rule_metrics = [
+                _field_comparison_metric(
+                    dataframe,
+                    pack,
+                    rule,
+                    remaining_issue_locations=remaining_issue_locations,
+                )
+            ]
         else:  # pragma: no cover - RulePack 校验器负责拒绝未知类型。
             raise RulePackExecutionError([f"不支持规则类型：{rule.type}。"])
         new_location_count = sum(
@@ -876,6 +1262,18 @@ def _business_risk(
     elif metric.id == "business_numeric_range_compliance":
         title = "字段存在数值范围之外的记录"
         message = f"字段“{metric.field}”未全部满足已审批的闭区间数值规则。"
+    elif metric.id == "business_regex_format_compliance":
+        title = "字段存在格式不符合的记录"
+        message = f"字段“{metric.field}”未全部满足已审批的格式规则。"
+    elif metric.id == "business_string_length_compliance":
+        title = "字段存在字符长度不符合的记录"
+        message = f"字段“{metric.field}”未全部满足已审批的字符长度规则。"
+    elif metric.id == "business_conditional_required_compliance":
+        title = "条件必填字段存在缺失"
+        message = f"字段“{metric.field}”在触发条件满足时存在缺失记录。"
+    elif metric.id == "business_field_comparison_compliance":
+        title = "字段间存在逻辑不一致"
+        message = "存在不满足已审批跨字段比较规则的记录。"
     else:  # pragma: no cover - 仅由本模块固定指标调用。
         return None
 
@@ -992,6 +1390,68 @@ def _validate_dataframe_matches_baseline(
             ["规则引擎表格规模与当前绑定基线报告不一致。"]
         )
     return dataframe
+
+
+def dry_run_rule_pack_on_dataframe(
+    dataframe: pd.DataFrame,
+    baseline_report: QualityReport,
+    rule_pack: RulePack,
+) -> RuleDryRunResult:
+    """在审批前使用同一确定性规则语义生成影响摘要。
+
+    该入口只接受 draft RulePack，不生成审批记录，也不修改基线报告。
+    """
+
+    if not isinstance(rule_pack, RulePack) or rule_pack.status != "draft":
+        raise RulePackExecutionError(["试运行只接受未审批 RulePack 草案。"])
+    validation = validate_rule_pack(rule_pack, baseline_report)
+    if not validation.valid:
+        raise RulePackExecutionError(validation.errors)
+    dataframe = _validate_dataframe_matches_baseline(dataframe, baseline_report)
+    metrics = _calculate_business_metrics(dataframe, baseline_report, rule_pack)
+    summaries: list[Mapping[str, Any]] = []
+    checked_count = 0
+    compliant_count = 0
+    issue_count = 0
+    not_assessable_count = 0
+    issue_location_count = 0
+    for metric in metrics:
+        evidence = metric.evidence if isinstance(metric.evidence, Mapping) else {}
+        metric_checked = evidence.get("checked_count")
+        metric_compliant = evidence.get("compliant_count")
+        metric_issues = evidence.get("issue_count")
+        if isinstance(metric_checked, int) and not isinstance(metric_checked, bool):
+            checked_count += metric_checked
+        if isinstance(metric_compliant, int) and not isinstance(metric_compliant, bool):
+            compliant_count += metric_compliant
+        if isinstance(metric_issues, int) and not isinstance(metric_issues, bool):
+            issue_count += metric_issues
+        if metric.status == "not_assessable":
+            not_assessable_count += 1
+        issue_location_count += len(metric.issue_locations)
+        summaries.append(
+            {
+                "metric_key": metric.metric_key,
+                "name": metric.name,
+                "field": metric.field,
+                "status": metric.status,
+                "value": metric.value,
+                "checked_count": metric_checked,
+                "compliant_count": metric_compliant,
+                "issue_count": metric_issues,
+                "reason": metric.reason,
+            }
+        )
+    return RuleDryRunResult(
+        rule_pack_id=rule_pack.rule_pack_id,
+        rule_pack_version=rule_pack.version,
+        metrics=tuple(summaries),
+        checked_count=checked_count,
+        compliant_count=compliant_count,
+        issue_count=issue_count,
+        not_assessable_count=not_assessable_count,
+        issue_location_count=issue_location_count,
+    )
 
 
 def _evaluate_rule_pack_on_verified_dataframe(

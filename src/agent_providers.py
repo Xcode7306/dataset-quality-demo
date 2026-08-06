@@ -1,8 +1,8 @@
 """Agent 内容提供方。
 
-默认模板提供方完全本地运行；DeepSeek Chat Completions 提供方只在上层
-显式选择后使用，并在调用时惰性导入 HTTP 客户端、读取环境变量。模块和缓存
-均不保存 API key。
+默认模板提供方完全本地运行；Chat Completions 提供方只在上层显式选择后
+使用，并在调用时惰性导入 HTTP 客户端。DeepSeek 的环境变量配置继续兼容，
+页面也可以传入任意兼容同一请求格式的 API 配置。
 """
 
 from __future__ import annotations
@@ -18,6 +18,13 @@ from .agent_tools import (
     AgentToolError,
     ReportSnapshot,
     deepseek_tool_definitions,
+)
+from .model_api import (
+    extract_message_content,
+    normalize_chat_completions_url,
+    parse_json_object_text,
+    response_error_detail,
+    secret_fingerprint,
 )
 
 
@@ -60,6 +67,8 @@ class ProviderResult:
     output_tokens: int = 0
     latency_ms: int = 0
     available_citation_ids: tuple[str, ...] | None = None
+    portable_mode: bool = False
+    unstructured_output: bool = False
 
 
 class AgentProvider(Protocol):
@@ -362,6 +371,21 @@ Markdown，不要添加字段。优先级只使用 high、medium、low。
     separators=(",", ":"),
 )
 
+_PORTABLE_SYSTEM_INSTRUCTIONS = """\
+你是政务数据集质量报告诊断 Agent。当前接口不支持工具调用；系统已经把
+经过白名单过滤的报告聚合证据放在用户消息中。只能依据这些证据进行解读，
+不得索取或推断原始记录、文件名、数据集名、执行错误、样本值或行号。
+每个事实、行动、局限和回答都要引用用户消息中真实存在的 citation_id。
+只输出规定的 JSON；如果接口不支持 JSON 模式，也可以输出一段完整的中文解读，
+系统会把这段模型文本作为回答展示。不要输出 Markdown 代码围栏，不要添加字段。
+最终 JSON 结构如下：
+""" + json.dumps(
+    PROVIDER_DRAFT_SCHEMA,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+
 
 def _item_value(item: Any, name: str, default: Any = None) -> Any:
     if isinstance(item, Mapping):
@@ -398,12 +422,15 @@ class _RetryableHTTPError(RuntimeError):
 
 
 class DeepSeekChatProvider:
-    """使用 DeepSeek 原生 Chat Completions API 的可选工具调用提供方。"""
+    """使用 Chat Completions API 的可选工具调用提供方。"""
 
     def __init__(
         self,
         *,
         model: str | None = None,
+        api_key: str | None = None,
+        api_url: str | None = None,
+        provider_name: str = "deepseek",
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         client_factory: Callable[..., Any] | None = None,
     ) -> None:
@@ -412,17 +439,42 @@ class DeepSeekChatProvider:
             or os.environ.get("DEEPSEEK_MODEL")
             or DEFAULT_DEEPSEEK_MODEL
         )
+        self._api_key = api_key
+        self._api_url = api_url
+        self.provider_name = provider_name.strip() or "deepseek"
         self.timeout_seconds = float(timeout_seconds)
         self._client_factory = client_factory
 
     @property
     def cache_namespace(self) -> str:
-        return f"deepseek:{self.model}:{PROMPT_VERSION}"
+        return (
+            f"{self.provider_name}:{self.model}:"
+            f"{secret_fingerprint(self._resolved_api_url())}:"
+            f"{secret_fingerprint(self._resolved_api_key())}:"
+            f"{PROMPT_VERSION}"
+        )
 
-    def _make_client(self) -> tuple[Any, dict[str, str]]:
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    def _resolved_api_key(self) -> str:
+        if self._api_key is not None:
+            return self._api_key.strip()
+        return os.environ.get("DEEPSEEK_API_KEY", "").strip()
+
+    def _resolved_api_url(self) -> str:
+        value = self._api_url
+        if value is None:
+            value = os.environ.get(
+                "DEEPSEEK_API_URL",
+                DEEPSEEK_CHAT_COMPLETIONS_URL,
+            )
+        return normalize_chat_completions_url(value)
+
+    def _make_client(self) -> tuple[Any, dict[str, str], str]:
+        api_key = self._resolved_api_key()
         if not api_key:
-            raise ProviderUnavailableError("未配置 DeepSeek API key。")
+            raise ProviderUnavailableError("未配置模型 API key。")
+        endpoint = self._resolved_api_url()
+        if not endpoint:
+            raise ProviderUnavailableError("未配置模型 API 地址。")
         factory = self._client_factory
         if factory is None:
             try:
@@ -431,15 +483,20 @@ class DeepSeekChatProvider:
                 raise ProviderUnavailableError("未安装 httpx。") from error
             factory = httpx.Client
         client = factory(timeout=self.timeout_seconds)
-        return client, {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        return (
+            client,
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            endpoint,
+        )
 
     @staticmethod
     def _post_with_one_retry(
         client: Any,
         *,
+        endpoint: str,
         headers: Mapping[str, str],
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
@@ -447,7 +504,7 @@ class DeepSeekChatProvider:
         for attempt in range(2):
             try:
                 response = client.post(
-                    DEEPSEEK_CHAT_COMPLETIONS_URL,
+                    endpoint,
                     headers=dict(headers),
                     json=dict(payload),
                 )
@@ -457,10 +514,12 @@ class DeepSeekChatProvider:
                 if status_code == 429 or status_code >= 500:
                     raise _RetryableHTTPError("DeepSeek 服务暂时不可用。")
                 if status_code >= 400:
-                    raise ProviderExecutionError("DeepSeek API 拒绝了请求。")
+                    raise ProviderExecutionError(
+                        f"模型 API 拒绝了请求：{response_error_detail(response)}"
+                    )
                 body = response.json()
                 if not isinstance(body, Mapping):
-                    raise _RetryableHTTPError("DeepSeek 响应不是 JSON 对象。")
+                    raise _RetryableHTTPError("模型 API 响应不是 JSON 对象。")
                 return body
             except ProviderExecutionError:
                 raise
@@ -468,7 +527,123 @@ class DeepSeekChatProvider:
                 last_error = error
                 if attempt == 1:
                     break
-        raise ProviderExecutionError("DeepSeek API 调用失败。") from last_error
+        detail = str(last_error).strip() if last_error else "未知网络错误"
+        raise ProviderExecutionError(
+            f"模型 API 调用失败：{detail[:500]}"
+        ) from last_error
+
+    def _post_portable_request(
+        self,
+        client: Any,
+        *,
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """先请求 JSON 模式；接口不支持时去掉可选参数重试一次。"""
+
+        try:
+            return self._post_with_one_retry(
+                client,
+                endpoint=endpoint,
+                headers=headers,
+                payload=payload,
+            )
+        except ProviderExecutionError:
+            reduced_payload = dict(payload)
+            reduced_payload.pop("response_format", None)
+            reduced_payload.pop("temperature", None)
+            reduced_payload.pop("max_tokens", None)
+            if reduced_payload == dict(payload):
+                raise
+            return self._post_with_one_retry(
+                client,
+                endpoint=endpoint,
+                headers=headers,
+                payload=reduced_payload,
+            )
+
+    def _generate_portable(
+        self,
+        snapshot: ReportSnapshot,
+        *,
+        intent: AgentIntent,
+        question: str | None,
+    ) -> ProviderResult:
+        """为不支持 tools 的 OpenAI 兼容服务使用普通 messages 调用。"""
+
+        client, headers, endpoint = self._make_client()
+        started = monotonic()
+        prompt = {
+            "intent": intent,
+            "question": question if intent == "question" else None,
+            "report_sha256": snapshot.report_sha256,
+            "evidence": snapshot.get_portable_context(),
+        }
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": _PORTABLE_SYSTEM_INSTRUCTIONS},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        prompt,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            ],
+            "response_format": {"type": "json_object"},
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "stream": False,
+        }
+        try:
+            response = self._post_portable_request(
+                client,
+                endpoint=endpoint,
+                headers=headers,
+                payload=payload,
+            )
+            choices = response.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise ProviderExecutionError("模型 API 未返回 choices。")
+            choice = choices[0]
+            message = _item_value(choice, "message")
+            if isinstance(message, Mapping):
+                content = extract_message_content(message.get("content"))
+            else:
+                content = extract_message_content(_item_value(choice, "text"))
+            if not content:
+                raise ProviderExecutionError("模型 API 未返回可展示的模型解读。")
+            parsed = parse_json_object_text(content)
+            usage = response.get("usage", {})
+            return ProviderResult(
+                payload=parsed if parsed is not None else content,
+                provider=self.provider_name,
+                model=self.model,
+                mode="model",
+                prompt_version=PROMPT_VERSION,
+                tool_calls=(),
+                input_tokens=_usage_value(response, "prompt_tokens"),
+                output_tokens=_usage_value(response, "completion_tokens"),
+                latency_ms=max(0, round((monotonic() - started) * 1000)),
+                available_citation_ids=tuple(sorted(snapshot.citation_ids)),
+                portable_mode=True,
+                unstructured_output=parsed is None,
+            )
+        except ProviderExecutionError:
+            raise
+        except Exception as error:
+            raise ProviderExecutionError(
+                f"模型解读响应无法解析：{str(error)[:500]}"
+            ) from error
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
     def generate(
         self,
@@ -477,7 +652,13 @@ class DeepSeekChatProvider:
         intent: AgentIntent,
         question: str | None,
     ) -> ProviderResult:
-        client, headers = self._make_client()
+        if self.provider_name != "deepseek":
+            return self._generate_portable(
+                snapshot,
+                intent=intent,
+                question=question,
+            )
+        client, headers, endpoint = self._make_client()
         started = monotonic()
         prompt = {
             "intent": intent,
@@ -501,19 +682,22 @@ class DeepSeekChatProvider:
 
         try:
             for _ in range(MAX_TOOL_CALLS + 1):
+                request_payload: dict[str, Any] = {
+                    "model": self.model,
+                    "messages": messages,
+                    "tools": deepseek_tool_definitions(),
+                    "tool_choice": "auto",
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": MAX_OUTPUT_TOKENS,
+                    "stream": False,
+                }
+                if self.provider_name == "deepseek":
+                    request_payload["thinking"] = {"type": "disabled"}
                 response = self._post_with_one_retry(
                     client,
+                    endpoint=endpoint,
                     headers=headers,
-                    payload={
-                        "model": self.model,
-                        "messages": messages,
-                        "tools": deepseek_tool_definitions(),
-                        "tool_choice": "auto",
-                        "response_format": {"type": "json_object"},
-                        "thinking": {"type": "disabled"},
-                        "max_tokens": MAX_OUTPUT_TOKENS,
-                        "stream": False,
-                    },
+                    payload=request_payload,
                 )
                 input_tokens += _usage_value(response, "prompt_tokens")
                 output_tokens += _usage_value(response, "completion_tokens")
@@ -545,7 +729,7 @@ class DeepSeekChatProvider:
                         )
                     return ProviderResult(
                         payload=content,
-                        provider="deepseek",
+                        provider=self.provider_name,
                         model=self.model,
                         mode="model",
                         prompt_version=PROMPT_VERSION,
@@ -670,7 +854,7 @@ class DeepSeekChatProvider:
             )
             partial_result = ProviderResult(
                 payload=None,
-                provider="deepseek",
+                provider=self.provider_name,
                 model=self.model,
                 mode="model",
                 prompt_version=PROMPT_VERSION,
@@ -685,7 +869,7 @@ class DeepSeekChatProvider:
                 ),
             )
             raise ProviderExecutionError(
-                "DeepSeek 调用未能生成可采用的结果。",
+                f"模型调用未能生成可采用的结果：{str(error)[:500]}",
                 partial_result=partial_result,
                 reason_code=reason_code,
             ) from error
@@ -696,3 +880,39 @@ class DeepSeekChatProvider:
                     close()
                 except Exception:
                     pass
+
+
+class OpenAICompatibleChatProvider(DeepSeekChatProvider):
+    """页面自定义的兼容 Chat Completions API 提供方。"""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        api_url: str,
+        model: str,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        client_factory: Callable[..., Any] | None = None,
+    ) -> None:
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            api_url=api_url,
+            provider_name="custom",
+            timeout_seconds=timeout_seconds,
+            client_factory=client_factory,
+        )
+
+
+__all__ = [
+    "AgentProvider",
+    "DEFAULT_DEEPSEEK_MODEL",
+    "DEEPSEEK_CHAT_COMPLETIONS_URL",
+    "DeepSeekChatProvider",
+    "OpenAICompatibleChatProvider",
+    "PROMPT_VERSION",
+    "ProviderExecutionError",
+    "ProviderResult",
+    "ProviderUnavailableError",
+    "TemplateAgentProvider",
+]

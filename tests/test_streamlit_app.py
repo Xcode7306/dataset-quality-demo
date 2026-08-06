@@ -128,6 +128,10 @@ class StreamlitAppTests(unittest.TestCase):
         app = self._new_app()
         self.assertEqual(len(app.multiselect), 0)
         self.assertEqual(len(app.checkbox), len(ALL_METRIC_IDS))
+        self.assertTrue(
+            app.session_state["metric_evidence_statistical_outlier_rate"]
+        )
+        self.assertEqual(app.session_state["metric_evidence_db31_010100"], "")
         self.assertEqual(self._selected_metric_ids(app), ORIGINAL_METRIC_IDS)
         self.assertTrue(
             any("metric-help-icon" in item.value for item in app.markdown)
@@ -154,6 +158,50 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertEqual(self._selected_metric_ids(app), ORIGINAL_METRIC_IDS)
 
+    def test_custom_model_api_settings_are_available_on_initial_page(self):
+        app = self._new_app()
+        labels = [item.label for item in app.text_input]
+        self.assertIn("API 地址", labels)
+        self.assertIn("API Key", labels)
+        self.assertIn("模型名称", labels)
+
+        next(
+            item
+            for item in app.text_input
+            if item.label == "API 地址"
+        ).set_value("https://model.example/v1")
+        next(
+            item for item in app.text_input if item.label == "API Key"
+        ).set_value("page-only-test-key")
+        next(
+            item for item in app.text_input if item.label == "模型名称"
+        ).set_value("custom-chat-model")
+        app.run()
+
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            any("已配置自定义大模型 API" in item.value for item in app.success)
+        )
+
+    def test_selected_metric_without_evidence_blocks_run(self):
+        sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
+        app = self._new_app()
+        for metric_id in ALL_METRIC_IDS:
+            self._metric_checkbox(app, metric_id).set_value(False)
+        self._metric_checkbox(app, "db31_010100").set_value(True)
+        app.run()
+
+        app.file_uploader[0].set_value(
+            (sample.name, sample.read_bytes(), "text/csv")
+        )
+        app.run()
+
+        run_button = self._button_by_label(app, "运行质量评估")
+        self.assertTrue(run_button.disabled)
+        self.assertTrue(
+            any("补全评价规则" in warning.value for warning in app.warning)
+        )
+
     def test_custom_metric_mix_is_the_exact_report_selection(self):
         sample = PROJECT_ROOT / "sample_data" / "bad_dataset.csv"
         app = self._new_app()
@@ -166,6 +214,10 @@ class StreamlitAppTests(unittest.TestCase):
             "db31_030400",
         ):
             self._metric_checkbox(app, metric_id).set_value(True)
+        app.run()
+        app.text_area[ALL_METRIC_IDS.index("db31_010101")].set_value(
+            "按各字段约定的数据类型进行校验"
+        )
         app.run()
         self._upload_and_run(
             app,
@@ -212,6 +264,35 @@ class StreamlitAppTests(unittest.TestCase):
         )
         self.assertNotIn("来源", metric_table.columns)
         self.assertNotIn("标准代码", metric_table.columns)
+
+    def test_report_identifies_missing_standard_and_exposes_completion_page(self):
+        sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
+        app = self._new_app()
+        for metric_id in ORIGINAL_METRIC_IDS:
+            self._metric_checkbox(app, metric_id).set_value(False)
+        self._metric_checkbox(app, "db31_010101").set_value(True)
+        app.run()
+        app.text_area[ALL_METRIC_IDS.index("db31_010101")].set_value(
+            "按各字段约定的数据类型进行校验"
+        )
+        app.run()
+        self._upload_and_run(
+            app,
+            sample.name,
+            sample.read_bytes(),
+            "text/csv",
+        )
+
+        self.assertTrue(
+            any("需补充评价标准 1 项" in item.value for item in app.caption)
+        )
+        self.assertTrue(
+            any("数据类型约束规范性" in item.value for item in app.markdown)
+        )
+        self.assertTrue(
+            any("逐字段预期数据类型标准" in item.value for item in app.warning)
+        )
+        self.assertIn("补充评价标准", [tab.label for tab in app.tabs])
 
     def test_empty_metric_selection_disables_run_and_clears_old_state(self):
         sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
@@ -405,7 +486,8 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertTrue(
             any(
                 "尚未配置 DEEPSEEK_API_KEY" in message.value
-                and "不会向外发送报告" in message.value
+                and "调用前必须补充 API Key" in message.value
+                and "不会回退到本地模板" in message.value
                 for message in app.warning
             )
         )
@@ -506,7 +588,9 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertEqual(len(state["history"]), 0)
         self.assertTrue(
             any(
-                "Agent 解读暂时不可用" in message.value
+                "外部模型解读失败" in message.value
+                and "未生成模板替代结果" in message.value
+                and "模拟 Agent 故障" in message.value
                 for message in app.error
             )
         )

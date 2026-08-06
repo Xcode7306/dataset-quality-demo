@@ -20,7 +20,9 @@ from .resource_limits import ResourceLimitExceeded, validate_upload_size
 from .rule_engine import (
     RuleEvaluationResult,
     RulePackExecutionError,
+    RuleDryRunResult,
     _evaluate_rule_pack_on_verified_dataframe,
+    dry_run_rule_pack_on_dataframe,
 )
 from .rule_pack import RulePack, is_rule_pack_executable, validate_rule_pack
 from .text_utils import normalize_display_text
@@ -139,6 +141,61 @@ def evaluate_uploaded_dataset_with_rule_pack(
             sheet_name=sheet_name or None,
         )
         return _evaluate_rule_pack_on_verified_dataframe(
+            parsed_dataset.dataframe,
+            baseline_report,
+            rule_pack,
+        )
+
+
+def dry_run_uploaded_dataset_with_rule_pack(
+    content: bytes,
+    file_name: str,
+    rule_pack: RulePack,
+    dataset_name: str | None = None,
+    sheet_name: str | None = None,
+    reference_date: date | None = None,
+    *,
+    selected_metric_ids: Iterable[str] | None = None,
+) -> RuleDryRunResult:
+    """在审批前重新解析上传内容并返回规则影响摘要。"""
+
+    if not isinstance(rule_pack, RulePack) or rule_pack.status != "draft":
+        raise RulePackExecutionError(["规则试运行只接受未审批 RulePack 草案。"])
+    safe_file_name, suffix, file_name_replaced = _prepare_upload_name(file_name)
+    try:
+        validate_upload_size(len(content))
+    except ResourceLimitExceeded as error:
+        raise DatasetReadError(str(error)) from error
+
+    safe_dataset_name = (
+        dataset_name
+        if dataset_name is not None and str(dataset_name).strip()
+        else Path(safe_file_name).stem
+    )
+    with TemporaryDirectory(prefix="dataset-quality-rule-dry-run-") as temporary_directory:
+        temporary_path = Path(temporary_directory) / f"upload{suffix}"
+        temporary_path.write_bytes(content)
+        baseline_report = build_profile_report(
+            temporary_path,
+            dataset_name=safe_dataset_name,
+            sheet_name=sheet_name or None,
+            reference_date=reference_date,
+            selected_metric_ids=selected_metric_ids,
+        )
+        _apply_upload_display_metadata(
+            baseline_report,
+            safe_file_name=safe_file_name,
+            file_name_replaced=file_name_replaced,
+        )
+        validation = validate_rule_pack(rule_pack, baseline_report)
+        if not validation.valid:
+            raise RulePackExecutionError(validation.errors)
+        parsed_dataset = parse_dataset(
+            temporary_path,
+            dataset_name=safe_dataset_name,
+            sheet_name=sheet_name or None,
+        )
+        return dry_run_rule_pack_on_dataframe(
             parsed_dataset.dataframe,
             baseline_report,
             rule_pack,
