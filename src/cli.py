@@ -1,9 +1,10 @@
-"""命令行运行入口：生成当前阶段的 report.json。"""
+"""命令行运行入口：默认生成结构化 JSON 评估报告。"""
 
 import argparse
 from datetime import date
 from pathlib import Path
 
+from .metric_catalog import ALL_METRIC_IDS
 from .report import UnsafeReportDestinationError, get_file_identity, save_report
 from .workflow import build_profile_report
 
@@ -48,7 +49,13 @@ def parse_reference_date(value: str) -> date:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="生成政务数据集质量评估报告。")
-    parser.add_argument("input_file", help="待评估的 CSV、Excel 或 JSON 文件路径。")
+    parser.add_argument(
+        "input_file",
+        help=(
+            "待评估的 CSV、Excel、JSON、JSONL / NDJSON、GeoJSON "
+            "或同构 JSON 分片 ZIP 文件路径。"
+        ),
+    )
     parser.add_argument("--name", help="报告中的数据集名称；默认使用文件名。")
     parser.add_argument("--sheet", help="Excel 工作表名称；默认读取第一个工作表。")
     parser.add_argument(
@@ -57,9 +64,23 @@ def main() -> None:
         help="评估基准日期（YYYY-MM-DD）；默认使用运行当天。",
     )
     parser.add_argument(
+        "--metric",
+        dest="selected_metric_ids",
+        action="append",
+        choices=ALL_METRIC_IDS,
+        metavar="ID",
+        help=(
+            "选择一个评价指标，可重复指定；未提供时保持 v0.4 默认的原 13 项。"
+            "可用 ID：" + "、".join(ALL_METRIC_IDS)
+        ),
+    )
+    parser.add_argument(
         "--output",
         default="reports/report.json",
-        help="报告输出路径，默认：reports/report.json。",
+        help=(
+            "报告输出路径，默认：reports/report.json；"
+            "显式使用 .md 可输出 Markdown 报告。"
+        ),
     )
     args = parser.parse_args()
 
@@ -78,6 +99,7 @@ def main() -> None:
         args.name,
         args.sheet,
         reference_date=args.reference_date,
+        selected_metric_ids=args.selected_metric_ids,
     )
     try:
         save_report(
@@ -90,7 +112,8 @@ def main() -> None:
         )
     except UnsafeReportDestinationError as error:
         parser.error(str(error))
-    print(f"已生成质量评估报告：{output_path}")
+    output_format = "结构化 JSON" if output_path.suffix.lower() == ".json" else "Markdown"
+    print(f"已生成 {output_format} 质量评估报告：{output_path}")
 
 
 if __name__ == "__main__":

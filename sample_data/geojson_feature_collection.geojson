@@ -1,0 +1,32 @@
+{
+  "type": "FeatureCollection",
+  "name": "政务设施空间样例",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "facility-01",
+      "properties": {
+        "设施名称": "服务大厅",
+        "类别": "政务服务",
+        "开放状态": "正常"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [120.1551, 30.2741]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "facility-02",
+      "properties": {
+        "设施名称": "便民服务站",
+        "类别": "社区服务",
+        "开放状态": "正常"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[120.1500, 30.2700], [120.1600, 30.2800]]
+      }
+    }
+  ]
+}
