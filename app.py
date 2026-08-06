@@ -44,6 +44,7 @@ from src.resource_limits import MAX_INPUT_FILE_MIB
 from src.rule_engine import RulePackExecutionError
 from src.rule_authoring_service import (
     build_rule_pack_from_draft,
+    compile_custom_rule_draft,
     compile_rule_draft,
     validate_rule_draft,
 )
@@ -78,6 +79,7 @@ from src.upload_service import evaluate_uploaded_dataset, sanitize_file_name
 AGENT_STATE_KEY = "agent_ui_state"
 RULE_STATE_KEY = "rule_ui_state"
 RULE_AUTHORING_STATE_KEY = "rule_authoring_ui_state"
+CUSTOM_RULE_STATE_KEY = "custom_rule_ui_state"
 METRIC_SELECTION_KEY = "selected_metric_ids"
 METRIC_SELECTION_WIDGET_PREFIX = "metric_selection_checkbox_"
 METRIC_EVIDENCE_WIDGET_PREFIX = "metric_evidence_"
@@ -105,6 +107,9 @@ RULE_WIDGET_KEYS = (
     "rule_numeric_maximum",
     "rule_approver",
     "rule_approval_confirmed",
+    "custom_rule_intent",
+    "custom_rule_approver",
+    "custom_rule_approval_confirmed",
 )
 RULE_FREQUENCIES = {
     "每日（1 天）": ("daily", 1),
@@ -140,6 +145,7 @@ def _clear_rule_state() -> None:
 
     st.session_state.pop(RULE_STATE_KEY, None)
     st.session_state.pop(RULE_AUTHORING_STATE_KEY, None)
+    st.session_state.pop(CUSTOM_RULE_STATE_KEY, None)
     for key in RULE_WIDGET_KEYS:
         st.session_state.pop(key, None)
 
@@ -1336,6 +1342,197 @@ def _render_rule_dry_run(preview: dict) -> None:
         )
 
 
+def _render_custom_rule_authoring(
+    report: QualityReport,
+    *,
+    uploaded_file,
+    dataset_name: str,
+    sheet_name: str,
+    reference_date: date,
+    selected_metric_ids: tuple[str, ...],
+) -> None:
+    """渲染 v0.8 自然语言自定义规则闭环。"""
+
+    st.subheader("自定义规则（v0.8）")
+    st.caption(
+        "用自然语言新增一条业务规则。当前支持格式/正则、字符长度、"
+        "条件必填和跨字段比较；规则仍须经过确定性校验、试运行和人工批准。"
+    )
+    if uploaded_file is None:
+        st.info("当前上传内容已不可用，请重新选择文件。")
+        return
+
+    state = st.session_state.get(CUSTOM_RULE_STATE_KEY, {})
+    basis = str(st.session_state.get("custom_rule_intent", "")).strip()
+    signature = _rule_form_signature(
+        {
+            "report_sha256": report.evaluation_context.get("report_sha256"),
+            "input_sha256": report.evaluation_context.get("input_sha256"),
+            "intent": basis,
+        }
+    )
+    if state.get("signature") and state.get("signature") != signature:
+        state = {}
+        st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    st.sidebar.text_input(
+        "自定义规则描述",
+        key="custom_rule_intent",
+        max_chars=4000,
+        help="例如：状态为注销时，注销日期必须填写；开始日期不得晚于结束日期。",
+    )
+    basis = str(st.session_state.get("custom_rule_intent", "")).strip()
+    signature = _rule_form_signature(
+        {
+            "report_sha256": report.evaluation_context.get("report_sha256"),
+            "input_sha256": report.evaluation_context.get("input_sha256"),
+            "intent": basis,
+        }
+    )
+    if state.get("signature") and state.get("signature") != signature:
+        state = {}
+        st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    if st.button(
+        "AI 解析自定义规则",
+        key="compile_custom_rule_v08",
+        width="stretch",
+        disabled=not bool(basis),
+    ):
+        try:
+            provider = _build_rule_authoring_provider()
+            compile_kwargs = {
+                "user_intent": basis,
+                "allow_template_fallback": provider is None,
+            }
+            if provider is not None:
+                compile_kwargs["provider"] = provider
+            draft = compile_custom_rule_draft(report, **compile_kwargs)
+        except (RuleAuthoringProviderUnavailable, RuleAuthoringProviderError, RuleDraftValidationError, ValueError) as error:
+            state = {
+                "signature": signature,
+                "error": _model_error_detail(error),
+            }
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+            st.error(f"自定义规则解析失败：{_escape_markdown(str(error))}")
+        else:
+            state = {
+                "signature": signature,
+                "draft": draft,
+                "dry_run": None,
+                "approved_pack": None,
+                "result": None,
+                "error": None,
+            }
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    state = st.session_state.get(CUSTOM_RULE_STATE_KEY, state)
+    if state.get("error"):
+        st.error(f"自定义规则未完成：{_escape_markdown(state['error'])}")
+    draft = state.get("draft")
+    if draft is None:
+        st.caption("填写规则描述后，点击“AI 解析自定义规则”。")
+        return
+
+    if draft.provider.fallback_used:
+        st.info("当前未配置外部模型，使用本地模板生成候选草案；正式使用前请配置 API。")
+    elif draft.provider.mode == "model":
+        st.success(f"模型已生成候选自定义规则：{draft.provider.model or draft.provider.provider}")
+    st.caption(f"草案状态：{draft.status}")
+
+    if draft.status == "needs_clarification":
+        st.warning("当前自定义规则缺少可执行信息，请补充后重新解析。")
+        for question in draft.clarification_questions:
+            st.text(f"需要补充：{question}")
+        return
+    if draft.status == "rejected":
+        st.error(_escape_markdown(draft.unsupported_reason or "当前需求暂不支持。"))
+        return
+    if draft.rule_spec is None:
+        st.error("Provider 未生成可展示的自定义规则草案。")
+        return
+
+    with st.expander("查看自定义规则草案", expanded=True):
+        st.json(draft.rule_spec.to_dict())
+    validation = validate_rule_draft(draft, report)
+    if not validation.valid:
+        st.error("自定义规则未通过确定性校验，不能试运行。")
+        for error in validation.errors:
+            st.text(error)
+        return
+    st.success("自定义规则已通过字段、参数和当前报告画像校验。")
+    try:
+        pack = build_rule_pack_from_draft(draft, report)
+    except RuleDraftValidationError as error:
+        st.error(f"RulePack 转换失败：{_escape_markdown(str(error))}")
+        return
+
+    if st.button("试运行自定义规则", key="dry_run_custom_rule_v08", width="stretch"):
+        try:
+            preview = dry_run_uploaded_dataset_with_rule_pack(
+                uploaded_file.getvalue(),
+                uploaded_file.name,
+                pack,
+                dataset_name=dataset_name.strip() or None,
+                sheet_name=sheet_name.strip() or None,
+                reference_date=reference_date,
+                selected_metric_ids=selected_metric_ids,
+            )
+        except Exception as error:
+            st.error(f"自定义规则试运行未完成：{_escape_markdown(str(error))}")
+        else:
+            state["dry_run"] = preview.to_dict()
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    preview = state.get("dry_run")
+    if preview is None:
+        st.info("规则草案已校验；点击“试运行自定义规则”查看影响摘要。")
+        return
+    _render_rule_dry_run(preview)
+
+    approver = st.text_input(
+        "审批人标识（自定义规则，本地自声明）",
+        max_chars=100,
+        key="custom_rule_approver",
+    )
+    confirmed = st.checkbox(
+        "我已核对当前自定义规则和试运行摘要，并批准本次确定性重评。",
+        key="custom_rule_approval_confirmed",
+    )
+    approve_clicked = st.button(
+        "批准并重新评估（自定义规则）",
+        key="approve_custom_rule_v08",
+        type="primary",
+        width="stretch",
+        disabled=not approver.strip() or not confirmed,
+    )
+    if approve_clicked:
+        try:
+            approved_pack = approve_rule_pack(
+                pack,
+                report,
+                approver=approver,
+            )
+            result = evaluate_uploaded_dataset_with_rule_pack(
+                uploaded_file.getvalue(),
+                uploaded_file.name,
+                approved_pack,
+                dataset_name=dataset_name.strip() or None,
+                sheet_name=sheet_name.strip() or None,
+                reference_date=reference_date,
+                selected_metric_ids=selected_metric_ids,
+            )
+        except (RulePackValidationError, RulePackExecutionError, ValueError) as error:
+            st.error(f"自定义规则未执行：{_escape_markdown(str(error))}")
+        else:
+            state["approved_pack"] = approved_pack
+            state["result"] = result
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    if state.get("result") is not None:
+        _render_rule_result(state["result"])
+
+
 def _render_rule_authoring(
     report: QualityReport,
     *,
@@ -1362,6 +1559,16 @@ def _render_rule_authoring(
     if not selected_metric_ids:
         st.info("请先选择至少一个指标。")
         return
+
+    _render_custom_rule_authoring(
+        report,
+        uploaded_file=uploaded_file,
+        dataset_name=dataset_name,
+        sheet_name=sheet_name,
+        reference_date=reference_date,
+        selected_metric_ids=selected_metric_ids,
+    )
+    st.divider()
 
     state = _rule_authoring_state_for(report)
     standard_metric_ids = tuple(
@@ -2264,7 +2471,7 @@ def _evaluation_request_signature(
 
 st.title("政务数据集质量评估")
 st.caption(
-    "v0.7 · 上传结构化文件，补充评价依据并生成可确认规则。"
+    "v0.8 · 上传结构化文件，补充评价依据或创建自定义规则。"
 )
 
 _initialize_metric_selection_state()

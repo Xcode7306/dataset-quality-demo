@@ -113,8 +113,17 @@ def build_rule_authoring_context(report: Any, metric_id: str) -> dict[str, Any]:
     }
 
 
+def build_custom_rule_authoring_context(report: Any) -> dict[str, Any]:
+    """返回自定义规则编译所需的脱敏上下文，不绑定目录指标。"""
+
+    context = build_rule_authoring_context(report, "")
+    context["target_type"] = "custom_rule"
+    return context
+
+
 __all__ = [
     "build_rule_authoring_context",
+    "build_custom_rule_authoring_context",
     "get_metric_definition_tool",
     "get_profile_summary_tool",
     "list_available_fields_tool",

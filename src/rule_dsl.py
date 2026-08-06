@@ -1,7 +1,7 @@
-"""v0.7 规则编制领域协议。
+"""v0.8 规则编制领域协议。
 
 本模块只保存“用户依据 → 规则草案”的结构化结果，不负责审批或正式执行。
-可执行的五类规则仍复用 ``src.rule_pack.Rule`` 和现有确定性引擎。
+可执行规则复用 ``src.rule_pack.Rule`` 和现有确定性引擎。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from .rule_pack import Rule, SUPPORTED_RULE_TYPES
 
 RULE_DRAFT_SCHEMA_VERSION = "0.1"
 RULE_DRAFT_GENERATOR = "quality-rule-agent-v0.7"
+RULE_DRAFT_GENERATOR_V08 = "quality-rule-agent-v0.8"
 MAX_USER_INTENT_LENGTH = 4000
 MAX_CLARIFICATION_QUESTIONS = 5
 MAX_EVIDENCE_ITEMS = 20
@@ -179,7 +180,7 @@ class RuleEvidence:
 
 @dataclass(frozen=True)
 class RuleSpec:
-    """与现有五类 RulePack 规则对应的稳定 DSL。"""
+    """与 v0.8 白名单 RulePack 规则对应的稳定 DSL。"""
 
     rule_type: str
     rule_id: str
@@ -235,6 +236,29 @@ class RuleSpec:
                 **common,
                 minimum=parameters.get("minimum"),
                 maximum=parameters.get("maximum"),
+            )
+        if self.rule_type == "regex_format":
+            return Rule(
+                **common,
+                regex_pattern=parameters.get("pattern"),
+            )
+        if self.rule_type == "string_length":
+            return Rule(
+                **common,
+                min_length=parameters.get("minimum"),
+                max_length=parameters.get("maximum"),
+            )
+        if self.rule_type == "conditional_required":
+            return Rule(
+                **common,
+                condition_field=self.fields[0],
+                condition_values=tuple(parameters.get("condition_values", ())),
+            )
+        if self.rule_type == "field_comparison":
+            return Rule(
+                **common,
+                comparison_operator=parameters.get("operator"),
+                comparison_type=parameters.get("comparison_type", "auto"),
             )
         return Rule(**common)
 
@@ -352,7 +376,7 @@ def validate_rule_spec(
         return RuleDraftValidationResult(False, ("rule_spec 不是 RuleSpec。",))
     errors.extend(_validate_text(rule_spec.rule_type, "rule_type", 80))
     if rule_spec.rule_type not in SUPPORTED_RULE_TYPES:
-        errors.append(f"规则类型“{rule_spec.rule_type}”不在当前 v0.7 白名单中。")
+        errors.append(f"规则类型“{rule_spec.rule_type}”不在当前 v0.8 白名单中。")
     if not _RULE_ID_PATTERN.fullmatch(rule_spec.rule_id):
         errors.append("rule_id 必须由本地代码生成，并符合小写 ID 格式。")
     for label, value, maximum in (
@@ -360,8 +384,12 @@ def validate_rule_spec(
         ("description", rule_spec.description, 2000),
     ):
         errors.extend(_validate_text(value, label, maximum))
-    if not 1 <= len(rule_spec.fields) <= 5:
-        errors.append("fields 必须包含 1 到 5 个字段。")
+    max_fields = 2 if rule_spec.rule_type in {
+        "conditional_required",
+        "field_comparison",
+    } else 5
+    if not 1 <= len(rule_spec.fields) <= max_fields:
+        errors.append(f"fields 必须包含 1 到 {max_fields} 个字段。")
     if len(set(rule_spec.fields)) != len(rule_spec.fields):
         errors.append("fields 不能包含重复字段。")
     available = set(str(field) for field in available_fields)
@@ -379,6 +407,10 @@ def validate_rule_spec(
             "update_freshness": {"frequency", "max_age_days"},
             "allowed_values": {"allowed_values"},
             "numeric_range": {"minimum", "maximum"},
+            "regex_format": {"pattern"},
+            "string_length": {"minimum", "maximum"},
+            "conditional_required": {"condition_values"},
+            "field_comparison": {"operator", "comparison_type"},
         }.get(rule_spec.rule_type, set())
         unknown_parameters = sorted(set(parameters) - allowed_parameters)
         if unknown_parameters:
@@ -394,6 +426,22 @@ def validate_rule_spec(
             set(parameters) & allowed_parameters
         ):
             errors.append("numeric_range 至少需要 minimum 或 maximum 参数。")
+        if rule_spec.rule_type == "regex_format" and set(parameters) != {"pattern"}:
+            errors.append("regex_format 的 parameters 必须只包含 pattern。")
+        if rule_spec.rule_type == "string_length":
+            if not set(parameters) & {"minimum", "maximum"}:
+                errors.append("string_length 至少需要 minimum 或 maximum 参数。")
+            if not set(parameters) <= {"minimum", "maximum"}:
+                errors.append("string_length 只能包含 minimum 或 maximum 参数。")
+        if rule_spec.rule_type == "conditional_required" and set(parameters) != {
+            "condition_values"
+        }:
+            errors.append("conditional_required 必须只包含 condition_values 参数。")
+        if rule_spec.rule_type == "field_comparison":
+            if "operator" not in parameters:
+                errors.append("field_comparison 必须包含 operator 参数。")
+            if set(parameters) - {"operator", "comparison_type"}:
+                errors.append("field_comparison 只能包含 operator 和 comparison_type 参数。")
     if rule_spec.severity not in {"info", "attention", "warning"}:
         errors.append("severity 不在允许范围内。")
     if rule_spec.denominator_policy not in {"all_records", "non_missing"}:
@@ -578,6 +626,7 @@ __all__ = [
     "MAX_EVIDENCE_ITEMS",
     "ProviderMetadata",
     "RULE_DRAFT_GENERATOR",
+    "RULE_DRAFT_GENERATOR_V08",
     "RULE_DRAFT_SCHEMA_VERSION",
     "RuleDraft",
     "RuleDraftStatus",

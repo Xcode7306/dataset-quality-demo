@@ -1,4 +1,4 @@
-"""v0.7 规则编制服务。
+"""v0.8 规则编制服务。
 
 服务负责组装上下文、调用 Provider、生成 RuleDraft 和执行确定性校验；它不
 审批、不直接正式执行规则。正式 RulePack 仍由现有本地审批服务接管。
@@ -19,9 +19,13 @@ from .rule_authoring_providers import (
     TemplateRuleAuthoringProvider,
     default_rule_authoring_provider,
 )
-from .rule_authoring_tools import build_rule_authoring_context
+from .rule_authoring_tools import (
+    build_custom_rule_authoring_context,
+    build_rule_authoring_context,
+)
 from .rule_dsl import (
     RULE_DRAFT_GENERATOR,
+    RULE_DRAFT_GENERATOR_V08,
     RULE_DRAFT_SCHEMA_VERSION,
     ProviderMetadata,
     RuleDraft,
@@ -96,20 +100,25 @@ def _fallback_result(
 
 def _base_evidence(
     context: dict[str, Any],
-    metric_id: str,
+    metric_id: str | None,
     user_intent: str,
 ) -> tuple[RuleEvidence, ...]:
+    evidence_target = metric_id or "custom_rule"
     evidence = [
         new_evidence(
             "user_statement",
             user_intent,
-            source_id=f"user-input:{metric_id}",
+            source_id=f"user-input:{evidence_target}",
             source_label="用户评价依据",
-            location=f"metric:{metric_id}:evidence",
+            location=(
+                f"metric:{metric_id}:evidence"
+                if metric_id
+                else "custom-rule:evidence"
+            ),
         )
     ]
     metric = context.get("metric", {})
-    if isinstance(metric, dict) and metric.get("found"):
+    if metric_id and isinstance(metric, dict) and metric.get("found"):
         evidence.append(
             new_evidence(
                 "metric_definition",
@@ -247,6 +256,100 @@ def compile_rule_draft(
     return draft
 
 
+def compile_custom_rule_draft(
+    report: Any,
+    *,
+    user_intent: str,
+    workflow_id: str | None = None,
+    provider: RuleAuthoringProvider | None = None,
+    created_at: datetime | str | None = None,
+    allow_template_fallback: bool = True,
+) -> RuleDraft:
+    """将自然语言自定义需求编译为不绑定目录指标的 v0.8 RuleDraft。"""
+
+    normalized_intent = str(user_intent or "").strip()
+    if not normalized_intent:
+        raise RuleDraftValidationError(["自定义规则描述不能为空。"])
+    context = build_custom_rule_authoring_context(report)
+    effective_workflow_id = workflow_id or make_workflow_id(
+        [context.get("report_sha256"), "custom_rule", normalized_intent]
+    )
+    timestamp = _created_at(created_at)
+    selected_provider = provider or default_rule_authoring_provider()
+    try:
+        provider_result = selected_provider.generate(
+            context,
+            user_intent=normalized_intent,
+        )
+    except (RuleAuthoringProviderUnavailable, RuleAuthoringProviderError) as error:
+        if not allow_template_fallback:
+            raise
+        provider_result = _fallback_result(
+            context,
+            user_intent=normalized_intent,
+            provider=selected_provider,
+            reason=(
+                "provider_unavailable"
+                if isinstance(error, RuleAuthoringProviderUnavailable)
+                else "provider_error"
+            ),
+        )
+    except Exception:
+        if not allow_template_fallback:
+            raise
+        provider_result = _fallback_result(
+            context,
+            user_intent=normalized_intent,
+            provider=selected_provider,
+            reason="provider_error",
+        )
+
+    evidence = list(_base_evidence(context, None, normalized_intent))
+    evidence.extend(_provider_evidence(provider_result, allowed_source_ids=set()))
+    evidence = list({item.id: item for item in evidence}.values())
+    rule_spec = provider_result.rule_spec
+    status = "draft"
+    unsupported_reason = None
+    if provider_result.outcome == "clarification":
+        status = "needs_clarification"
+    elif provider_result.outcome == "unsupported":
+        status = "rejected"
+        unsupported_reason = provider_result.unsupported_reason or "当前需求超出支持范围。"
+    elif rule_spec is None:
+        status = "failed"
+        unsupported_reason = "Provider 未返回规则草案。"
+    else:
+        rule_spec = normalized_rule_spec(rule_spec, evidence_ids=[item.id for item in evidence])
+
+    draft = RuleDraft(
+        schema_version=RULE_DRAFT_SCHEMA_VERSION,
+        draft_id=make_draft_id(
+            effective_workflow_id,
+            "custom_rule",
+            None,
+            normalized_intent,
+            timestamp,
+        ),
+        workflow_id=effective_workflow_id,
+        target_type="custom_rule",
+        target_metric_id=None,
+        user_intent=normalized_intent,
+        status=status,
+        rule_spec=rule_spec,
+        evidence=tuple(evidence),
+        assumptions=tuple(provider_result.assumptions),
+        clarification_questions=tuple(provider_result.clarification_questions),
+        unsupported_reason=unsupported_reason,
+        provider=provider_result.metadata,
+        context=context,
+        created_at=timestamp,
+    )
+    shape_validation = validate_rule_draft_shape(draft)
+    if not shape_validation.valid:
+        raise RuleDraftValidationError(shape_validation.errors)
+    return draft
+
+
 def validate_rule_draft(
     draft: RuleDraft,
     report: Any,
@@ -264,9 +367,13 @@ def validate_rule_draft(
             (draft.unsupported_reason or "当前 RuleDraft 还不能进入校验或试运行。",),
             tuple(warnings),
         )
-    if draft.target_metric_id is None:
+    if draft.target_type == "catalog_metric" and draft.target_metric_id is None:
         return RuleDraftValidationResult(False, ("目录指标 RuleDraft 缺少 target_metric_id。",))
-    current_context = build_rule_authoring_context(report, draft.target_metric_id)
+    current_context = (
+        build_rule_authoring_context(report, draft.target_metric_id)
+        if draft.target_type == "catalog_metric" and draft.target_metric_id
+        else build_custom_rule_authoring_context(report)
+    )
     if draft.context.get("report_sha256") != current_context.get("report_sha256"):
         errors.append("RuleDraft 与当前零配置报告不匹配，请重新解析评价依据。")
     if draft.context.get("input_sha256") != current_context.get("input_sha256"):
@@ -278,18 +385,26 @@ def validate_rule_draft(
         evidence_ids=[item.id for item in draft.evidence],
     )
     errors.extend(rule_validation.errors)
-    if draft.rule_spec is not None:
+    if draft.rule_spec is not None and not rule_validation.errors:
         try:
             pack = build_rule_pack(
                 report,
                 name=draft.rule_spec.name,
-                version="0.7.0",
+                version=(
+                    "0.7.0"
+                    if draft.target_type == "catalog_metric"
+                    else "0.8.0"
+                ),
                 rules=(draft.rule_spec.to_rule(),),
                 source_type="user_natural_language",
-                generator=RULE_DRAFT_GENERATOR,
+                generator=(
+                    RULE_DRAFT_GENERATOR
+                    if draft.target_type == "catalog_metric"
+                    else RULE_DRAFT_GENERATOR_V08
+                ),
                 generated_at=draft.created_at,
             )
-        except (RulePackValidationError, TypeError, ValueError) as error:
+        except (RulePackValidationError, TypeError, ValueError, IndexError) as error:
             errors.append(f"RulePack 确定性校验失败：{error}")
         else:
             pack_validation = validate_rule_pack(pack, report)
@@ -303,7 +418,7 @@ def build_rule_pack_from_draft(
     draft: RuleDraft,
     report: Any,
     *,
-    version: str = "0.7.0",
+    version: str | None = None,
 ) -> RulePack:
     """把已经通过确定性校验的 RuleDraft 转换为未审批 RulePack。"""
 
@@ -315,16 +430,22 @@ def build_rule_pack_from_draft(
     return build_rule_pack(
         report,
         name=draft.rule_spec.name,
-        version=version,
+        version=version
+        or ("0.7.0" if draft.target_type == "catalog_metric" else "0.8.0"),
         rules=(draft.rule_spec.to_rule(),),
         source_type="user_natural_language",
-        generator=RULE_DRAFT_GENERATOR,
+        generator=(
+            RULE_DRAFT_GENERATOR
+            if draft.target_type == "catalog_metric"
+            else RULE_DRAFT_GENERATOR_V08
+        ),
         generated_at=draft.created_at,
     )
 
 
 __all__ = [
     "build_rule_pack_from_draft",
+    "compile_custom_rule_draft",
     "compile_rule_draft",
     "validate_rule_draft",
 ]

@@ -28,7 +28,7 @@ from .model_api import (
 )
 
 
-RULE_AUTHORING_PROMPT_VERSION = "quality-rule-authoring-v0.7.1"
+RULE_AUTHORING_PROMPT_VERSION = "quality-rule-authoring-v0.8.0"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -168,7 +168,7 @@ def _candidate(
 
 
 class TemplateRuleAuthoringProvider:
-    """无需网络的规则编制模板，覆盖 v0.7 五类 Rule DSL。"""
+    """无需网络的规则编制模板，覆盖 v0.8 白名单 Rule DSL。"""
 
     cache_namespace = f"template:{RULE_AUTHORING_PROMPT_VERSION}"
 
@@ -185,12 +185,13 @@ class TemplateRuleAuthoringProvider:
             return _clarification(["评价依据不能超过 4000 个字符，请压缩为规则条件。"])
 
         if re.search(
-            r"python|javascript|shell|sql|脚本|代码|eval\s*\(|exec\s*\(|动态执行|调用函数",
+            r"\bpython\b|\bjavascript\b|\bshell\b|\bsql\b|脚本|代码执行|运行代码|"
+            r"任意代码|eval\s*\(|exec\s*\(|动态执行|调用函数",
             text,
             flags=re.IGNORECASE,
         ):
             return _unsupported(
-                "v0.7 只支持五类白名单数据质量规则，不执行 Python、SQL、脚本或任意函数。"
+                "v0.8 只支持白名单数据质量规则，不执行 Python、SQL、脚本或任意函数。"
             )
 
         fields = _field_items(context)
@@ -204,6 +205,103 @@ class TemplateRuleAuthoringProvider:
             for item in fields
             if item["inferred_type"] == "numeric"
         ]
+
+        if re.search(r"存在于|参照表|权威表|外键|跨表|自动修复|自动清洗|写回|删除", text):
+            return _unsupported(
+                "v0.8 暂不支持跨表参照、外键、自动清洗、数据写回或删除。"
+            )
+
+        if re.search(r"条件必填|条件下.*必填|时.*必须填写|时.*必填", text):
+            matched_fields = sorted(
+                self._find_fields_in_text(text, fields),
+                key=lambda item: text.casefold().find(item.casefold()),
+            )
+            if len(matched_fields) < 2:
+                return _clarification(["请同时指出触发条件字段和条件满足时必须填写的字段。"])
+            condition_field, required_field = matched_fields[:2]
+            condition_values = self._condition_values(
+                text,
+                condition_field,
+                required_field,
+            )
+            if not condition_values:
+                return _clarification([f"请说明字段“{condition_field}”触发条件的完整取值。"])
+            return _candidate(
+                rule_type="conditional_required",
+                field_names=[condition_field, required_field],
+                name=f"{condition_field}条件下{required_field}必填",
+                description=(
+                    f"当字段“{condition_field}”取指定值时，"
+                    f"字段“{required_field}”必须填写。"
+                ),
+                parameters={"condition_values": condition_values},
+            )
+
+        if re.search(r"不得晚于|不晚于|不能晚于|不得早于|不早于|不能早于|"
+                     r"小于等于|大于等于|不大于|不小于|不超过|不低于|≤|≥", text):
+            matched_fields = sorted(
+                self._find_fields_in_text(text, fields),
+                key=lambda item: text.casefold().find(item.casefold()),
+            )
+            if len(matched_fields) < 2:
+                return _clarification(["请指出需要比较的左侧字段和右侧字段。"])
+            operator = self._comparison_operator(text)
+            if operator is None:
+                return _clarification(["请说明两个字段之间是小于、等于还是大于关系。"])
+            comparison_type = "auto"
+            first_type = next(
+                (item["inferred_type"] for item in fields if item["name"] == matched_fields[0]),
+                "unknown",
+            )
+            second_type = next(
+                (item["inferred_type"] for item in fields if item["name"] == matched_fields[1]),
+                "unknown",
+            )
+            if first_type == second_type and first_type in {"numeric", "datetime", "text"}:
+                comparison_type = first_type
+            return _candidate(
+                rule_type="field_comparison",
+                field_names=matched_fields[:2],
+                name=f"{matched_fields[0]}与{matched_fields[1]}跨字段比较",
+                description=(
+                    f"字段“{matched_fields[0]}”与“{matched_fields[1]}”"
+                    "应满足指定的顺序关系。"
+                ),
+                parameters={
+                    "operator": operator,
+                    "comparison_type": comparison_type,
+                },
+            )
+
+        if re.search(r"正则|格式|位数字|位字符|数字代码|匹配", text):
+            field = _first_field(text, fields)
+            if field is None:
+                return _clarification(["请指出需要校验格式的字段名称。"])
+            pattern = self._regex_pattern(text)
+            if pattern is None:
+                return _clarification(["请提供完整正则表达式，或明确说明固定长度和字符类型。"])
+            return _candidate(
+                rule_type="regex_format",
+                field_names=[field],
+                name=f"{field}格式",
+                description=f"字段“{field}”必须满足指定格式。",
+                parameters={"pattern": pattern},
+            )
+
+        if re.search(r"长度|字符数|位数|几个字符", text):
+            field = _first_field(text, fields)
+            if field is None:
+                return _clarification(["请指出需要限制字符长度的字段名称。"])
+            length_parameters = self._length_parameters(text)
+            if not length_parameters:
+                return _clarification(["请提供字符长度的最小值、最大值或固定长度。"])
+            return _candidate(
+                rule_type="string_length",
+                field_names=[field],
+                name=f"{field}字符长度",
+                description=f"字段“{field}”的字符长度必须满足指定范围。",
+                parameters=length_parameters,
+            )
 
         if re.search(r"主键|唯一标识|唯一编码|唯一编号", text):
             primary_fields = _find_fields(text, fields)
@@ -333,9 +431,88 @@ class TemplateRuleAuthoringProvider:
 
         return _clarification(
             [
-                "当前依据还不能映射为五类规则；请补充字段名称和必填、允许值、更新时间、主键或数值范围条件。"
+                "当前依据还不能映射为白名单规则；请补充字段名称和必填、允许值、更新时间、主键、数值范围、格式、长度、条件必填或跨字段比较条件。"
             ]
         )
+
+    @staticmethod
+    def _find_fields_in_text(text: str, fields: list[dict[str, str]]) -> list[str]:
+        return [
+            item["name"]
+            for item in fields
+            if item["name"].casefold() in text.casefold()
+        ]
+
+    @staticmethod
+    def _condition_values(
+        text: str,
+        condition_field: str,
+        required_field: str,
+    ) -> list[str]:
+        start = text.casefold().find(condition_field.casefold())
+        end = text.casefold().find(required_field.casefold(), start + len(condition_field))
+        fragment = text[start + len(condition_field): end if end >= 0 else None]
+        match = re.search(r"(?:为|是|等于|=)\s*([^，,；;。]+?)(?:时|则|，|,|$)", fragment)
+        if not match:
+            return []
+        values_text = match.group(1).strip().strip("：:")
+        return [
+            item.strip().strip("\"'“”‘’")
+            for item in re.split(r"[、,，/／|或]+", values_text)
+            if item.strip().strip("\"'“”‘’")
+        ][:100]
+
+    @staticmethod
+    def _comparison_operator(text: str) -> str | None:
+        if re.search(r"不得晚于|不晚于|不能晚于|小于等于|不大于|不超过|≤", text):
+            return "lte"
+        if re.search(r"不得早于|不早于|不能早于|大于等于|不小于|不低于|≥", text):
+            return "gte"
+        if re.search(r"严格小于|应小于", text):
+            return "lt"
+        if re.search(r"严格大于|应大于", text):
+            return "gt"
+        if re.search(r"等于|相等", text):
+            return "eq"
+        return None
+
+    @staticmethod
+    def _regex_pattern(text: str) -> str | None:
+        anchored = re.search(r"(\^.*?\$)", text)
+        if anchored:
+            return anchored.group(1).strip("\"'“”‘’")
+        explicit = re.search(
+            r"(?:正则(?:表达式)?|匹配)\s*[:：]?\s*([^\s。；;]+)",
+            text,
+        )
+        if explicit:
+            candidate = explicit.group(1).strip("\"'“”‘’")
+            if candidate not in {"正则", "表达式", "格式"}:
+                return candidate
+        fixed = re.search(r"(\d+|[一二三四五六七八九十]+)\s*位\s*(?:数字|字符)", text)
+        if fixed:
+            number = fixed.group(1)
+            mapping = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+            length = int(number) if number.isdigit() else mapping.get(number)
+            if length is not None:
+                token = r"\d" if "数字" in fixed.group(0) else r"."
+                return rf"^{token}{{{length}}}$"
+        return None
+
+    @staticmethod
+    def _length_parameters(text: str) -> dict[str, int]:
+        fixed = re.search(r"长度\s*(?:为|是|等于)\s*(\d+)\s*(?:位|个字符|字符)?", text)
+        if fixed:
+            value = int(fixed.group(1))
+            return {"minimum": value, "maximum": value}
+        minimum = re.search(r"(?:至少|不少于|不低于)\s*(\d+)\s*(?:位|个字符|字符)?", text)
+        maximum = re.search(r"(?:至多|不超过|不多于|不高于)\s*(\d+)\s*(?:位|个字符|字符)?", text)
+        result: dict[str, int] = {}
+        if minimum:
+            result["minimum"] = int(minimum.group(1))
+        if maximum:
+            result["maximum"] = int(maximum.group(1))
+        return result
 
 
 def build_rule_input_guidance(
@@ -374,15 +551,18 @@ def build_rule_input_guidance(
             questions.append("缺少需要进行数值范围约束的字段名称。")
         if not re.search(r"-?\d+(?:\.\d+)?", text):
             questions.append("缺少数值下限、上限或完整的闭区间范围。")
-    if re.search(r"类型|格式|长度|正则|数据模型|元数据|权威参考|业务规则", lowered):
+    if re.search(r"跨表|外键|参照|自动清洗|自动修复|写回|删除", lowered):
         questions.append(
-            "当前 v0.7 规则引擎尚未支持类型、格式、长度、数据模型或参照数据规则；"
-            "如需继续，请提供可映射为必填、主键、更新时间、允许值或数值范围的具体条件，"
-            "否则需要先扩展 Rule DSL。"
+            "v0.8 暂不支持跨表参照、外键、自动清洗、数据写回或删除。"
+        )
+    if re.search(r"类型|格式|长度|正则|条件|比较|跨字段|数据模型|元数据|权威参考|业务规则", lowered):
+        questions.append(
+            "v0.8 支持格式/正则、字符长度、条件必填和跨字段比较；"
+            "请补充字段名称以及完整正则、长度边界、触发条件或比较运算符。"
         )
     if not questions:
         questions.append(
-            "缺少可执行规则类型；请补充字段名称，以及必填、唯一、允许值、更新时间或数值范围条件。"
+            "缺少可执行规则类型；请补充字段名称，以及必填、唯一、允许值、更新时间、数值范围、格式、长度、条件必填或跨字段比较条件。"
         )
     return tuple(dict.fromkeys(questions))[:5]
 
@@ -493,7 +673,7 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
     )
 
 
-_MODEL_SYSTEM_PROMPT = """你是政务数据质量规则编译器。只将用户依据编译为当前允许的五类 Rule DSL：primary_key、required、update_freshness、allowed_values、numeric_range。不得输出 Python、SQL、脚本或任意函数。关键字段、阈值、频率缺失时输出 clarification；超出白名单时输出 unsupported。只返回指定 JSON，不要 Markdown。"""
+_MODEL_SYSTEM_PROMPT = """你是政务数据质量规则编译器。只将用户依据编译为当前允许的 Rule DSL：primary_key、required、update_freshness、allowed_values、numeric_range、regex_format、string_length、conditional_required、field_comparison。不得输出 Python、SQL、脚本、外键、跨表查询或任意函数。关键字段、阈值、频率、正则、条件值或比较运算符缺失时输出 clarification；跨表参照、自动清洗、数据写回和删除需求输出 unsupported。只返回指定 JSON，不要 Markdown。"""
 
 
 class DeepSeekRuleAuthoringProvider:
@@ -621,6 +801,10 @@ class DeepSeekRuleAuthoringProvider:
                 "update_freshness",
                 "allowed_values",
                 "numeric_range",
+                "regex_format",
+                "string_length",
+                "conditional_required",
+                "field_comparison",
             ],
         }
         try:
