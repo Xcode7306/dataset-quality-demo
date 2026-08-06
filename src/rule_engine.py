@@ -112,6 +112,38 @@ class RuleEvaluationResult:
         )
 
 
+@dataclass(frozen=True)
+class RuleDryRunResult:
+    """v0.7 审批前试运行摘要；不携带原始值或问题位置明细。"""
+
+    rule_pack_id: str
+    rule_pack_version: str
+    metrics: tuple[Mapping[str, Any], ...]
+    checked_count: int
+    compliant_count: int
+    issue_count: int
+    not_assessable_count: int
+    issue_location_count: int
+    schema_version: str = "0.7"
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "schema_version": self.schema_version,
+            "rule_pack_id": self.rule_pack_id,
+            "rule_pack_version": self.rule_pack_version,
+            "metrics": [dict(metric) for metric in self.metrics],
+            "counts": {
+                "checked": self.checked_count,
+                "compliant": self.compliant_count,
+                "issues": self.issue_count,
+                "not_assessable": self.not_assessable_count,
+                "issue_locations": self.issue_location_count,
+            },
+        }
+        json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        return payload
+
+
 def _record_location(
     record_number: int,
     fields: Iterable[str],
@@ -992,6 +1024,68 @@ def _validate_dataframe_matches_baseline(
             ["规则引擎表格规模与当前绑定基线报告不一致。"]
         )
     return dataframe
+
+
+def dry_run_rule_pack_on_dataframe(
+    dataframe: pd.DataFrame,
+    baseline_report: QualityReport,
+    rule_pack: RulePack,
+) -> RuleDryRunResult:
+    """在审批前使用同一确定性规则语义生成影响摘要。
+
+    该入口只接受 draft RulePack，不生成审批记录，也不修改基线报告。
+    """
+
+    if not isinstance(rule_pack, RulePack) or rule_pack.status != "draft":
+        raise RulePackExecutionError(["试运行只接受未审批 RulePack 草案。"])
+    validation = validate_rule_pack(rule_pack, baseline_report)
+    if not validation.valid:
+        raise RulePackExecutionError(validation.errors)
+    dataframe = _validate_dataframe_matches_baseline(dataframe, baseline_report)
+    metrics = _calculate_business_metrics(dataframe, baseline_report, rule_pack)
+    summaries: list[Mapping[str, Any]] = []
+    checked_count = 0
+    compliant_count = 0
+    issue_count = 0
+    not_assessable_count = 0
+    issue_location_count = 0
+    for metric in metrics:
+        evidence = metric.evidence if isinstance(metric.evidence, Mapping) else {}
+        metric_checked = evidence.get("checked_count")
+        metric_compliant = evidence.get("compliant_count")
+        metric_issues = evidence.get("issue_count")
+        if isinstance(metric_checked, int) and not isinstance(metric_checked, bool):
+            checked_count += metric_checked
+        if isinstance(metric_compliant, int) and not isinstance(metric_compliant, bool):
+            compliant_count += metric_compliant
+        if isinstance(metric_issues, int) and not isinstance(metric_issues, bool):
+            issue_count += metric_issues
+        if metric.status == "not_assessable":
+            not_assessable_count += 1
+        issue_location_count += len(metric.issue_locations)
+        summaries.append(
+            {
+                "metric_key": metric.metric_key,
+                "name": metric.name,
+                "field": metric.field,
+                "status": metric.status,
+                "value": metric.value,
+                "checked_count": metric_checked,
+                "compliant_count": metric_compliant,
+                "issue_count": metric_issues,
+                "reason": metric.reason,
+            }
+        )
+    return RuleDryRunResult(
+        rule_pack_id=rule_pack.rule_pack_id,
+        rule_pack_version=rule_pack.version,
+        metrics=tuple(summaries),
+        checked_count=checked_count,
+        compliant_count=compliant_count,
+        issue_count=issue_count,
+        not_assessable_count=not_assessable_count,
+        issue_location_count=issue_location_count,
+    )
 
 
 def _evaluate_rule_pack_on_verified_dataframe(

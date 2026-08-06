@@ -9,7 +9,11 @@ import unittest
 from unittest.mock import patch
 
 import src.agent_service as agent_service
-from src.agent_providers import DeepSeekChatProvider, ProviderResult
+from src.agent_providers import (
+    DeepSeekChatProvider,
+    OpenAICompatibleChatProvider,
+    ProviderResult,
+)
 from src.agent_service import (
     agent_cache_size,
     clear_agent_cache,
@@ -339,6 +343,65 @@ class AgentSecurityAndFallbackTests(unittest.TestCase):
         self.assertTrue(second.audit.fallback_used)
         self.assertEqual(2, provider.calls)
         self.assertEqual(0, agent_cache_size())
+
+    def test_external_mode_never_replaces_failure_with_template(self):
+        provider = StaticProvider(RuntimeError("external endpoint unavailable"))
+
+        with self.assertRaisesRegex(RuntimeError, "external endpoint unavailable"):
+            run_agent(
+                StubReport(),
+                provider=provider,
+                use_cache=False,
+                allow_template_fallback=False,
+            )
+
+    def test_custom_provider_accepts_plain_text_without_tools(self):
+        requests: list[dict] = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "模型认为当前报告应先复核字段缺失风险。"
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 9},
+                }
+
+        class FakeClient:
+            def post(self, url, *, headers, json):
+                requests.append({"url": url, "headers": headers, "payload": json})
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        provider = OpenAICompatibleChatProvider(
+            api_key="page-test-key",
+            api_url="https://model.example/v1",
+            model="custom-chat-model",
+            client_factory=lambda **options: FakeClient(),
+        )
+        analysis = run_agent(
+            StubReport(),
+            provider=provider,
+            use_cache=False,
+            allow_template_fallback=False,
+        )
+
+        self.assertFalse(analysis.audit.fallback_used)
+        self.assertEqual("model", analysis.audit.mode)
+        self.assertIn("模型认为当前报告", analysis.answer.text)
+        self.assertEqual(7, analysis.audit.input_tokens)
+        self.assertEqual(9, analysis.audit.output_tokens)
+        self.assertEqual(1, len(requests))
+        self.assertNotIn("tools", requests[0]["payload"])
+        self.assertNotIn("tool_choice", requests[0]["payload"])
 
     def test_deepseek_must_read_at_least_one_tool_before_answering(self):
         class FakeResponse:

@@ -159,6 +159,9 @@ def _normalize_question(
 
 
 def _safe_provider_label(provider: Any) -> str:
+    configured_name = getattr(provider, "provider_name", None)
+    if isinstance(configured_name, str) and configured_name.strip():
+        return _safe_provider_value(configured_name)
     if isinstance(provider, TemplateAgentProvider):
         return "template"
     if isinstance(provider, DeepSeekChatProvider):
@@ -246,6 +249,8 @@ def _normalize_provider_result(
                     if isinstance(citation_id, str) and citation_id
                 )
             ),
+            portable_mode=generated.portable_mode,
+            unstructured_output=generated.unstructured_output,
         )
     return ProviderResult(
         payload=generated,
@@ -313,6 +318,45 @@ def _validate_citations_and_numbers(
             )
 
 
+def _normalize_portable_citations(
+    draft: Mapping[str, Any],
+    snapshot: ReportSnapshot,
+) -> dict[str, Any]:
+    """将普通兼容接口返回的引用收敛到当前报告已有证据。"""
+
+    normalized = deepcopy(dict(draft))
+    valid_ids = set(snapshot.citation_ids)
+    fallback_id = "report:summary" if "report:summary" in valid_ids else None
+    for collection_name in ("facts", "actions", "limitations"):
+        collection = normalized.get(collection_name, [])
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if not isinstance(item, dict):
+                continue
+            citations = item.get("citation_ids")
+            accepted = [
+                citation_id
+                for citation_id in citations
+                if isinstance(citation_id, str) and citation_id in valid_ids
+            ] if isinstance(citations, list) else []
+            item["citation_ids"] = list(dict.fromkeys(accepted))
+            if not item["citation_ids"] and fallback_id is not None:
+                item["citation_ids"] = [fallback_id]
+    answer = normalized.get("answer")
+    if isinstance(answer, dict):
+        citations = answer.get("citation_ids")
+        accepted = [
+            citation_id
+            for citation_id in citations
+            if isinstance(citation_id, str) and citation_id in valid_ids
+        ] if isinstance(citations, list) else []
+        answer["citation_ids"] = list(dict.fromkeys(accepted))
+        if not answer["citation_ids"] and fallback_id is not None:
+            answer["citation_ids"] = [fallback_id]
+    return normalized
+
+
 def _analysis_from_result(
     result: ProviderResult,
     *,
@@ -331,12 +375,23 @@ def _analysis_from_result(
 ) -> AgentAnalysis:
     if any(tool_name not in TOOL_NAMES for tool_name in result.tool_calls):
         raise AgentOutputValidationError("提供方声明了非白名单工具调用。")
-    draft = parse_provider_draft(result.payload)
+    draft = parse_provider_draft(
+        result.payload,
+        allow_compatibility=result.portable_mode,
+    )
+    if result.portable_mode:
+        draft = _normalize_portable_citations(draft, snapshot)
     _validate_citations_and_numbers(
         draft,
         snapshot,
         result.available_citation_ids,
-        validate_numbers=validate_numbers,
+        # 自定义兼容端点的输出格式和数字表达不统一；引用已收敛到白名单，
+        # 由确定性报告继续承担数字事实，不因格式差异丢失模型解读。
+        validate_numbers=(
+            validate_numbers
+            and not result.unstructured_output
+            and not result.portable_mode
+        ),
     )
     citation_ids = collect_draft_citation_ids(draft)
     citations = [snapshot.citation(citation_id) for citation_id in citation_ids]
@@ -474,12 +529,14 @@ def run_agent(
     question: str | None = None,
     provider: AgentProvider | None = None,
     use_cache: bool = True,
+    allow_template_fallback: bool = True,
 ) -> AgentAnalysis:
-    """只读解读质量报告，并在任何提供方失败时返回本地模板结果。
+    """只读解读质量报告；外部正式模式可禁止模板回退。
 
-    外部模型默认关闭。只有设置 ``QUALITY_AGENT_PROVIDER=deepseek`` 时才会
-    选择 DeepSeek；没有 key、HTTP 客户端、网络或合法输出时均自动回退，
-    不暴露异常详情。
+    外部模型默认关闭。调用方可以显式注入页面配置的兼容 Provider；未注入
+    Provider 时仍通过 ``QUALITY_AGENT_PROVIDER=deepseek`` 兼容选择 DeepSeek。
+    ``allow_template_fallback`` 仅用于无外部模型的暂行模式；正式外部模式应
+    关闭它，让 API、协议或模型输出错误直接返回调用方处理。
     """
 
     if intent not in SUPPORTED_INTENTS:
@@ -535,6 +592,11 @@ def run_agent(
         )
     except Exception as error:
         elapsed_ms = max(0, round((monotonic() - started) * 1000))
+        if not allow_template_fallback:
+            after = deepcopy(to_dict())
+            if after != before:
+                raise RuntimeError("Agent 调用期间质量报告发生变化。") from error
+            raise
         partial_result = getattr(error, "partial_result", None)
         if isinstance(partial_result, ProviderResult):
             attempted_result = _normalize_provider_result(

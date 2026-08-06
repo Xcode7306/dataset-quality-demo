@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rule-evidence.schema.json",
+  "title": "RuleEvidence v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "type",
+    "text",
+    "source_id",
+    "source_label",
+    "location",
+    "authoritative"
+  ],
+  "properties": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 120},
+    "type": {
+      "enum": [
+        "user_statement",
+        "metric_definition",
+        "standard_clause",
+        "data_dictionary",
+        "system_inference"
+      ]
+    },
+    "text": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "source_id": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "maxLength": 300}
+      ]
+    },
+    "source_label": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "maxLength": 300}
+      ]
+    },
+    "location": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "maxLength": 500}
+      ]
+    },
+    "authoritative": {"type": "boolean"}
+  }
+}

@@ -31,6 +31,11 @@ RuleType = Literal[
     "allowed_values",
     "numeric_range",
 ]
+RulePackSourceType = Literal[
+    "local_guided",
+    "user_natural_language",
+    "standard_retrieval",
+]
 RulePackStatus = Literal["draft", "approved"]
 JsonScalar = str | int | float | bool
 
@@ -112,9 +117,9 @@ class FieldSemanticMapping:
 
 @dataclass(frozen=True)
 class RulePackSource:
-    """规则草案来源；v0.4 默认是无需模型的本地引导。"""
+    """规则草案来源；保留 v0.4 本地引导并支持 v0.7 自然语言编制。"""
 
-    type: Literal["local_guided"]
+    type: RulePackSourceType
     generator: str
     generated_at: str
 
@@ -623,11 +628,15 @@ def validate_rule_pack(
     if not isinstance(pack.source, RulePackSource):
         errors.append("RulePack source 结构无效。")
     else:
-        if (
-            pack.source.type != "local_guided"
-            or pack.source.generator != RULE_PACK_GENERATOR
-        ):
-            errors.append("RulePack source 不在当前本地引导白名单中。")
+        expected_generators = {
+            "local_guided": RULE_PACK_GENERATOR,
+            "user_natural_language": "quality-rule-agent-v0.7",
+            "standard_retrieval": "quality-rule-agent-v0.9",
+        }
+        if pack.source.type not in expected_generators:
+            errors.append("RulePack source.type 不在当前白名单中。")
+        elif pack.source.generator != expected_generators[pack.source.type]:
+            errors.append("RulePack source.generator 与来源类型不匹配。")
         if not _is_valid_iso_utc(pack.source.generated_at):
             errors.append("RulePack source.generated_at 必须是 UTC 时间。")
 
@@ -756,8 +765,10 @@ def build_rule_pack(
     version: str,
     rules: Sequence[Rule],
     generated_at: datetime | str | None = None,
+    source_type: RulePackSourceType = "local_guided",
+    generator: str | None = None,
 ) -> RulePack:
-    """基于当前零配置报告创建仍未生效的本地引导草案。"""
+    """基于当前零配置报告创建仍未生效的 RulePack 草案。"""
 
     payload = _report_payload(report)
     if payload is None:
@@ -765,9 +776,16 @@ def build_rule_pack(
     context = payload.get("evaluation_context")
     if not isinstance(context, Mapping):
         raise RulePackValidationError(("当前报告缺少 evaluation_context。",))
+    allowed_generators = {
+        "local_guided": RULE_PACK_GENERATOR,
+        "user_natural_language": "quality-rule-agent-v0.7",
+        "standard_retrieval": "quality-rule-agent-v0.9",
+    }
+    if source_type not in allowed_generators:
+        raise RulePackValidationError(("RulePack 来源类型不在当前白名单中。",))
     source = RulePackSource(
-        type="local_guided",
-        generator=RULE_PACK_GENERATOR,
+        type=source_type,
+        generator=generator or allowed_generators[source_type],
         generated_at=_format_utc(generated_at),
     )
     typed_rules = tuple(rules)

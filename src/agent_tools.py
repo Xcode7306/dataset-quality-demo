@@ -952,6 +952,31 @@ class ReportSnapshot:
     def citation_ids(self) -> frozenset[str]:
         return frozenset(self._citations)
 
+    def get_portable_context(self) -> dict[str, Any]:
+        """返回不依赖工具调用的兼容模型上下文。
+
+        一些模型接口只支持普通 messages，不支持 tools 或 tool_choice。
+        该上下文仍只包含本模块已经生成的聚合证据，不包含原始单元格、样例值、
+        行号列表、文件名或执行错误。
+        """
+
+        return {
+            "report_summary": self.get_report_summary(),
+            "metrics": [
+                self.get_metric_evidence(metric_key=metric_key)
+                for metric_key in sorted(self._metrics)
+            ],
+            "risks": [
+                self.get_risk_evidence(risk_id=risk_id)
+                for risk_id in sorted(self._risks)
+            ],
+            "not_assessable": self.list_not_assessable(limit=20),
+            "citations": [
+                self.citation(citation_id).to_dict()
+                for citation_id in sorted(self._citations)
+            ],
+        }
+
     def citation(self, citation_id: str) -> AgentCitation:
         try:
             return self._citations[citation_id].citation
