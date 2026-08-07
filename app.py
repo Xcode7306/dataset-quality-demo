@@ -159,7 +159,7 @@ def _clear_agent_state() -> None:
     st.session_state.pop(AGENT_STATE_KEY, None)
 
 
-def _clear_rule_state() -> None:
+def _clear_rule_state(*, preserve_rag_binding: bool = False) -> None:
     """清除当前报告的规则草案、审批、增强结果及表单缓存。"""
 
     st.session_state.pop(RULE_STATE_KEY, None)
@@ -167,11 +167,13 @@ def _clear_rule_state() -> None:
     st.session_state.pop(CUSTOM_RULE_STATE_KEY, None)
     rag_state = st.session_state.get(RAG_STATE_KEY)
     if isinstance(rag_state, dict):
-        # 文档库属于当前会话的依据来源，不因更换业务数据而丢失；
-        # 但旧检索快照和绑定必须清空，避免 RuleDraft 跨报告复用。
-        rag_state.pop("response", None)
-        rag_state.pop("bound_response", None)
-        rag_state.pop("selected_chunk_ids", None)
+        # 文档库属于当前会话的依据来源，不因更换业务数据而丢失。
+        # 评估前已完成的检索绑定也可以继续用于本次规则编制；
+        # 已有报告切换到新输入时则必须清掉，避免 RuleDraft 跨报告复用。
+        if not preserve_rag_binding:
+            rag_state.pop("response", None)
+            rag_state.pop("bound_response", None)
+            rag_state.pop("selected_chunk_ids", None)
         st.session_state[RAG_STATE_KEY] = rag_state
     for key in RULE_WIDGET_KEYS:
         st.session_state.pop(key, None)
@@ -284,52 +286,6 @@ def _model_api_configuration() -> tuple[dict[str, str] | None, str | None]:
             "source": "environment",
         }, None
     return None, None
-
-
-def _render_rag_sidebar_inputs() -> None:
-    """把 RAG 文本输入放在侧栏，保持数据集/工作表控件的兼容顺序。"""
-
-    with st.expander("标准依据 RAG（v0.9）输入", expanded=False):
-        st.text_input(
-            "文档名称（可选）",
-            key="rag_document_title_v09",
-            max_chars=300,
-            placeholder="默认使用文档标题或文件名",
-        )
-        st.text_input(
-            "标准号（可选）",
-            key="rag_document_standard_v09",
-            max_chars=100,
-            placeholder="例如 DB31/T 1523-2024",
-        )
-        st.text_input(
-            "版本（可选）",
-            key="rag_document_version_v09",
-            max_chars=80,
-            placeholder="例如 2024、v0.9",
-        )
-        st.text_input(
-            "发布日期（可选）",
-            key="rag_document_published_v09",
-            max_chars=30,
-            placeholder="例如 2024-06-01",
-        )
-        st.text_input(
-            "检索问题或条款关键词",
-            key="rag_query_v09",
-            max_chars=2_000,
-            placeholder="例如：服务名称是否必填、更新频率、有效性",
-        )
-        st.text_input(
-            "按标准号筛选（可选）",
-            key="rag_search_standard_v09",
-            max_chars=100,
-        )
-        st.text_input(
-            "按版本筛选（可选）",
-            key="rag_search_version_v09",
-            max_chars=80,
-        )
 
 
 def _render_model_api_settings() -> None:
@@ -1164,7 +1120,6 @@ def _rule_form_signature(payload: dict) -> str:
 
 
 def _render_rag_panel(
-    report: QualityReport,
     *,
     selected_metric_ids: tuple[str, ...],
 ) -> None:
@@ -1177,6 +1132,24 @@ def _render_rag_panel(
     )
     state = _rag_ui_state()
     knowledge_base = state["knowledge_base"]
+
+    st.markdown("#### 1. 上传标准依据文档")
+    rag_file = st.file_uploader(
+        "选择标准依据文档",
+        type=["md", "markdown", "txt", "pdf"],
+        key="rag_document_upload_v09",
+        help=(
+            "支持 Markdown、TXT 和可抽取文本层的 PDF；"
+            "文档只在当前会话内存中处理，不会与业务数据混入。"
+        ),
+    )
+    if rag_file is None:
+        st.info("先上传一份标准、数据字典或用户规范，再确认来源并加入知识库。")
+    else:
+        st.caption(
+            f"已选择：{_escape_markdown(rag_file.name)}；"
+            "系统会自动识别标题、标准号、版本和发布日期。"
+        )
 
     summary = knowledge_base.summary()
     st.markdown("#### 当前已批准文档")
@@ -1207,24 +1180,43 @@ def _render_rag_panel(
     else:
         st.info("当前知识库没有已批准文档。")
 
-    with st.expander("添加标准、数据字典或用户规范", expanded=False):
-        rag_file = st.session_state.get("rag_document_upload_v09")
-        if rag_file is None:
-            st.info("请先在左侧“开始评估”区域选择标准依据文档。")
+    with st.expander(
+        "2. 确认来源并加入知识库（元数据可选）",
+        expanded=False,
+    ):
+        st.caption(
+            "通常只需选择用途并确认来源；下列文档信息留空时，会从正文自动识别。"
+        )
+        title = st.text_input(
+            "文档名称（可选）",
+            key="rag_document_title_v09",
+            max_chars=300,
+            placeholder="默认使用文档标题或文件名",
+        )
+        standard_number = st.text_input(
+            "标准号（可选）",
+            key="rag_document_standard_v09",
+            max_chars=100,
+            placeholder="例如 DB31/T 1523-2024",
+        )
+        version = st.text_input(
+            "版本（可选）",
+            key="rag_document_version_v09",
+            max_chars=80,
+            placeholder="例如 2024、v0.9",
+        )
+        published_at = st.text_input(
+            "发布日期（可选）",
+            key="rag_document_published_v09",
+            max_chars=30,
+            placeholder="例如 2024-06-01",
+        )
         namespace = st.selectbox(
             "文档用途",
             options=tuple(RAG_NAMESPACE_LABELS),
             format_func=lambda value: RAG_NAMESPACE_LABELS[value],
             key="rag_document_namespace_v09",
         )
-        title = str(st.session_state.get("rag_document_title_v09", "")).strip()
-        standard_number = str(
-            st.session_state.get("rag_document_standard_v09", "")
-        ).strip()
-        version = str(st.session_state.get("rag_document_version_v09", "")).strip()
-        published_at = str(
-            st.session_state.get("rag_document_published_v09", "")
-        ).strip()
         effective_status = st.selectbox(
             "生效状态",
             options=("active", "draft", "superseded", "expired", "unknown"),
@@ -1285,10 +1277,9 @@ def _render_rag_panel(
             "摄取并加入标准依据库",
             key="rag_ingest_document_v09",
             width="stretch",
+            disabled=rag_file is None,
         ):
-            if rag_file is None:
-                st.error("请先选择 Markdown、TXT 或 PDF 文档。")
-            elif not approved:
+            if not approved:
                 st.error("请先确认该文档可以作为标准依据来源。")
             elif existing_versions and not version_change_confirmed:
                 st.error("新增标准版本前，请先确认版本变化。")
@@ -1364,8 +1355,13 @@ def _render_rag_panel(
                 st.session_state[RAG_STATE_KEY] = state
                 st.success("文档已从当前会话知识库移除。")
 
-    st.markdown("#### 检索标准依据")
-    query = str(st.session_state.get("rag_query_v09", ""))
+    st.markdown("#### 3. 检索与绑定")
+    query = st.text_input(
+        "检索问题或条款关键词",
+        key="rag_query_v09",
+        max_chars=2_000,
+        placeholder="例如：服务名称是否必填、更新频率、有效性",
+    )
     metric_filter_options = ["__all__", *selected_metric_ids]
     metric_filter = st.selectbox(
         "按指标筛选（可选）",
@@ -1382,8 +1378,16 @@ def _render_rag_panel(
         ),
         key="rag_search_namespace_v09",
     )
-    standard_filter = str(st.session_state.get("rag_search_standard_v09", ""))
-    version_filter = str(st.session_state.get("rag_search_version_v09", ""))
+    standard_filter = st.text_input(
+        "按标准号筛选（可选）",
+        key="rag_search_standard_v09",
+        max_chars=100,
+    )
+    version_filter = st.text_input(
+        "按版本筛选（可选）",
+        key="rag_search_version_v09",
+        max_chars=80,
+    )
     if st.button(
         "检索标准依据",
         key="rag_search_v09",
@@ -2933,9 +2937,11 @@ _initialize_metric_selection_state()
 _initialize_metric_evidence_state()
 _initialize_model_api_state()
 report_is_displayed = st.session_state.get("quality_report") is not None
+rag_slot = st.empty()
 if not report_is_displayed:
     selected_metric_ids = _render_metric_selection_panel()
 else:
+    rag_slot.empty()
     selected_metric_ids = tuple(
         metric_id
         for metric_id in ALL_METRIC_IDS
@@ -2963,15 +2969,6 @@ with st.sidebar:
             f"单文件上限 {MAX_INPUT_FILE_MIB} MiB。"
         ),
     )
-    st.file_uploader(
-        "选择标准依据文档（RAG，可选）",
-        type=["md", "markdown", "txt", "pdf"],
-        key="rag_document_upload_v09",
-        help=(
-            "v0.9 支持 Markdown、TXT 和可抽取文本层的 PDF；"
-            "文档只在当前会话内存中处理，不会与业务数据混入。"
-        ),
-    )
     dataset_name = st.text_input(
         "数据集名称（可选）",
         placeholder="默认使用文件名",
@@ -2991,7 +2988,6 @@ with st.sidebar:
             placeholder="默认读取第一个工作表",
         )
     _render_model_api_settings()
-    _render_rag_sidebar_inputs()
     request_signature = _evaluation_request_signature(
         uploaded_file,
         dataset_name,
@@ -3004,7 +3000,7 @@ with st.sidebar:
         st.session_state["evaluation_request_signature"] = request_signature
         st.session_state.pop("quality_report", None)
         _clear_agent_state()
-        _clear_rule_state()
+        _clear_rule_state(preserve_rag_binding=not had_report)
         if had_report:
             st.rerun()
     if not report_is_displayed:
@@ -3024,6 +3020,12 @@ with st.sidebar:
         run_evaluation = False
     st.caption("原始文件仅写入临时目录用于本次计算，评估结束后自动删除。")
 
+if not report_is_displayed:
+    with rag_slot.container():
+        rag_tab = st.tabs(["标准依据 RAG"])[0]
+        with rag_tab:
+            _render_rag_panel(selected_metric_ids=selected_metric_ids)
+
 if (
     run_evaluation
     and uploaded_file is not None
@@ -3031,7 +3033,7 @@ if (
     and not missing_metric_evidence_ids
 ):
     _clear_agent_state()
-    _clear_rule_state()
+    _clear_rule_state(preserve_rag_binding=True)
     with st.spinner("正在解析文件并计算质量指标……"):
         try:
             st.session_state["quality_report"] = evaluate_uploaded_dataset(
@@ -3046,18 +3048,19 @@ if (
         except (DatasetReadError, UnsupportedFileTypeError) as error:
             st.session_state.pop("quality_report", None)
             _clear_agent_state()
-            _clear_rule_state()
+            _clear_rule_state(preserve_rag_binding=True)
             st.error(_escape_markdown(f"评估未能启动：{error}"))
         except Exception:  # 防止界面中断，且不暴露本地路径等环境细节
             st.session_state.pop("quality_report", None)
             _clear_agent_state()
-            _clear_rule_state()
+            _clear_rule_state(preserve_rag_binding=True)
             st.error("评估未能启动：运行环境或临时文件不可用，请重试。")
 
 report = st.session_state.get("quality_report")
 if report is None:
     st.info(
-        "请从左侧上传 CSV、Excel、JSON、JSONL、GeoJSON 或 ZIP 文件。"
+        "可以先在“标准依据 RAG”中上传标准文档；准备好业务数据后，"
+        "再从左侧上传 CSV、Excel、JSON、JSONL、GeoJSON 或 ZIP 文件。"
     )
 else:
     _agent_state_for(report)
@@ -3105,7 +3108,6 @@ else:
         _render_agent(report)
     with rag_tab:
         _render_rag_panel(
-            report,
             selected_metric_ids=selected_metric_ids,
         )
     with authoring_tab:
