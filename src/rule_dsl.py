@@ -1,4 +1,4 @@
-"""v0.8 规则编制领域协议。
+"""v0.9 规则编制领域协议。
 
 本模块只保存“用户依据 → 规则草案”的结构化结果，不负责审批或正式执行。
 可执行规则复用 ``src.rule_pack.Rule`` 和现有确定性引擎。
@@ -20,6 +20,7 @@ from .rule_pack import Rule, SUPPORTED_RULE_TYPES
 RULE_DRAFT_SCHEMA_VERSION = "0.1"
 RULE_DRAFT_GENERATOR = "quality-rule-agent-v0.7"
 RULE_DRAFT_GENERATOR_V08 = "quality-rule-agent-v0.8"
+RULE_DRAFT_GENERATOR_V09 = "quality-rule-agent-v0.9"
 MAX_USER_INTENT_LENGTH = 4000
 MAX_CLARIFICATION_QUESTIONS = 5
 MAX_EVIDENCE_ITEMS = 20
@@ -165,6 +166,13 @@ class RuleEvidence:
     source_label: str | None = None
     location: str | None = None
     authoritative: bool = False
+    document_id: str | None = None
+    document_name: str | None = None
+    document_version: str | None = None
+    section: str | None = None
+    clause: str | None = None
+    chunk_id: str | None = None
+    page: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +183,13 @@ class RuleEvidence:
             "source_label": self.source_label,
             "location": self.location,
             "authoritative": self.authoritative,
+            "document_id": self.document_id,
+            "document_name": self.document_name,
+            "document_version": self.document_version,
+            "section": self.section,
+            "clause": self.clause,
+            "chunk_id": self.chunk_id,
+            "page": self.page,
         }
 
 
@@ -495,10 +510,25 @@ def validate_rule_draft_shape(draft: RuleDraft) -> RuleDraftValidationResult:
             errors.append(f"依据类型“{item.type}”不受支持。")
         errors.extend(_validate_text(item.id, "evidence.id", 120))
         errors.extend(_validate_text(item.text, "evidence.text", 4000))
-        if item.type == "standard_clause" and not item.source_id:
-            errors.append("standard_clause 必须包含 source_id。")
+        if item.type in {"standard_clause", "data_dictionary"}:
+            if not item.source_id:
+                errors.append(f"{item.type} 必须包含 source_id。")
+            if not item.document_name:
+                errors.append(f"{item.type} 必须包含 document_name。")
+            if not item.document_version:
+                errors.append(f"{item.type} 必须包含 document_version。")
+            if not item.section and not item.clause:
+                errors.append(f"{item.type} 必须包含 section 或 clause 定位。")
+            if not item.chunk_id:
+                errors.append(f"{item.type} 必须包含 chunk_id。")
+            if item.source_id and item.chunk_id and item.source_id != item.chunk_id:
+                errors.append(f"{item.type} 的 source_id 必须等于 chunk_id。")
         if item.type == "system_inference" and item.authoritative:
             errors.append("system_inference 不能标记为 authoritative。")
+        if item.page is not None and (
+            isinstance(item.page, bool) or not isinstance(item.page, int) or item.page < 1
+        ):
+            errors.append("依据 page 必须是正整数或 null。")
     if len(draft.clarification_questions) > MAX_CLARIFICATION_QUESTIONS:
         errors.append("clarification_questions 最多包含 5 个问题。")
     for item in (*draft.assumptions, *draft.clarification_questions):
@@ -533,10 +563,30 @@ def new_evidence(
     source_label: str | None = None,
     location: str | None = None,
     authoritative: bool = False,
+    document_id: str | None = None,
+    document_name: str | None = None,
+    document_version: str | None = None,
+    section: str | None = None,
+    clause: str | None = None,
+    chunk_id: str | None = None,
+    page: int | None = None,
 ) -> RuleEvidence:
     evidence_id = _content_id(
         "evidence",
-        [evidence_type, text, source_id, source_label, location],
+        [
+            evidence_type,
+            text,
+            source_id,
+            source_label,
+            location,
+            document_id,
+            document_name,
+            document_version,
+            section,
+            clause,
+            chunk_id,
+            page,
+        ],
     )
     return RuleEvidence(
         id=evidence_id,
@@ -546,6 +596,13 @@ def new_evidence(
         source_label=source_label,
         location=location,
         authoritative=authoritative,
+        document_id=document_id,
+        document_name=document_name,
+        document_version=document_version,
+        section=section,
+        clause=clause,
+        chunk_id=chunk_id,
+        page=page,
     )
 
 
@@ -627,6 +684,7 @@ __all__ = [
     "ProviderMetadata",
     "RULE_DRAFT_GENERATOR",
     "RULE_DRAFT_GENERATOR_V08",
+    "RULE_DRAFT_GENERATOR_V09",
     "RULE_DRAFT_SCHEMA_VERSION",
     "RuleDraft",
     "RuleDraftStatus",

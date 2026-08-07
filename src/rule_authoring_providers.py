@@ -1,4 +1,4 @@
-"""v0.7 规则编制 Provider：本地模板 + 可选 Chat Completions 适配。
+"""v0.9 规则编制 Provider：本地模板 + 可选 Chat Completions 适配。
 
 Provider 只负责把用户自然语言解析成候选结构，不拥有审批或执行权限。
 当外部模型不可用时，模板 Provider 保证本地功能仍可使用。
@@ -28,7 +28,7 @@ from .model_api import (
 )
 
 
-RULE_AUTHORING_PROMPT_VERSION = "quality-rule-authoring-v0.8.0"
+RULE_AUTHORING_PROMPT_VERSION = "quality-rule-authoring-v0.9.0"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -616,6 +616,45 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
         raise RuleAuthoringProviderError("模型返回的假设或澄清问题数量超出限制。")
     if any(len(item) > 2000 or not item.strip() for item in (*assumptions, *questions)):
         raise RuleAuthoringProviderError("模型返回的假设或澄清问题包含空值或超长文本。")
+    raw_evidence = payload.get("evidence", [])
+    if not isinstance(raw_evidence, list) or len(raw_evidence) > 20:
+        raise RuleAuthoringProviderError("模型返回的 evidence 必须是不超过 20 项的数组。")
+    evidence: list[RuleEvidence] = []
+    for index, item in enumerate(raw_evidence):
+        if not isinstance(item, Mapping):
+            raise RuleAuthoringProviderError(f"evidence[{index}] 必须是对象。")
+        evidence_type = item.get("type")
+        if evidence_type not in {"standard_clause", "data_dictionary"}:
+            raise RuleAuthoringProviderError(
+                "模型只能引用 standard_clause 或 data_dictionary 依据。"
+            )
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+            raise RuleAuthoringProviderError(
+                f"evidence[{index}].text 必须是 1 到 4000 个字符。"
+            )
+        page = item.get("page")
+        if page is not None and (
+            isinstance(page, bool) or not isinstance(page, int) or page < 1
+        ):
+            raise RuleAuthoringProviderError(f"evidence[{index}].page 无效。")
+        evidence.append(
+            new_evidence(
+                evidence_type,  # type: ignore[arg-type]
+                text,
+                source_id=item.get("source_id"),
+                source_label=item.get("source_label"),
+                location=item.get("location"),
+                authoritative=bool(item.get("authoritative", False)),
+                document_id=item.get("document_id"),
+                document_name=item.get("document_name"),
+                document_version=item.get("document_version"),
+                section=item.get("section"),
+                clause=item.get("clause"),
+                chunk_id=item.get("chunk_id"),
+                page=page,
+            )
+        )
     rule_spec_payload = payload["rule_spec"]
     rule_spec = None
     if rule_spec_payload is not None:
@@ -666,6 +705,7 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
     return RuleAuthoringProviderResult(
         outcome=outcome,
         rule_spec=rule_spec,
+        evidence=tuple(evidence),
         assumptions=tuple(assumptions[:20]),
         clarification_questions=tuple(questions[:5]),
         unsupported_reason=unsupported_reason,
@@ -673,7 +713,7 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
     )
 
 
-_MODEL_SYSTEM_PROMPT = """你是政务数据质量规则编译器。只将用户依据编译为当前允许的 Rule DSL：primary_key、required、update_freshness、allowed_values、numeric_range、regex_format、string_length、conditional_required、field_comparison。不得输出 Python、SQL、脚本、外键、跨表查询或任意函数。关键字段、阈值、频率、正则、条件值或比较运算符缺失时输出 clarification；跨表参照、自动清洗、数据写回和删除需求输出 unsupported。只返回指定 JSON，不要 Markdown。"""
+_MODEL_SYSTEM_PROMPT = """你是政务数据质量规则编译器。只将用户依据编译为当前允许的 Rule DSL：primary_key、required、update_freshness、allowed_values、numeric_range、regex_format、string_length、conditional_required、field_comparison。不得输出 Python、SQL、脚本、外键、跨表查询或任意函数。关键字段、阈值、频率、正则、条件值或比较运算符缺失时输出 clarification；跨表参照、自动清洗、数据写回和删除需求输出 unsupported。若输入包含 rag_evidence，只能引用其中真实存在的 chunk_id，不能创建文档、版本或条款；没有检索依据时不得声称符合标准。只返回指定 JSON，不要 Markdown。"""
 
 
 class DeepSeekRuleAuthoringProvider:
@@ -788,13 +828,24 @@ class DeepSeekRuleAuthoringProvider:
         client, headers = self._client()
         request_id = make_rule_id(
             "request",
-            [str(context.get("report_sha256", "")), user_intent],
+            [
+                str(context.get("report_sha256", "")),
+                user_intent,
+                str(context.get("rag", {}).get("chunk_ids", []))
+                if isinstance(context.get("rag"), Mapping)
+                else "",
+            ],
         )
         prompt = {
             "user_intent": user_intent,
             "metric": context.get("metric"),
             "fields": context.get("fields", []),
             "profile_summary": context.get("profile_summary", {}),
+            "rag_evidence": (
+                context.get("rag", {}).get("results", [])
+                if isinstance(context.get("rag"), Mapping)
+                else []
+            ),
             "allowed_rule_types": [
                 "primary_key",
                 "required",
@@ -817,7 +868,7 @@ class DeepSeekRuleAuthoringProvider:
                         {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
                         {
                             "role": "user",
-                            "content": json.dumps(
+                    "content": json.dumps(
                                 prompt, ensure_ascii=False, separators=(",", ":")
                             ),
                         },

@@ -1,4 +1,4 @@
-"""v0.4 RulePack 协议、引导建议、确定性校验与本地审批。
+"""v0.9 RulePack 协议、引导建议、确定性校验与本地审批。
 
 RulePack 与 ``QualityReport``、``AgentAnalysis`` 相互独立。模型或页面可以
 提出草案，但只有本模块生成的审批记录、且仍绑定当前报告与输入的规则包才可
@@ -214,6 +214,7 @@ class RulePack:
     rules: tuple[Rule, ...]
     approval: ApprovalRecord | None = None
     schema_version: str = RULE_PACK_SCHEMA_VERSION
+    evidence: tuple[Mapping[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -228,6 +229,7 @@ class RulePack:
             "source": self.source.to_dict(),
             "field_semantics": self.field_semantics.to_dict(),
             "rules": [rule.to_dict() for rule in self.rules],
+            "evidence": [dict(item) for item in self.evidence],
             "approval": (
                 self.approval.to_dict()
                 if self.approval is not None
@@ -315,6 +317,7 @@ def _draft_payload(pack: RulePack) -> dict[str, Any]:
         "source": pack.source.to_dict(),
         "field_semantics": pack.field_semantics.to_dict(),
         "rules": [rule.to_dict() for rule in pack.rules],
+        "evidence": [dict(item) for item in pack.evidence],
     }
 
 
@@ -797,6 +800,31 @@ def validate_rule_pack(
     if report_status != "success":
         errors.append("只有成功的零配置报告可以生成或执行 RulePack。")
 
+    if not isinstance(pack.evidence, tuple):
+        errors.append("RulePack evidence 必须是元组。")
+        evidence_items: tuple[Any, ...] = ()
+    else:
+        evidence_items = pack.evidence
+    if len(evidence_items) > 20:
+        errors.append("RulePack evidence 最多包含 20 条依据。")
+    for index, item in enumerate(evidence_items):
+        if not isinstance(item, Mapping):
+            errors.append(f"RulePack evidence[{index}] 必须是对象。")
+            continue
+        evidence_type = item.get("type")
+        if evidence_type not in {
+            "user_statement",
+            "metric_definition",
+            "standard_clause",
+            "data_dictionary",
+            "system_inference",
+        }:
+            errors.append(f"RulePack evidence[{index}] 类型不受支持。")
+        try:
+            json.dumps(dict(item), ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            errors.append(f"RulePack evidence[{index}] 不能安全序列化。")
+
     try:
         current_draft_hash = draft_sha256(pack)
     except (TypeError, ValueError, UnicodeError):
@@ -857,6 +885,20 @@ def validate_rule_pack(
             errors.append("RulePack source.generator 与来源类型不匹配。")
         if not _is_valid_iso_utc(pack.source.generated_at):
             errors.append("RulePack source.generated_at 必须是 UTC 时间。")
+        if pack.source.type == "standard_retrieval" and not any(
+            isinstance(item, Mapping)
+            and (
+                item.get("type") in {"standard_clause", "data_dictionary"}
+                or (
+                    item.get("type") == "user_statement"
+                    and item.get("chunk_id")
+                    and item.get("document_name")
+                    and item.get("document_version")
+                )
+            )
+            for item in evidence_items
+        ):
+            errors.append("standard_retrieval RulePack 必须绑定至少一条可定位来源。")
 
     fields, inferred_types, profile = _profile_columns(payload or {})
     field_set = frozenset(fields)
@@ -985,6 +1027,7 @@ def build_rule_pack(
     generated_at: datetime | str | None = None,
     source_type: RulePackSourceType = "local_guided",
     generator: str | None = None,
+    evidence: Sequence[Mapping[str, Any]] = (),
 ) -> RulePack:
     """基于当前零配置报告创建仍未生效的 RulePack 草案。"""
 
@@ -1019,6 +1062,7 @@ def build_rule_pack(
         field_semantics=_mapping_from_rules(typed_rules),
         rules=typed_rules,
         approval=None,
+        evidence=tuple(dict(item) for item in evidence),
     )
     try:
         pack = replace(pack, rule_pack_id=_rule_pack_id(pack))

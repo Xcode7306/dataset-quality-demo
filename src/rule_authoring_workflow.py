@@ -1,4 +1,4 @@
-"""v0.7 规则编制状态机。
+"""v0.9 规则编制状态机。
 
 状态由本地代码控制，Provider 只能提供候选 RuleDraft，不能指定审批或执行
 状态。这个轻量状态机先独立于 LangGraph，后续可作为图节点的领域内核。
@@ -65,6 +65,11 @@ class RuleAuthoringWorkflow:
                 f"工作流不能从 {self.state} 转换到 {state}。"
             )
         return replace(self, state=state, **updates)
+
+    def start_retrieving(self) -> "RuleAuthoringWorkflow":
+        """进入标准依据检索阶段；检索本身仍由只读本地工具完成。"""
+
+        return self._transition("retrieving", error=None)
 
     def start_compiling(self) -> "RuleAuthoringWorkflow":
         return self._transition("compiling", error=None)

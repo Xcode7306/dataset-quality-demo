@@ -1,4 +1,4 @@
-"""v0.7 规则编制工具。
+"""v0.9 规则编制工具。
 
 这些工具只从指标目录和脱敏画像构建上下文，不读取原始单元格值，也不执行
 审批、文件写入或正式规则重评。
@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .metric_catalog import get_metric_definition
 
@@ -91,7 +91,113 @@ def get_profile_summary_tool(report: Any) -> dict[str, Any]:
     }
 
 
-def build_rule_authoring_context(report: Any, metric_id: str) -> dict[str, Any]:
+def retrieve_rule_evidence_tool(
+    knowledge_base: Any,
+    query: str,
+    *,
+    metric_id: str | None = None,
+    standard_number: str | None = None,
+    version: str | None = None,
+    source_namespace: str | None = None,
+    limit: int = 5,
+) -> dict[str, Any]:
+    """只读检索已批准标准依据，并返回可绑定的片段快照。
+
+    该工具不接收报告或原始数据，Provider 也只能引用返回结果中的
+    ``chunk_id``；空结果和来源冲突会原样暴露给上层工作流。
+    """
+
+    search = getattr(knowledge_base, "search", None)
+    if not callable(search):
+        raise TypeError("knowledge_base 必须提供 search()。")
+    response = search(
+        query,
+        metric_id=metric_id,
+        standard_number=standard_number,
+        version=version,
+        source_namespace=source_namespace,
+        limit=limit,
+    )
+    to_dict = getattr(response, "to_dict", None)
+    if not callable(to_dict):
+        raise TypeError("knowledge_base.search() 必须返回可序列化的 RAG 响应。")
+    payload = to_dict(include_text=True)
+    if not isinstance(payload, Mapping):
+        raise TypeError("RAG 响应必须是对象。")
+    return dict(payload)
+
+
+def _rag_context(
+    response: Any | None,
+    *,
+    selected_chunk_ids: Iterable[str] = (),
+) -> dict[str, Any] | None:
+    if response is None:
+        return None
+    to_dict = getattr(response, "to_dict", None)
+    if not callable(to_dict):
+        raise TypeError("rag response 必须提供 to_dict()。")
+    payload = to_dict(include_text=True)
+    if not isinstance(payload, Mapping):
+        raise TypeError("rag response.to_dict() 必须返回对象。")
+    results = payload.get("results", [])
+    selected = list(dict.fromkeys(str(item) for item in selected_chunk_ids))
+    result_ids = {
+        str(item.get("chunk_id"))
+        for item in results
+        if isinstance(item, Mapping) and item.get("chunk_id")
+    } if isinstance(results, list) else set()
+    if selected and not set(selected).issubset(result_ids):
+        raise ValueError("RAG 绑定片段必须来自本次检索结果。")
+    return {
+        "status": payload.get("status"),
+        "query": payload.get("query"),
+        "namespace": payload.get("namespace"),
+        "metric_id": payload.get("metric_id"),
+        "standard_number": payload.get("standard_number"),
+        "version": payload.get("version"),
+        "chunk_ids": selected,
+        "document_versions": sorted(
+            {
+                str(item.get("document_name"))
+                + "@"
+                + str(item.get("document_version") or "未标注版本")
+                for item in results
+                if isinstance(item, Mapping) and item.get("document_name")
+            }
+        ) if isinstance(results, list) else [],
+        "results": [
+            {
+                key: item.get(key)
+                for key in (
+                    "chunk_id",
+                    "document_id",
+                    "document_name",
+                    "document_version",
+                    "standard_number",
+                    "section",
+                    "clause",
+                    "page",
+                    "line_start",
+                    "line_end",
+                    "text",
+                )
+                if key in item
+            }
+            for item in results
+            if isinstance(item, Mapping)
+        ][:20],
+        "conflict": payload.get("conflict"),
+    }
+
+
+def build_rule_authoring_context(
+    report: Any,
+    metric_id: str,
+    *,
+    rag_response: Any | None = None,
+    selected_chunk_ids: Iterable[str] = (),
+) -> dict[str, Any]:
     """返回给 Provider 的最小上下文白名单。"""
 
     payload = _report_payload(report)
@@ -99,7 +205,7 @@ def build_rule_authoring_context(report: Any, metric_id: str) -> dict[str, Any]:
     context = context if isinstance(context, Mapping) else {}
     metric = get_metric_definition_tool(metric_id)
     fields = list_available_fields_tool(report)["fields"]
-    return {
+    result = {
         "report_sha256": context.get("report_sha256"),
         "input_sha256": context.get("input_sha256"),
         "reference_date": context.get("reference_date"),
@@ -111,12 +217,29 @@ def build_rule_authoring_context(report: Any, metric_id: str) -> dict[str, Any]:
         "fields": fields,
         "profile_summary": get_profile_summary_tool(report),
     }
+    rag = _rag_context(
+        rag_response,
+        selected_chunk_ids=selected_chunk_ids,
+    )
+    if rag is not None:
+        result["rag"] = rag
+    return result
 
 
-def build_custom_rule_authoring_context(report: Any) -> dict[str, Any]:
+def build_custom_rule_authoring_context(
+    report: Any,
+    *,
+    rag_response: Any | None = None,
+    selected_chunk_ids: Iterable[str] = (),
+) -> dict[str, Any]:
     """返回自定义规则编译所需的脱敏上下文，不绑定目录指标。"""
 
-    context = build_rule_authoring_context(report, "")
+    context = build_rule_authoring_context(
+        report,
+        "",
+        rag_response=rag_response,
+        selected_chunk_ids=selected_chunk_ids,
+    )
     context["target_type"] = "custom_rule"
     return context
 
@@ -127,4 +250,5 @@ __all__ = [
     "get_metric_definition_tool",
     "get_profile_summary_tool",
     "list_available_fields_tool",
+    "retrieve_rule_evidence_tool",
 ]

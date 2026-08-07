@@ -57,6 +57,18 @@ from src.rule_authoring_providers import (
 )
 from src.rule_dsl import RuleDraftValidationError
 from src.rule_authoring_tools import build_rule_authoring_context
+from src.rag.citations import response_source_summary
+from src.rag.ingestion import RagIngestionError
+from src.rag.models import (
+    RAG_NAMESPACE_DATA_DICTIONARY,
+    RAG_NAMESPACE_STANDARDS,
+    RAG_NAMESPACE_USER_SPEC,
+)
+from src.rag.retrieval import (
+    RagKnowledgeBase,
+    RagRetrievalError,
+    build_default_knowledge_base,
+)
 from src.rule_pack import (
     Rule,
     MAX_RULE_NUMBER_ABS,
@@ -80,6 +92,7 @@ AGENT_STATE_KEY = "agent_ui_state"
 RULE_STATE_KEY = "rule_ui_state"
 RULE_AUTHORING_STATE_KEY = "rule_authoring_ui_state"
 CUSTOM_RULE_STATE_KEY = "custom_rule_ui_state"
+RAG_STATE_KEY = "rag_ui_state"
 METRIC_SELECTION_KEY = "selected_metric_ids"
 METRIC_SELECTION_WIDGET_PREFIX = "metric_selection_checkbox_"
 METRIC_EVIDENCE_WIDGET_PREFIX = "metric_evidence_"
@@ -119,6 +132,12 @@ RULE_FREQUENCIES = {
     "每年（366 天）": ("yearly", 366),
     "自定义天数": ("custom", None),
 }
+RAG_NAMESPACE_LABELS = {
+    RAG_NAMESPACE_STANDARDS: "标准文件",
+    RAG_NAMESPACE_DATA_DICTIONARY: "数据字典",
+    RAG_NAMESPACE_USER_SPEC: "用户规范",
+}
+RAG_ALL_NAMESPACE_LABEL = "全部已批准来源"
 
 METRIC_PRESET_BUTTON_KEYS = {
     "default": "metric_preset_default",
@@ -146,8 +165,57 @@ def _clear_rule_state() -> None:
     st.session_state.pop(RULE_STATE_KEY, None)
     st.session_state.pop(RULE_AUTHORING_STATE_KEY, None)
     st.session_state.pop(CUSTOM_RULE_STATE_KEY, None)
+    rag_state = st.session_state.get(RAG_STATE_KEY)
+    if isinstance(rag_state, dict):
+        # 文档库属于当前会话的依据来源，不因更换业务数据而丢失；
+        # 但旧检索快照和绑定必须清空，避免 RuleDraft 跨报告复用。
+        rag_state.pop("response", None)
+        rag_state.pop("bound_response", None)
+        rag_state.pop("selected_chunk_ids", None)
+        st.session_state[RAG_STATE_KEY] = rag_state
     for key in RULE_WIDGET_KEYS:
         st.session_state.pop(key, None)
+
+
+def _rag_ui_state() -> dict:
+    """返回绑定当前报告会话的本地 RAG 状态。"""
+
+    state = st.session_state.get(RAG_STATE_KEY)
+    if not isinstance(state, dict):
+        state = {}
+    knowledge_base = state.get("knowledge_base")
+    if not isinstance(knowledge_base, RagKnowledgeBase):
+        state["knowledge_base"] = build_default_knowledge_base()
+    st.session_state[RAG_STATE_KEY] = state
+    return state
+
+
+def _current_rag_binding() -> tuple[object | None, tuple[str, ...]]:
+    """返回已由用户明确绑定到下一次规则编制的 RAG 响应。"""
+
+    state = st.session_state.get(RAG_STATE_KEY)
+    if not isinstance(state, dict):
+        return None, ()
+    response = state.get("bound_response")
+    chunk_ids = tuple(
+        str(item)
+        for item in state.get("selected_chunk_ids", ())
+        if isinstance(item, str) and item
+    )
+    if response is None or not chunk_ids:
+        return None, ()
+    return response, chunk_ids
+
+
+def _rag_binding_signature() -> dict[str, object]:
+    """把来源绑定纳入规则草案签名，避免沿用旧版本依据。"""
+
+    response, chunk_ids = _current_rag_binding()
+    return {
+        "rag_query": getattr(response, "query", None),
+        "rag_status": getattr(response, "status", None),
+        "rag_chunk_ids": list(chunk_ids),
+    }
 
 
 def _metric_checkbox_key(metric_id: str) -> str:
@@ -216,6 +284,52 @@ def _model_api_configuration() -> tuple[dict[str, str] | None, str | None]:
             "source": "environment",
         }, None
     return None, None
+
+
+def _render_rag_sidebar_inputs() -> None:
+    """把 RAG 文本输入放在侧栏，保持数据集/工作表控件的兼容顺序。"""
+
+    with st.expander("标准依据 RAG（v0.9）输入", expanded=False):
+        st.text_input(
+            "文档名称（可选）",
+            key="rag_document_title_v09",
+            max_chars=300,
+            placeholder="默认使用文档标题或文件名",
+        )
+        st.text_input(
+            "标准号（可选）",
+            key="rag_document_standard_v09",
+            max_chars=100,
+            placeholder="例如 DB31/T 1523-2024",
+        )
+        st.text_input(
+            "版本（可选）",
+            key="rag_document_version_v09",
+            max_chars=80,
+            placeholder="例如 2024、v0.9",
+        )
+        st.text_input(
+            "发布日期（可选）",
+            key="rag_document_published_v09",
+            max_chars=30,
+            placeholder="例如 2024-06-01",
+        )
+        st.text_input(
+            "检索问题或条款关键词",
+            key="rag_query_v09",
+            max_chars=2_000,
+            placeholder="例如：服务名称是否必填、更新频率、有效性",
+        )
+        st.text_input(
+            "按标准号筛选（可选）",
+            key="rag_search_standard_v09",
+            max_chars=100,
+        )
+        st.text_input(
+            "按版本筛选（可选）",
+            key="rag_search_version_v09",
+            max_chars=80,
+        )
 
 
 def _render_model_api_settings() -> None:
@@ -1049,6 +1163,329 @@ def _rule_form_signature(payload: dict) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _render_rag_panel(
+    report: QualityReport,
+    *,
+    selected_metric_ids: tuple[str, ...],
+) -> None:
+    """渲染 v0.9 标准依据摄取、检索、冲突提示和引用绑定。"""
+
+    st.subheader("标准依据 RAG（v0.9）")
+    st.caption(
+        "仅从项目预置或用户明确批准的标准、数据字典和用户规范中检索。"
+        "结果带文档、版本、条款/章节和稳定 chunk ID；没有可定位来源时，不会形成标准合规依据。"
+    )
+    state = _rag_ui_state()
+    knowledge_base = state["knowledge_base"]
+
+    summary = knowledge_base.summary()
+    st.markdown("#### 当前已批准文档")
+    documents = summary.get("documents", [])
+    if documents:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "文档": item.get("title", "—"),
+                        "标准号": item.get("standard_number") or "—",
+                        "版本": item.get("version") or "未标注",
+                        "解析时间": item.get("ingested_at", "—"),
+                        "用途": RAG_NAMESPACE_LABELS.get(
+                            item.get("source_namespace"),
+                            item.get("source_namespace", "—"),
+                        ),
+                        "状态": item.get("effective_status", "—"),
+                        "片段数": item.get("chunk_count", 0),
+                    }
+                    for item in documents
+                    if isinstance(item, dict)
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.info("当前知识库没有已批准文档。")
+
+    with st.expander("添加标准、数据字典或用户规范", expanded=False):
+        rag_file = st.session_state.get("rag_document_upload_v09")
+        if rag_file is None:
+            st.info("请先在左侧“开始评估”区域选择标准依据文档。")
+        namespace = st.selectbox(
+            "文档用途",
+            options=tuple(RAG_NAMESPACE_LABELS),
+            format_func=lambda value: RAG_NAMESPACE_LABELS[value],
+            key="rag_document_namespace_v09",
+        )
+        title = str(st.session_state.get("rag_document_title_v09", "")).strip()
+        standard_number = str(
+            st.session_state.get("rag_document_standard_v09", "")
+        ).strip()
+        version = str(st.session_state.get("rag_document_version_v09", "")).strip()
+        published_at = str(
+            st.session_state.get("rag_document_published_v09", "")
+        ).strip()
+        effective_status = st.selectbox(
+            "生效状态",
+            options=("active", "draft", "superseded", "expired", "unknown"),
+            format_func=lambda value: {
+                "active": "生效中",
+                "draft": "草稿",
+                "superseded": "已被替代",
+                "expired": "已失效",
+                "unknown": "未知",
+            }[value],
+            key="rag_document_status_v09",
+        )
+        approved = st.selectbox(
+            "文档来源确认",
+            options=("未确认", "已确认"),
+            format_func=lambda value: (
+                "我尚未确认该文档可以作为标准依据"
+                if value == "未确认"
+                else "我确认该文档可以作为标准依据"
+            ),
+            key="rag_document_approved_v09",
+        ) == "已确认"
+
+        normalized_standard = "".join(standard_number.split()).casefold()
+        existing_versions = [
+            item
+            for item in knowledge_base.documents
+            if normalized_standard
+            and "".join((item.standard_number or "").split()).casefold()
+            == normalized_standard
+            and item.source_namespace == namespace
+        ]
+        version_change_confirmed = False
+        if existing_versions:
+            if any((version or None) != item.version for item in existing_versions):
+                warning = (
+                    "检测到同一标准号的其他版本。新增后检索可能出现版本冲突，"
+                    "需要在检索结果中明确选择适用版本。"
+                )
+            else:
+                warning = (
+                    "检测到同一标准号和版本的现有文档。新增内容会形成新的内容哈希，"
+                    "需要重新确认来源并重新绑定引用。"
+                )
+            st.warning(warning)
+            version_change_confirmed = st.selectbox(
+                "版本变化确认",
+                options=("未确认", "已确认"),
+                format_func=lambda value: (
+                    "未确认新增版本"
+                    if value == "未确认"
+                    else "我确认新增版本，并接受后续检索显示版本冲突"
+                ),
+                key="rag_version_change_confirmed_v09",
+            ) == "已确认"
+
+        if st.button(
+            "摄取并加入标准依据库",
+            key="rag_ingest_document_v09",
+            width="stretch",
+        ):
+            if rag_file is None:
+                st.error("请先选择 Markdown、TXT 或 PDF 文档。")
+            elif not approved:
+                st.error("请先确认该文档可以作为标准依据来源。")
+            elif existing_versions and not version_change_confirmed:
+                st.error("新增标准版本前，请先确认版本变化。")
+            else:
+                try:
+                    document = knowledge_base.ingest_bytes(
+                        rag_file.getvalue(),
+                        rag_file.name,
+                        title=title.strip() or None,
+                        standard_number=standard_number.strip() or None,
+                        version=version.strip() or None,
+                        published_at=published_at.strip() or None,
+                        effective_status=effective_status,
+                        source_namespace=namespace,
+                        approved=True,
+                        metadata={
+                            "origin": "user_upload_v0.9",
+                            "approved_by": "page_confirmation",
+                        },
+                    )
+                except (RagIngestionError, ValueError) as error:
+                    st.error(f"文档摄取失败：{_escape_markdown(str(error))}")
+                else:
+                    state["response"] = None
+                    state["bound_response"] = None
+                    state["selected_chunk_ids"] = ()
+                    st.session_state[RAG_STATE_KEY] = state
+                    st.success(
+                        f"已加入：{_escape_markdown(document.title)}，"
+                        f"共 {len(document.chunk_ids)} 个可定位片段。"
+                    )
+
+    if documents:
+        st.markdown("#### 文档移除")
+        document_options = ["__none__", *[item.document_id for item in knowledge_base.documents]]
+        selected_document = st.selectbox(
+            "选择要从当前会话知识库移除的文档",
+            options=document_options,
+            format_func=lambda value: (
+                "不移除"
+                if value == "__none__"
+                else next(
+                    (
+                        item.title
+                        for item in knowledge_base.documents
+                        if item.document_id == value
+                    ),
+                    value,
+                )
+            ),
+            key="rag_document_remove_v09",
+        )
+        confirm_remove = st.selectbox(
+            "移除确认",
+            options=("未确认", "已确认"),
+            format_func=lambda value: (
+                "未确认移除"
+                if value == "未确认"
+                else "我确认移除该文档；已有草案中的引用需要重新检索确认"
+            ),
+            key="rag_document_remove_confirmed_v09",
+        ) == "已确认"
+        if st.button(
+            "移除选中文档",
+            key="rag_remove_document_v09",
+            disabled=selected_document == "__none__" or not confirm_remove,
+        ):
+            removed = knowledge_base.remove_document(selected_document)
+            if removed:
+                state["response"] = None
+                state["bound_response"] = None
+                state["selected_chunk_ids"] = ()
+                st.session_state[RAG_STATE_KEY] = state
+                st.success("文档已从当前会话知识库移除。")
+
+    st.markdown("#### 检索标准依据")
+    query = str(st.session_state.get("rag_query_v09", ""))
+    metric_filter_options = ["__all__", *selected_metric_ids]
+    metric_filter = st.selectbox(
+        "按指标筛选（可选）",
+        options=metric_filter_options,
+        format_func=lambda value: "不限定" if value == "__all__" else value,
+        key="rag_metric_filter_v09",
+    )
+    search_namespace_options = ["__all__", *RAG_NAMESPACE_LABELS]
+    search_namespace = st.selectbox(
+        "按来源用途筛选",
+        options=search_namespace_options,
+        format_func=lambda value: (
+            RAG_ALL_NAMESPACE_LABEL if value == "__all__" else RAG_NAMESPACE_LABELS[value]
+        ),
+        key="rag_search_namespace_v09",
+    )
+    standard_filter = str(st.session_state.get("rag_search_standard_v09", ""))
+    version_filter = str(st.session_state.get("rag_search_version_v09", ""))
+    if st.button(
+        "检索标准依据",
+        key="rag_search_v09",
+        width="stretch",
+        disabled=not bool(query.strip()),
+    ):
+        try:
+            response = knowledge_base.search(
+                query,
+                metric_id=None if metric_filter == "__all__" else metric_filter,
+                standard_number=standard_filter.strip() or None,
+                version=version_filter.strip() or None,
+                source_namespace=None if search_namespace == "__all__" else search_namespace,
+                limit=5,
+            )
+        except (RagRetrievalError, ValueError) as error:
+            st.error(f"检索失败：{_escape_markdown(str(error))}")
+        else:
+            state["response"] = response
+            state["bound_response"] = None
+            state["selected_chunk_ids"] = ()
+            st.session_state[RAG_STATE_KEY] = state
+
+    response = state.get("response")
+    if response is None:
+        bound_response, bound_ids = _current_rag_binding()
+        if bound_response is not None:
+            st.success(f"已绑定 {len(bound_ids)} 个标准依据片段到规则编制。")
+            for source in response_source_summary(bound_response):
+                st.caption(
+                    f"{source['document_name']} · {source.get('version') or '未标注版本'} · "
+                    f"{source['chunk_id']}"
+                )
+        return
+
+    st.caption(
+        f"过滤后文档 {response.filtered_document_count} 份，候选片段 "
+        f"{response.total_candidate_count} 个，当前展示 {len(response.results)} 个。"
+    )
+    if response.status == "no_results":
+        st.warning("没有命中已批准来源；不能据此声称符合标准。")
+        return
+    if response.status == "conflict":
+        st.error(
+            "检索命中多个版本或来源，当前结果不能直接绑定。请用版本/用途筛选后重新检索。"
+        )
+        if response.conflict is not None:
+            st.text(response.conflict.reason)
+            for label, version_label in zip(
+                response.conflict.document_labels,
+                response.conflict.versions,
+            ):
+                st.text(f"来源：{label} · 版本：{version_label}")
+        return
+
+    st.markdown("#### 可绑定片段")
+    result_labels = {
+        result.chunk.chunk_id: (
+            f"{result.document.title} · {result.document.version or '未标注版本'} · "
+            f"{result.chunk.section or result.chunk.clause or '正文'} · "
+            f"{result.chunk.chunk_id}"
+        )
+        for result in response.results
+    }
+    for result in response.results:
+        citation = result.citation
+        location = " / ".join(
+            item
+            for item in (
+                citation.section,
+                citation.clause,
+                f"第{citation.page}页" if citation.page is not None else None,
+                f"chunk:{citation.chunk_id}",
+            )
+            if item
+        )
+        st.markdown(
+            f"**{_escape_markdown(citation.document_name)}** · "
+            f"{_escape_markdown(citation.document_version or '未标注版本')} · "
+            f"{_escape_markdown(location)}"
+        )
+        st.text(result.chunk.text)
+    selected_ids = tuple(
+        st.multiselect(
+            "选择要绑定的检索片段",
+            options=tuple(result_labels),
+            format_func=lambda value: result_labels[value],
+            key="rag_selected_chunks_v09",
+        )
+    )
+    if st.button(
+        "绑定所选片段到规则编制",
+        key="rag_bind_selected_v09",
+        width="stretch",
+        disabled=not bool(selected_ids),
+    ):
+        state["bound_response"] = response
+        state["selected_chunk_ids"] = selected_ids
+        st.session_state[RAG_STATE_KEY] = state
+        st.success(f"已绑定 {len(selected_ids)} 个标准依据片段。")
+
+
 def _rule_id(rule_type: str, fields: list[str]) -> str:
     digest = hashlib.sha256(
         json.dumps(
@@ -1351,9 +1788,9 @@ def _render_custom_rule_authoring(
     reference_date: date,
     selected_metric_ids: tuple[str, ...],
 ) -> None:
-    """渲染 v0.8 自然语言自定义规则闭环。"""
+    """渲染 v0.9 自然语言自定义规则闭环。"""
 
-    st.subheader("自定义规则（v0.8）")
+    st.subheader("自定义规则（v0.9）")
     st.caption(
         "用自然语言新增一条业务规则。当前支持格式/正则、字符长度、"
         "条件必填和跨字段比较；规则仍须经过确定性校验、试运行和人工批准。"
@@ -1362,6 +1799,10 @@ def _render_custom_rule_authoring(
         st.info("当前上传内容已不可用，请重新选择文件。")
         return
 
+    rag_response, rag_chunk_ids = _current_rag_binding()
+    if rag_chunk_ids:
+        st.info(f"本次自定义规则将携带 {len(rag_chunk_ids)} 个已绑定标准依据片段。")
+
     state = st.session_state.get(CUSTOM_RULE_STATE_KEY, {})
     basis = str(st.session_state.get("custom_rule_intent", "")).strip()
     signature = _rule_form_signature(
@@ -1369,6 +1810,7 @@ def _render_custom_rule_authoring(
             "report_sha256": report.evaluation_context.get("report_sha256"),
             "input_sha256": report.evaluation_context.get("input_sha256"),
             "intent": basis,
+            **_rag_binding_signature(),
         }
     )
     if state.get("signature") and state.get("signature") != signature:
@@ -1387,6 +1829,7 @@ def _render_custom_rule_authoring(
             "report_sha256": report.evaluation_context.get("report_sha256"),
             "input_sha256": report.evaluation_context.get("input_sha256"),
             "intent": basis,
+            **_rag_binding_signature(),
         }
     )
     if state.get("signature") and state.get("signature") != signature:
@@ -1404,6 +1847,8 @@ def _render_custom_rule_authoring(
             compile_kwargs = {
                 "user_intent": basis,
                 "allow_template_fallback": provider is None,
+                "rag_response": rag_response,
+                "selected_chunk_ids": rag_chunk_ids,
             }
             if provider is not None:
                 compile_kwargs["provider"] = provider
@@ -1542,7 +1987,7 @@ def _render_rule_authoring(
     reference_date: date,
     selected_metric_ids: tuple[str, ...],
 ) -> None:
-    """渲染 v0.7“评价依据 → RuleDraft → 试运行 → 审批重评”闭环。"""
+    """渲染 v0.9“检索依据 → RuleDraft → 试运行 → 审批重评”闭环。"""
 
     st.subheader("补充评价标准")
     st.caption(
@@ -1559,6 +2004,10 @@ def _render_rule_authoring(
     if not selected_metric_ids:
         st.info("请先选择至少一个指标。")
         return
+
+    rag_response, rag_chunk_ids = _current_rag_binding()
+    if rag_chunk_ids:
+        st.info(f"已绑定 {len(rag_chunk_ids)} 个标准依据片段；解析规则时会写入 RuleEvidence。")
 
     _render_custom_rule_authoring(
         report,
@@ -1618,7 +2067,11 @@ def _render_rule_authoring(
             )
             basis = _metric_evidence_text(metric_id)
             basis_signature = _rule_form_signature(
-                {"metric_id": metric_id, "evidence": basis}
+                {
+                    "metric_id": metric_id,
+                    "evidence": basis,
+                    **_rag_binding_signature(),
+                }
             )
             draft = state.get("drafts", {}).get(metric_id)
             if draft is not None and state.get("draft_signatures", {}).get(metric_id) != basis_signature:
@@ -1643,6 +2096,8 @@ def _render_rule_authoring(
                     compile_kwargs = {
                         "target_metric_id": metric_id,
                         "user_intent": basis,
+                        "rag_response": rag_response,
+                        "selected_chunk_ids": rag_chunk_ids,
                         # 仅无 API 的暂行演示模式允许本地模板；一旦配置
                         # 外部模型，失败必须返回页面，不能伪装成模型草案。
                         "allow_template_fallback": provider is None,
@@ -2471,7 +2926,7 @@ def _evaluation_request_signature(
 
 st.title("政务数据集质量评估")
 st.caption(
-    "v0.8 · 上传结构化文件，补充评价依据或创建自定义规则。"
+    "v0.9 · 上传结构化文件，检索标准依据，补充评价依据或创建自定义规则。"
 )
 
 _initialize_metric_selection_state()
@@ -2508,6 +2963,15 @@ with st.sidebar:
             f"单文件上限 {MAX_INPUT_FILE_MIB} MiB。"
         ),
     )
+    st.file_uploader(
+        "选择标准依据文档（RAG，可选）",
+        type=["md", "markdown", "txt", "pdf"],
+        key="rag_document_upload_v09",
+        help=(
+            "v0.9 支持 Markdown、TXT 和可抽取文本层的 PDF；"
+            "文档只在当前会话内存中处理，不会与业务数据混入。"
+        ),
+    )
     dataset_name = st.text_input(
         "数据集名称（可选）",
         placeholder="默认使用文件名",
@@ -2527,6 +2991,7 @@ with st.sidebar:
             placeholder="默认读取第一个工作表",
         )
     _render_model_api_settings()
+    _render_rag_sidebar_inputs()
     request_signature = _evaluation_request_signature(
         uploaded_file,
         dataset_name,
@@ -2613,6 +3078,7 @@ else:
         profile_tab,
         execution_tab,
         agent_tab,
+        rag_tab,
         authoring_tab,
         rule_tab,
     ) = st.tabs(
@@ -2622,6 +3088,7 @@ else:
             "字段画像",
             "无法评估与运行信息",
             "Agent 解读",
+            "标准依据 RAG",
             "补充评价标准",
             "规则增强",
         ]
@@ -2636,6 +3103,11 @@ else:
         _render_execution(report)
     with agent_tab:
         _render_agent(report)
+    with rag_tab:
+        _render_rag_panel(
+            report,
+            selected_metric_ids=selected_metric_ids,
+        )
     with authoring_tab:
         _render_rule_authoring(
             report,
