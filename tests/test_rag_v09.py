@@ -45,6 +45,13 @@ RAG_TEXT_V2 = RAG_TEXT_V1_TEXT.replace(
     "必须填写，空值不得作为有效数据", "必须填写，且应与目录服务清单一致"
 ).encode("utf-8")
 
+LOCAL_RAG_TEXT = """# Local Test Standard
+版本：v1
+
+## 1 字段要求
+local_field 必须填写。
+""".encode("utf-8")
+
 
 class RagV09Tests(unittest.TestCase):
     @classmethod
@@ -287,7 +294,7 @@ class RagV09Tests(unittest.TestCase):
         app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
         app.run()
         self.assertFalse(app.exception)
-        app.file_uploader[0].set_value(
+        next(item for item in app.file_uploader if item.label == "选择数据文件").set_value(
             (SAMPLE.name, SAMPLE.read_bytes(), "text/csv")
         )
         app.run()
@@ -331,6 +338,56 @@ class RagV09Tests(unittest.TestCase):
                 for item in draft.evidence
             )
         )
+
+    def test_streamlit_uploads_standard_inside_rag_panel(self):
+        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
+        app.run()
+        rag_upload = next(
+            item for item in app.file_uploader if item.label == "选择标准依据文档"
+        )
+        rag_upload.set_value(("local-standard.md", LOCAL_RAG_TEXT, "text/markdown")).run()
+        self.assertFalse(app.exception)
+        self.assertEqual(rag_upload.label, "选择标准依据文档")
+
+        next(
+            item for item in app.selectbox if item.label == "文档来源确认"
+        ).set_value("已确认").run()
+        next(
+            button for button in app.button if button.label == "摄取并加入标准依据库"
+        ).click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any("已加入" in item.value for item in app.success))
+        self.assertTrue(
+            any(
+                item.get("title") == "Local Test Standard"
+                for item in app.session_state["rag_ui_state"]["knowledge_base"].summary()["documents"]
+            )
+        )
+
+        next(item for item in app.file_uploader if item.label == "选择数据文件").set_value(
+            (SAMPLE.name, SAMPLE.read_bytes(), "text/csv")
+        ).run()
+        next(
+            button for button in app.button if button.label == "运行质量评估"
+        ).click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            any(
+                item.get("title") == "Local Test Standard"
+                for item in app.session_state["rag_ui_state"]["knowledge_base"].summary()["documents"]
+            )
+        )
+
+        next(
+            item for item in app.text_input if item.label == "检索问题或条款关键词"
+        ).set_value("local_field")
+        next(
+            button for button in app.button if button.label == "检索标准依据"
+        ).click().run()
+        self.assertFalse(app.exception)
+        response = app.session_state["rag_ui_state"]["response"]
+        self.assertEqual(response.status, "ok")
+        self.assertTrue(any("local_field" in result.chunk.text for result in response.results))
 
 
 if __name__ == "__main__":
