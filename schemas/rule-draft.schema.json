@@ -107,8 +107,24 @@
         "source_id": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 300}]},
         "source_label": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 300}]},
         "location": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 500}]},
-        "authoritative": {"type": "boolean"}
-      }
+        "authoritative": {"type": "boolean"},
+        "document_id": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 120}]},
+        "document_name": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 300}]},
+        "document_version": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 100}]},
+        "section": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 300}]},
+        "clause": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 120}]},
+        "chunk_id": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 120}]},
+        "page": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["type"], "properties": {"type": {"enum": ["standard_clause", "data_dictionary"]}}},
+          "then": {
+            "required": ["document_name", "document_version", "chunk_id"],
+            "anyOf": [{"required": ["section"]}, {"required": ["clause"]}]
+          }
+        }
+      ]
     },
     "ruleSpec": {
       "type": "object",
@@ -212,9 +228,9 @@
                 "operator": {"enum": ["lt", "lte", "gt", "gte", "eq", "neq"]},
                 "comparison_type": {"enum": ["auto", "numeric", "datetime", "text"]}
               }
-            }
-          ]
-        },
+        }
+      ]
+    },
         "severity": {"enum": ["info", "attention", "warning"]},
         "denominator_policy": {"enum": ["all_records", "non_missing"]},
         "missing_value_policy": {"enum": ["missing_is_violation", "missing_excluded"]},
@@ -256,7 +272,24 @@
         "selected_metric_ids": {"type": "array", "items": {"type": "string"}},
         "metric": {"type": "object"},
         "fields": {"type": "array", "items": {"type": "object"}},
-        "profile_summary": {"type": "object"}
+        "profile_summary": {"type": "object"},
+        "rag": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "query", "chunk_ids", "document_versions"],
+          "properties": {
+            "status": {"enum": ["ok", "no_results", "conflict"]},
+            "query": {"type": "string", "maxLength": 2000},
+            "namespace": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 80}]},
+            "metric_id": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 120}]},
+            "standard_number": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 120}]},
+            "version": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 100}]},
+            "chunk_ids": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "maxLength": 120}},
+            "document_versions": {"type": "array", "maxItems": 20, "items": {"type": "string", "maxLength": 200}},
+            "results": {"type": "array", "maxItems": 20, "items": {"type": "object"}},
+            "conflict": {"oneOf": [{"type": "null"}, {"type": "object"}]}
+          }
+        }
       }
     }
   }

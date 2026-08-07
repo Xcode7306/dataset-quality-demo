@@ -217,11 +217,14 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
         self.assertEqual(len(app.metric), 0)
         self.assertEqual(len(app.download_button), 0)
         self.assertTrue(
-            any("请从左侧上传" in message.value for message in app.info)
+            any(
+                "可以先在“标准依据 RAG”中上传标准文档" in message.value
+                for message in app.info
+            )
         )
 
     def _upload_and_run(self, app, file_name, content, mime_type):
-        app.file_uploader[0].set_value((file_name, content, mime_type))
+        next(item for item in app.file_uploader if item.label == "选择数据文件").set_value((file_name, content, mime_type))
         app.run()
         app.date_input[0].set_value(REFERENCE_DATE)
         self._button_by_label(app, "运行质量评估").click().run()
@@ -233,7 +236,9 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
         app = self._new_app()
         self._upload_and_run(app, sample.name, sample.read_bytes(), "text/csv")
 
-        app.text_input[0].set_value("新数据集名称")
+        next(
+            item for item in app.text_input if item.label == "数据集名称（可选）"
+        ).set_value("新数据集名称")
         app.run()
         self._assert_report_is_cleared(app)
 
@@ -266,8 +271,9 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
             "第一张",
         )
 
-        self.assertGreaterEqual(len(app.text_input), 2)
-        app.text_input[1].set_value("第二张")
+        next(
+            item for item in app.text_input if item.label == "工作表名称（可选）"
+        ).set_value("第二张")
         app.run()
         self._assert_report_is_cleared(app)
 
@@ -294,9 +300,9 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
         app = self._new_app()
         self._upload_and_run(app, sample.name, sample.read_bytes(), "text/csv")
 
-        app.file_uploader[0].set_value(None)
+        next(item for item in app.file_uploader if item.label == "选择数据文件").set_value(None)
         app.run()
-        app.file_uploader[0].set_value(
+        next(item for item in app.file_uploader if item.label == "选择数据文件").set_value(
             (sample.name, sample.read_bytes(), "text/csv")
         )
         app.run()
