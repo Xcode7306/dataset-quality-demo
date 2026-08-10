@@ -60,6 +60,14 @@ from src.rule_authoring_providers import (
 )
 from src.rule_authoring_workflow import RuleAuthoringHistory
 from src.rule_authoring_tools import build_rule_authoring_context
+from src.rule_batch import (
+    RuleBatchInput,
+    RuleBatchPreflight,
+    RuleImportError,
+    compile_rule_batch,
+    parse_rule_import,
+    rule_inputs_from_dialog,
+)
 from src.rag.citations import response_source_summary
 from src.rag.ingestion import RagIngestionError
 from src.rag.models import (
@@ -96,10 +104,17 @@ RULE_STATE_KEY = "rule_ui_state"
 RULE_AUTHORING_STATE_KEY = "rule_authoring_ui_state"
 CUSTOM_RULE_STATE_KEY = "custom_rule_ui_state"
 RULE_WORKFLOW_HISTORY_KEY = "rule_authoring_workflow_history"
+PRE_EVALUATION_RULE_STATE_KEY = "pre_evaluation_rule_state"
+PRE_EVALUATION_RULE_RESULT_KEY = "pre_evaluation_rule_result"
 RAG_STATE_KEY = "rag_ui_state"
 METRIC_SELECTION_KEY = "selected_metric_ids"
 METRIC_SELECTION_WIDGET_PREFIX = "metric_selection_checkbox_"
 METRIC_EVIDENCE_WIDGET_PREFIX = "metric_evidence_"
+METRIC_SUPPLEMENT_WIDGET_PREFIX = "metric_rule_supplement_"
+PRE_EVALUATION_CUSTOM_RULE_KEY = "custom_rule_intent"
+PRE_EVALUATION_RULE_APPROVER_KEY = "pre_evaluation_rule_approver"
+PRE_EVALUATION_RULE_CONFIRM_KEY = "pre_evaluation_rule_confirmed"
+PRE_EVALUATION_IMPORT_VALUES_KEY = "pre_evaluation_import_rule_values"
 MODEL_API_URL_KEY = "model_api_url"
 MODEL_API_KEY_KEY = "model_api_key"
 MODEL_NAME_KEY = "model_name"
@@ -124,9 +139,10 @@ RULE_WIDGET_KEYS = (
     "rule_numeric_maximum",
     "rule_approver",
     "rule_approval_confirmed",
-    "custom_rule_intent",
     "custom_rule_approver",
     "custom_rule_approval_confirmed",
+    PRE_EVALUATION_RULE_APPROVER_KEY,
+    PRE_EVALUATION_RULE_CONFIRM_KEY,
 )
 RULE_FREQUENCIES = {
     "每日（1 天）": ("daily", 1),
@@ -169,6 +185,8 @@ def _clear_rule_state(*, preserve_rag_binding: bool = False) -> None:
     st.session_state.pop(RULE_STATE_KEY, None)
     st.session_state.pop(RULE_AUTHORING_STATE_KEY, None)
     st.session_state.pop(CUSTOM_RULE_STATE_KEY, None)
+    st.session_state.pop(PRE_EVALUATION_RULE_STATE_KEY, None)
+    st.session_state.pop(PRE_EVALUATION_RULE_RESULT_KEY, None)
     rag_state = st.session_state.get(RAG_STATE_KEY)
     if isinstance(rag_state, dict):
         # 文档库属于当前会话的依据来源，不因更换业务数据而丢失。
@@ -234,6 +252,12 @@ def _metric_evidence_key(metric_id: str) -> str:
     """为指标卡下的评价依据输入生成稳定控件键。"""
 
     return f"{METRIC_EVIDENCE_WIDGET_PREFIX}{metric_id}"
+
+
+def _metric_supplement_key(metric_id: str) -> str:
+    """为默认指标附加的可选 AI 规则生成稳定控件键。"""
+
+    return f"{METRIC_SUPPLEMENT_WIDGET_PREFIX}{metric_id}"
 
 
 def _initialize_model_api_state() -> None:
@@ -435,6 +459,23 @@ def _initialize_metric_evidence_state() -> None:
             st.session_state[key] = default_evaluation_basis(metric_id)
 
 
+def _initialize_pre_evaluation_rule_input_state() -> None:
+    """Keep optional rule text available when Streamlit temporarily hides widgets."""
+
+    if PRE_EVALUATION_CUSTOM_RULE_KEY not in st.session_state:
+        st.session_state[PRE_EVALUATION_CUSTOM_RULE_KEY] = ""
+    for metric_id in ALL_METRIC_IDS:
+        key = _metric_supplement_key(metric_id)
+        if key not in st.session_state:
+            st.session_state[key] = ""
+    saved_imports = st.session_state.get(PRE_EVALUATION_IMPORT_VALUES_KEY, {})
+    if isinstance(saved_imports, dict):
+        for item_id, value in saved_imports.items():
+            key = f"pre_import_rule_text_{item_id}"
+            if key not in st.session_state and isinstance(value, str):
+                st.session_state[key] = value
+
+
 def _selected_metric_ids_from_cards() -> tuple[str, ...]:
     """从指标卡读取选择，并按照固定目录顺序固化到会话状态。"""
 
@@ -623,6 +664,313 @@ def _render_metric_selection_panel() -> tuple[str, ...]:
         )
 
     return selected_metric_ids
+
+
+def _render_pre_evaluation_rule_inputs(
+    selected_metric_ids: tuple[str, ...],
+) -> tuple[tuple[RuleBatchInput, ...], tuple[str, ...], tuple[str, ...]]:
+    """Collect optional metric supplements, dialog rules, and imported rules."""
+
+    st.subheader("评估前 AI 规则生成（可选）")
+    st.caption(
+        "可给已选默认指标追加规则，也可直接描述新规则或导入规则文件。"
+        "每条规则会在最终评估前完成 AI 解析、完整性检查、确定性校验和试运行；"
+        "描述不完整时会立即指出缺少的字段、阈值、取值或条件。"
+    )
+    requests: list[RuleBatchInput] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    with st.expander("给默认指标补充评判规则", expanded=False):
+        st.caption("只填写需要新增的规则；原有评价依据不会重复交给模型生成。")
+        if not selected_metric_ids:
+            st.info("选择指标后可在这里追加规则。")
+        for metric_id in selected_metric_ids:
+            definition = get_metric_definition(metric_id)
+            if definition is None:
+                continue
+            st.text_area(
+                f"{definition['name']} · 补充规则",
+                key=_metric_supplement_key(metric_id),
+                height=76,
+                max_chars=4000,
+                placeholder="例如：service_name 必须填写",
+            )
+            intent = str(
+                st.session_state.get(_metric_supplement_key(metric_id), "")
+            ).strip()
+            if intent:
+                try:
+                    requests.append(
+                        RuleBatchInput.create(
+                            origin="metric_supplement",
+                            user_intent=intent,
+                            label=f"指标补充：{definition['name']}",
+                            target_metric_id=metric_id,
+                            source_location=f"metric:{metric_id}:supplement",
+                        )
+                    )
+                except RuleImportError as error:
+                    errors.append(f"{definition['name']}：{error}")
+
+    st.text_input(
+        "评估前自定义规则描述（可选）",
+        key=PRE_EVALUATION_CUSTOM_RULE_KEY,
+        max_chars=4000,
+        placeholder="例如：status 为 inactive 时，name 必须填写",
+        help="关键信息不足时会在最终评估前直接追问；多条规则请使用文件导入。",
+    )
+    try:
+        requests.extend(
+            rule_inputs_from_dialog(
+                str(st.session_state.get(PRE_EVALUATION_CUSTOM_RULE_KEY, ""))
+            )
+        )
+    except RuleImportError as error:
+        errors.append(str(error))
+
+    rule_file = st.file_uploader(
+        "导入规则文件（批量，可选）",
+        type=["txt", "md", "csv", "xls", "xlsx", "json", "jsonl", "ndjson"],
+        key="pre_evaluation_rule_file",
+        help=(
+            "TXT/Markdown 每个非空行一条规则；CSV/Excel 使用“规则描述”列，"
+            "可选“指标ID”列；JSON 使用字符串数组或规则对象数组。最多 100 条、2 MiB。"
+        ),
+    )
+    if rule_file is not None:
+        try:
+            imported = parse_rule_import(rule_file.getvalue(), rule_file.name)
+        except RuleImportError as error:
+            errors.append(f"规则文件“{rule_file.name}”无法导入：{error}")
+        else:
+            warnings.extend(imported.warnings)
+            st.caption(
+                f"已识别 {len(imported.items)} 条文件规则；可在生成前逐条修改。"
+            )
+            with st.expander("检查并编辑导入的规则", expanded=True):
+                for item in imported.items:
+                    edit_key = f"pre_import_rule_text_{item.item_id}"
+                    if edit_key not in st.session_state:
+                        st.session_state[edit_key] = item.user_intent
+                    st.text_area(
+                        item.label,
+                        key=edit_key,
+                        height=72,
+                        max_chars=4000,
+                        help=(
+                            f"目标指标：{item.target_metric_id}"
+                            if item.target_metric_id
+                            else "未指定指标时按自定义规则生成。"
+                        ),
+                    )
+                    edited_intent = str(st.session_state.get(edit_key, "")).strip()
+                    saved_import_values = dict(
+                        st.session_state.get(
+                            PRE_EVALUATION_IMPORT_VALUES_KEY,
+                            {},
+                        )
+                    )
+                    saved_import_values[item.item_id] = edited_intent
+                    st.session_state[PRE_EVALUATION_IMPORT_VALUES_KEY] = (
+                        saved_import_values
+                    )
+                    try:
+                        requests.append(
+                            RuleBatchInput.create(
+                                origin="file_import",
+                                user_intent=edited_intent,
+                                label=item.label,
+                                target_metric_id=item.target_metric_id,
+                                source_name=item.source_name,
+                                source_location=item.source_location,
+                            )
+                        )
+                    except RuleImportError as error:
+                        errors.append(f"{item.label}：{error}")
+
+    if requests:
+        st.info(
+            f"当前共有 {len(requests)} 条待生成规则。"
+            "点击左侧“AI 检查并生成规则”后，完整性问题会在本页立即列出。"
+        )
+    return (
+        tuple(requests),
+        tuple(dict.fromkeys(errors)),
+        tuple(dict.fromkeys(warnings)),
+    )
+
+
+def _pre_evaluation_rule_signature(
+    evaluation_signature: object,
+    requests: tuple[RuleBatchInput, ...],
+) -> str:
+    configuration, issue = _model_api_configuration()
+    model_binding = {
+        "issue": issue,
+        "source": configuration.get("source") if configuration else None,
+        "api_url": configuration.get("api_url") if configuration else None,
+        "model": configuration.get("model") if configuration else None,
+        "api_key_sha256": (
+            hashlib.sha256(configuration["api_key"].encode("utf-8")).hexdigest()
+            if configuration and configuration.get("api_key")
+            else None
+        ),
+    }
+    return _rule_form_signature(
+        {
+            "evaluation": evaluation_signature,
+            "rules": [item.to_dict() for item in requests],
+            "model": model_binding,
+            **_rag_binding_signature(),
+        }
+    )
+
+
+def _render_pre_evaluation_rule_state(
+    *,
+    signature: str,
+    uploaded_file,
+    dataset_name: str,
+    sheet_name: str,
+    reference_date: date,
+    selected_metric_ids: tuple[str, ...],
+) -> None:
+    """Show batch clarification/preview and execute only after local approval."""
+
+    state = st.session_state.get(PRE_EVALUATION_RULE_STATE_KEY)
+    if not isinstance(state, dict) or state.get("signature") != signature:
+        return
+    if state.get("error"):
+        st.error(
+            "规则生成预检未完成："
+            f"{_escape_markdown(state['error'])}"
+        )
+    preflight = state.get("preflight")
+    if not isinstance(preflight, RuleBatchPreflight):
+        return
+
+    st.markdown("### AI 规则生成预检结果")
+    rows = []
+    for item in preflight.items:
+        draft = item.draft
+        rows.append(
+            {
+                "来源": item.request.label,
+                "目标指标": item.request.target_metric_id or "自定义规则",
+                "状态": item.status,
+                "生成类型": (
+                    draft.rule_spec.rule_type
+                    if draft is not None and draft.rule_spec is not None
+                    else "—"
+                ),
+                "需处理内容": "；".join(item.messages) or "—",
+            }
+        )
+    if rows:
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    blocking = [item for item in preflight.items if item.status != "ready"]
+    if blocking:
+        st.warning(
+            f"有 {len(blocking)} 条规则描述不完整或不可执行，最终评估尚未启动。"
+        )
+        for item in blocking:
+            st.markdown(f"**{_escape_markdown(item.request.label)}**")
+            for message in item.messages:
+                st.text(f"需要补充：{message}")
+        st.caption("请直接修改上方对应描述，再重新点击“AI 检查并生成规则”。")
+        return
+    if not preflight.ready or preflight.draft_pack is None:
+        for warning in preflight.warnings:
+            st.error(_escape_markdown(warning))
+        return
+
+    st.success(
+        f"{len(preflight.items)} 条描述均已生成并通过确定性校验；"
+        f"合并后共 {len(preflight.draft_pack.rules)} 条可执行规则。"
+    )
+    for warning in preflight.warnings:
+        st.warning(_escape_markdown(warning))
+    with st.expander("查看合并后的 RulePack 草案", expanded=True):
+        st.json(preflight.draft_pack.to_dict())
+    preview = state.get("preview")
+    if preview is None:
+        st.error("规则尚未完成确定性试运行，不能审批或启动最终评估。")
+        return
+    _render_rule_dry_run(preview.to_dict())
+
+    approved_pack = state.get("approved_pack")
+    approver = st.text_input(
+        "审批人标识（评估前 AI 规则，本地自声明）",
+        key=PRE_EVALUATION_RULE_APPROVER_KEY,
+        max_chars=100,
+    )
+    confirmed = st.checkbox(
+        "我已核对全部生成规则和试运行摘要，并批准将其用于本次评估。",
+        key=PRE_EVALUATION_RULE_CONFIRM_KEY,
+    )
+    pack_hash = draft_sha256(preflight.draft_pack)
+    approve_clicked = st.button(
+        "批准规则并运行质量评估"
+        if approved_pack is None
+        else "重试已批准规则的质量评估",
+        key="approve_pre_evaluation_rule_batch",
+        type="primary",
+        width="stretch",
+        disabled=(
+            uploaded_file is None
+            or not approver.strip()
+            or not confirmed
+            or state.get("draft_sha256") != pack_hash
+        ),
+    )
+    if not approve_clicked:
+        return
+    report = state.get("report")
+    if not isinstance(report, QualityReport):
+        st.error("规则预检报告已失效，请重新生成规则。")
+        return
+    try:
+        if approved_pack is None:
+            approved_pack = approve_rule_pack(
+                preflight.draft_pack,
+                report,
+                approver=approver,
+            )
+        with st.spinner("正在重新解析数据并执行全部已批准规则……"):
+            result = evaluate_uploaded_dataset_with_rule_pack(
+                uploaded_file.getvalue(),
+                uploaded_file.name,
+                approved_pack,
+                dataset_name=dataset_name.strip() or None,
+                sheet_name=sheet_name.strip() or None,
+                reference_date=reference_date,
+                selected_metric_ids=selected_metric_ids,
+            )
+    except (
+        DatasetReadError,
+        UnsupportedFileTypeError,
+        RulePackValidationError,
+        RulePackExecutionError,
+        ValueError,
+    ) as error:
+        st.session_state[PRE_EVALUATION_RULE_STATE_KEY] = {
+            **state,
+            "approved_pack": approved_pack,
+            "error": _model_error_detail(error),
+        }
+        st.error(f"已批准规则的评估未完成：{_escape_markdown(str(error))}")
+        return
+    st.session_state[PRE_EVALUATION_RULE_RESULT_KEY] = result
+    st.session_state[PRE_EVALUATION_RULE_STATE_KEY] = {
+        **state,
+        "approved_pack": approved_pack,
+        "result": result,
+        "error": None,
+    }
+    st.session_state["quality_report"] = result.enhanced_report
+    st.rerun()
 
 
 def _escape_markdown(value: object) -> str:
@@ -3340,16 +3688,27 @@ def _evaluation_request_signature(
 
 st.title("政务数据集质量评估")
 st.caption(
-    "v1.0 · 上传结构化文件，检索标准依据，并以可恢复、可追溯工作流编制规则。"
+    "v1.1 · 在最终评估前生成、补充或批量导入规则，并以受控工作流执行。"
 )
 
 _initialize_metric_selection_state()
 _initialize_metric_evidence_state()
+_initialize_pre_evaluation_rule_input_state()
 _initialize_model_api_state()
 report_is_displayed = st.session_state.get("quality_report") is not None
 rag_slot = st.empty()
+pre_rule_requests: tuple[RuleBatchInput, ...] = ()
+pre_rule_input_errors: tuple[str, ...] = ()
+pre_rule_input_warnings: tuple[str, ...] = ()
 if not report_is_displayed:
     selected_metric_ids = _render_metric_selection_panel()
+    (
+        pre_rule_requests,
+        pre_rule_input_errors,
+        pre_rule_input_warnings,
+    ) = _render_pre_evaluation_rule_inputs(selected_metric_ids)
+    for warning in pre_rule_input_warnings:
+        st.warning(_escape_markdown(warning))
 else:
     rag_slot.empty()
     selected_metric_ids = tuple(
@@ -3358,6 +3717,8 @@ else:
         if metric_id in st.session_state.get(METRIC_SELECTION_KEY, [])
     )
 missing_metric_evidence_ids = _missing_metric_evidence_ids(selected_metric_ids)
+preflight_rules = False
+pre_rule_signature = ""
 
 with st.sidebar:
     st.header("开始评估")
@@ -3414,18 +3775,51 @@ with st.sidebar:
         if had_report:
             st.rerun()
     if not report_is_displayed:
+        pre_rule_signature = _pre_evaluation_rule_signature(
+            request_signature,
+            pre_rule_requests,
+        )
+        previous_preflight = st.session_state.get(PRE_EVALUATION_RULE_STATE_KEY)
+        if (
+            isinstance(previous_preflight, dict)
+            and previous_preflight.get("signature") != pre_rule_signature
+        ):
+            st.session_state.pop(PRE_EVALUATION_RULE_STATE_KEY, None)
+            st.session_state.pop(PRE_EVALUATION_RULE_RESULT_KEY, None)
+            st.session_state.pop(PRE_EVALUATION_RULE_APPROVER_KEY, None)
+            st.session_state.pop(PRE_EVALUATION_RULE_CONFIRM_KEY, None)
         if missing_metric_evidence_ids:
             st.warning("请先补全所有已勾选指标的评价规则。")
-        run_evaluation = st.button(
-            "运行质量评估",
-            type="primary",
-            width="stretch",
-            disabled=(
-                uploaded_file is None
-                or not selected_metric_ids
-                or bool(missing_metric_evidence_ids)
-            ),
+        has_pre_evaluation_rules = bool(
+            pre_rule_requests or pre_rule_input_errors
         )
+        if has_pre_evaluation_rules:
+            for error in pre_rule_input_errors:
+                st.error(_escape_markdown(error))
+            preflight_rules = st.button(
+                "AI 检查并生成规则",
+                type="primary",
+                width="stretch",
+                disabled=(
+                    uploaded_file is None
+                    or not selected_metric_ids
+                    or bool(missing_metric_evidence_ids)
+                    or bool(pre_rule_input_errors)
+                ),
+            )
+            run_evaluation = False
+            st.caption("全部规则通过预检和人工批准后，才会启动最终质量评估。")
+        else:
+            run_evaluation = st.button(
+                "运行质量评估",
+                type="primary",
+                width="stretch",
+                disabled=(
+                    uploaded_file is None
+                    or not selected_metric_ids
+                    or bool(missing_metric_evidence_ids)
+                ),
+            )
     else:
         run_evaluation = False
     st.caption("原始文件仅写入临时目录用于本次计算，评估结束后自动删除。")
@@ -3435,6 +3829,92 @@ if not report_is_displayed:
         rag_tab = st.tabs(["标准依据 RAG"])[0]
         with rag_tab:
             _render_rag_panel(selected_metric_ids=selected_metric_ids)
+
+if (
+    preflight_rules
+    and uploaded_file is not None
+    and selected_metric_ids
+    and pre_rule_requests
+    and not missing_metric_evidence_ids
+    and not pre_rule_input_errors
+):
+    _clear_agent_state()
+    st.session_state.pop(PRE_EVALUATION_RULE_RESULT_KEY, None)
+    with st.spinner(
+        f"正在解析数据结构并逐条检查 {len(pre_rule_requests)} 条规则……"
+    ):
+        try:
+            preflight_report = evaluate_uploaded_dataset(
+                uploaded_file.getvalue(),
+                uploaded_file.name,
+                dataset_name=dataset_name.strip() or None,
+                sheet_name=sheet_name.strip() or None,
+                reference_date=reference_date,
+                selected_metric_ids=selected_metric_ids,
+            )
+            provider = _build_rule_authoring_provider()
+            rag_response, rag_chunk_ids = _current_rag_binding()
+            preflight = compile_rule_batch(
+                preflight_report,
+                pre_rule_requests,
+                provider=provider,
+                allow_template_fallback=provider is None,
+                rag_response=rag_response,
+                selected_chunk_ids=rag_chunk_ids,
+            )
+            preview = None
+            if preflight.ready and preflight.draft_pack is not None:
+                preview = dry_run_uploaded_dataset_with_rule_pack(
+                    uploaded_file.getvalue(),
+                    uploaded_file.name,
+                    preflight.draft_pack,
+                    dataset_name=dataset_name.strip() or None,
+                    sheet_name=sheet_name.strip() or None,
+                    reference_date=reference_date,
+                    selected_metric_ids=selected_metric_ids,
+                )
+            st.session_state[PRE_EVALUATION_RULE_STATE_KEY] = {
+                "signature": pre_rule_signature,
+                "report": preflight_report,
+                "preflight": preflight,
+                "preview": preview,
+                "draft_sha256": (
+                    draft_sha256(preflight.draft_pack)
+                    if preflight.draft_pack is not None
+                    else None
+                ),
+                "approved_pack": None,
+                "result": None,
+                "error": None,
+            }
+        except (
+            DatasetReadError,
+            UnsupportedFileTypeError,
+            RuleImportError,
+            RulePackValidationError,
+            RulePackExecutionError,
+            ValueError,
+        ) as error:
+            st.session_state[PRE_EVALUATION_RULE_STATE_KEY] = {
+                "signature": pre_rule_signature,
+                "error": _model_error_detail(error),
+            }
+        except Exception:
+            st.session_state[PRE_EVALUATION_RULE_STATE_KEY] = {
+                "signature": pre_rule_signature,
+                "error": "模型服务或临时解析环境不可用，请检查配置后重试。",
+            }
+    st.rerun()
+
+if not report_is_displayed and pre_rule_signature:
+    _render_pre_evaluation_rule_state(
+        signature=pre_rule_signature,
+        uploaded_file=uploaded_file,
+        dataset_name=dataset_name,
+        sheet_name=sheet_name,
+        reference_date=reference_date,
+        selected_metric_ids=selected_metric_ids,
+    )
 
 if (
     run_evaluation
@@ -3485,6 +3965,16 @@ else:
 
     _render_summary(report)
     _render_metric_selection_summary(report)
+    pre_evaluation_rule_result = st.session_state.get(
+        PRE_EVALUATION_RULE_RESULT_KEY
+    )
+    if pre_evaluation_rule_result is not None:
+        with st.container(border=True):
+            st.markdown("### 评估前生成规则的执行结果")
+            st.caption(
+                "以下业务规则在最终评估前已完成生成、完整性校验、试运行和人工审批。"
+            )
+            _render_rule_result(pre_evaluation_rule_result)
     (
         risk_tab,
         metric_tab,

@@ -18,6 +18,7 @@ from .rule_authoring_providers import (
     RuleAuthoringProviderResult,
     TemplateRuleAuthoringProvider,
     default_rule_authoring_provider,
+    inspect_rule_intent,
 )
 from .rule_authoring_tools import (
     build_custom_rule_authoring_context,
@@ -101,6 +102,52 @@ def _fallback_result(
         fallback,
         metadata=_with_fallback_metadata(fallback.metadata, reason=reason),
     )
+
+
+def _enforce_explicit_rule_inputs(
+    context: Mapping[str, Any],
+    *,
+    user_intent: str,
+    result: RuleAuthoringProviderResult,
+) -> RuleAuthoringProviderResult:
+    """Prevent either a template or an external model from guessing key inputs."""
+
+    inspection = inspect_rule_intent(context, user_intent=user_intent)
+    if inspection.unsupported_reason:
+        return replace(
+            result,
+            outcome="unsupported",
+            rule_spec=None,
+            clarification_questions=(),
+            unsupported_reason=inspection.unsupported_reason,
+        )
+
+    questions = list(inspection.clarification_questions)
+    if result.outcome == "draft" and result.rule_spec is not None:
+        intent_text = str(user_intent).casefold()
+        if result.rule_spec.fields and all(
+            field.casefold() in intent_text for field in result.rule_spec.fields
+        ):
+            questions = [
+                question
+                for question in questions
+                if not (
+                    "字段名称" in question
+                    or "字段和" in question
+                    or "全部字段" in question
+                )
+            ]
+    if questions:
+        return replace(
+            result,
+            outcome="clarification",
+            rule_spec=None,
+            clarification_questions=tuple(
+                dict.fromkeys((*result.clarification_questions, *questions))
+            )[:5],
+            unsupported_reason=None,
+        )
+    return result
 
 
 def _base_evidence(
@@ -338,6 +385,11 @@ def compile_rule_draft(
             reason="provider_error",
         )
 
+    provider_result = _enforce_explicit_rule_inputs(
+        context,
+        user_intent=normalized_intent,
+        result=provider_result,
+    )
     evidence = list(_base_evidence(context, target_metric_id, normalized_intent))
     evidence.extend(rag_evidence)
     evidence.extend(
@@ -458,6 +510,11 @@ def compile_custom_rule_draft(
             reason="provider_error",
         )
 
+    provider_result = _enforce_explicit_rule_inputs(
+        context,
+        user_intent=normalized_intent,
+        result=provider_result,
+    )
     evidence = list(_base_evidence(context, None, normalized_intent))
     evidence.extend(rag_evidence)
     evidence.extend(
@@ -548,6 +605,45 @@ def validate_rule_draft(
         evidence_ids=[item.id for item in draft.evidence],
     )
     errors.extend(rule_validation.errors)
+    if draft.rule_spec is not None:
+        inspection = inspect_rule_intent(
+            draft.context,
+            user_intent=draft.user_intent,
+        )
+        if (
+            inspection.recognized_rule_type is not None
+            and draft.rule_spec.rule_type != inspection.recognized_rule_type
+        ):
+            errors.append("模型生成的规则类型与用户明确描述的规则类型不一致。")
+        intent_text = draft.user_intent.casefold()
+        guessed_fields = [
+            field
+            for field in draft.rule_spec.fields
+            if field.casefold() not in intent_text
+        ]
+        if guessed_fields:
+            errors.append(
+                "模型生成了用户未明确写出的字段："
+                + "、".join(guessed_fields)
+                + "。"
+            )
+        if draft.rule_spec.rule_type in {"allowed_values", "conditional_required"}:
+            parameter_name = (
+                "allowed_values"
+                if draft.rule_spec.rule_type == "allowed_values"
+                else "condition_values"
+            )
+            invented_values = [
+                str(value)
+                for value in draft.rule_spec.parameters.get(parameter_name, ())
+                if str(value).casefold() not in intent_text
+            ]
+            if invented_values:
+                errors.append(
+                    "模型生成了用户未明确列出的取值："
+                    + "、".join(invented_values[:10])
+                    + "。"
+                )
     errors.extend(_validate_draft_rag_binding(draft))
     if draft.rule_spec is not None and not errors:
         source_type, generator, pack_version = _pack_source_for_draft(draft)

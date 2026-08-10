@@ -133,7 +133,9 @@ class RuleAuthoringV08Tests(unittest.TestCase):
 
     def test_streamlit_custom_rule_entry_reaches_dry_run(self):
         app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
-        app.file_uploader[0].set_value(
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(
             ("custom-rules.csv", CONTENT, "text/csv")
         ).run()
         app.date_input[0].set_value(REFERENCE_DATE)

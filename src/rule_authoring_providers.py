@@ -61,6 +61,19 @@ class RuleAuthoringProviderResult:
     )
 
 
+@dataclass(frozen=True)
+class RuleIntentInspection:
+    """Deterministic completeness guard that a model result cannot bypass."""
+
+    recognized_rule_type: str | None
+    clarification_questions: tuple[str, ...] = ()
+    unsupported_reason: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        return not self.clarification_questions and self.unsupported_reason is None
+
+
 class RuleAuthoringProvider(Protocol):
     def generate(
         self,
@@ -536,6 +549,159 @@ class TemplateRuleAuthoringProvider:
         if maximum:
             result["maximum"] = int(maximum.group(1))
         return result
+
+
+def inspect_rule_intent(
+    context: Mapping[str, Any],
+    *,
+    user_intent: str,
+) -> RuleIntentInspection:
+    """Identify missing critical inputs before a draft may enter validation.
+
+    This guard intentionally checks what the user explicitly stated.  A model
+    may add clearer questions, but it cannot silently invent fields, thresholds,
+    trigger values, frequencies, regexes, or comparison operators.
+    """
+
+    text = str(user_intent or "").strip()
+    if not text:
+        return RuleIntentInspection(
+            None,
+            ("请说明需要评价哪个字段，以及该字段必须满足什么条件。",),
+        )
+    if len(text) > 4000:
+        return RuleIntentInspection(
+            None,
+            ("规则描述不能超过 4000 个字符，请压缩为一条明确规则。",),
+        )
+    if re.search(
+        r"\bpython\b|\bjavascript\b|\bshell\b|\bsql\b|脚本|代码执行|运行代码|"
+        r"任意代码|eval\s*\(|exec\s*\(|动态执行|调用函数",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return RuleIntentInspection(
+            None,
+            unsupported_reason=(
+                "当前只支持白名单数据质量规则，不执行 Python、SQL、脚本或任意函数。"
+            ),
+        )
+    if re.search(r"存在于|参照表|权威表|外键|跨表|自动修复|自动清洗|写回|删除", text):
+        return RuleIntentInspection(
+            None,
+            unsupported_reason=(
+                "当前暂不支持跨表参照、外键、自动清洗、数据写回或删除。"
+            ),
+        )
+
+    fields = _field_items(context)
+    matched_fields = _find_fields(text, fields)
+    questions: list[str] = []
+
+    def require_fields(count: int, message: str) -> None:
+        if len(matched_fields) < count:
+            questions.append(message)
+
+    if re.search(r"条件必填|条件下.*必填|时.*必须填写|时.*必填", text):
+        require_fields(2, "请同时写明触发条件字段和条件成立后必须填写的字段。")
+        if not re.search(r"(?:为|是|等于|=)\s*[^，,；;。]+?(?:时|则|，|,)", text):
+            questions.append("请写明触发条件字段的完整取值，例如“状态为注销时”。")
+        return RuleIntentInspection(
+            "conditional_required", tuple(dict.fromkeys(questions))[:5]
+        )
+
+    if re.search(
+        r"不得晚于|不晚于|不能晚于|不得早于|不早于|不能早于|"
+        r"小于等于|大于等于|不大于|不小于|严格小于|严格大于|"
+        r"应小于|应大于|等于|相等|跨字段比较|字段比较|≤|≥",
+        text,
+    ):
+        require_fields(2, "请依次写明需要比较的左侧字段和右侧字段。")
+        if TemplateRuleAuthoringProvider._comparison_operator(text) is None:
+            questions.append("请明确两个字段之间应满足小于、等于还是大于关系。")
+        return RuleIntentInspection(
+            "field_comparison", tuple(dict.fromkeys(questions))[:5]
+        )
+
+    if re.search(r"正则|格式|位数字|位字符|数字代码|匹配", text):
+        require_fields(1, "请写明需要校验格式的字段名称。")
+        if TemplateRuleAuthoringProvider._regex_pattern(text) is None:
+            questions.append("请提供完整正则表达式，或明确固定长度和字符类型。")
+        return RuleIntentInspection(
+            "regex_format", tuple(dict.fromkeys(questions))[:5]
+        )
+
+    if re.search(r"长度|字符数|位数|几个字符", text):
+        require_fields(1, "请写明需要限制字符长度的字段名称。")
+        if not TemplateRuleAuthoringProvider._length_parameters(text):
+            questions.append("请提供字符长度的最小值、最大值或固定长度。")
+        return RuleIntentInspection(
+            "string_length", tuple(dict.fromkeys(questions))[:5]
+        )
+
+    if re.search(r"主键|唯一标识|唯一编码|唯一编号", text):
+        require_fields(1, "请写明组成主键或唯一标识的全部字段名称。")
+        return RuleIntentInspection(
+            "primary_key", tuple(dict.fromkeys(questions))[:5]
+        )
+
+    if re.search(r"只能|允许值|枚举|取值范围|状态值", text):
+        require_fields(1, "请写明允许值约束对应的字段名称。")
+        values_match = re.search(
+            r"(?:只能(?:为|是)|允许值(?:为|是|包括)?|取值(?:为|是|包括)?|"
+            r"枚举(?:为|是|包括)?)\s*(.+)$",
+            text,
+        )
+        values_text = values_match.group(1).strip() if values_match else ""
+        values_text = re.split(r"[。；;！!]", values_text)[0].strip()
+        if not values_text:
+            questions.append("请列出字段允许的完整取值列表。")
+        return RuleIntentInspection(
+            "allowed_values", tuple(dict.fromkeys(questions))[:5]
+        )
+
+    if re.search(r"更新时间|更新日期|及时更新|时效|新鲜度|及时", text):
+        require_fields(1, "请明确写出更新时间字段名称。")
+        if not re.search(
+            r"每日|每天|日更新|每周|每星期|周更新|每月|月更新|每季度|季度更新|"
+            r"每年|年度更新|年更新|(?:不超过|最长|间隔|滞后)\s*\d+\s*天",
+            text,
+        ):
+            questions.append("请说明更新频率或允许的最长间隔天数。")
+        return RuleIntentInspection(
+            "update_freshness", tuple(dict.fromkeys(questions))[:5]
+        )
+
+    if re.search(
+        r"范围|区间|不低于|不高于|至少|至多|大于|小于|不得低于|不得超过|≥|≤",
+        text,
+    ):
+        require_fields(1, "请写明需要进行数值范围约束的字段名称。")
+        if not re.search(r"-?\d+(?:\.\d+)?", text):
+            questions.append("请提供数值下限、上限，或完整的闭区间范围。")
+        return RuleIntentInspection(
+            "numeric_range", tuple(dict.fromkeys(questions))[:5]
+        )
+
+    if re.search(r"必填|必须填写|不得为空|不能为空|不可为空|必需有值", text):
+        require_fields(1, "请写明需要设为必填的字段名称。")
+        return RuleIntentInspection(
+            "required", tuple(dict.fromkeys(questions))[:5]
+        )
+
+    metric = context.get("metric")
+    required_inputs = (
+        metric.get("required_inputs", []) if isinstance(metric, Mapping) else []
+    )
+    requirement = "、".join(str(item) for item in required_inputs if str(item).strip())
+    suffix = f"；该指标还需要：{requirement}" if requirement else ""
+    return RuleIntentInspection(
+        None,
+        (
+            "请明确规则类型、字段名称和完整条件；当前支持必填、唯一、允许值、"
+            f"更新时间、数值范围、格式、长度、条件必填或跨字段比较{suffix}。",
+        ),
+    )
 
 
 def build_rule_input_guidance(
@@ -1110,8 +1276,10 @@ __all__ = [
     "RuleAuthoringProviderError",
     "RuleAuthoringProviderResult",
     "RuleAuthoringProviderUnavailable",
+    "RuleIntentInspection",
     "TemplateRuleAuthoringProvider",
     "build_rule_input_guidance",
     "default_rule_authoring_provider",
+    "inspect_rule_intent",
     "parse_provider_payload",
 ]
