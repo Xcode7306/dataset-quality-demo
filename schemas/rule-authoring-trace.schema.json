@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rule-authoring-trace.schema.json",
+  "title": "RuleAuthoringTrace v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "trace_id", "workflow_id", "target", "context",
+    "provider", "started_at", "completed_at", "outcome", "transitions",
+    "tool_calls", "retrieval", "draft", "validation_status",
+    "dry_run_status", "approval_id", "execution_result_id", "retry_count",
+    "fallback_used", "fallback_reason", "failure", "semantic_fingerprint"
+  ],
+  "properties": {
+    "schema_version": {"const": "0.1"},
+    "trace_id": {"type": "string", "pattern": "^trace-[a-f0-9]{20}$"},
+    "workflow_id": {"type": "string", "pattern": "^workflow-[a-z0-9][a-z0-9._-]{5,79}$"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "metric_id", "case_id"],
+      "properties": {
+        "type": {"enum": ["catalog_metric", "custom_rule", "rag_query"]},
+        "metric_id": {"type": ["string", "null"], "maxLength": 120},
+        "case_id": {"type": ["string", "null"], "maxLength": 120}
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report_sha256", "input_sha256", "reference_date", "report_status",
+        "row_count", "column_count", "selected_metric_ids"
+      ],
+      "properties": {
+        "report_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+        "input_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+        "reference_date": {"type": ["string", "null"], "maxLength": 40},
+        "report_status": {"type": ["string", "null"], "maxLength": 40},
+        "row_count": {"type": ["integer", "null"], "minimum": 0},
+        "column_count": {"type": ["integer", "null"], "minimum": 0},
+        "selected_metric_ids": {
+          "type": "array", "maxItems": 100, "uniqueItems": true,
+          "items": {"type": "string", "maxLength": 120}
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider", "model", "mode", "prompt_version", "prompt_sha256",
+        "request_id", "input_tokens", "output_tokens"
+      ],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1, "maxLength": 120},
+        "model": {"type": ["string", "null"], "maxLength": 200},
+        "mode": {"enum": ["template", "model"]},
+        "prompt_version": {"type": "string", "minLength": 1, "maxLength": 200},
+        "prompt_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+        "request_id": {"type": ["string", "null"], "maxLength": 200},
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "output_tokens": {"type": "integer", "minimum": 0}
+      }
+    },
+    "started_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "completed_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "outcome": {"enum": ["draft", "clarification", "unsupported", "failed"]},
+    "transitions": {
+      "type": "array", "maxItems": 50,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["sequence", "from_state", "to_state", "at", "reason_code"],
+        "properties": {
+          "sequence": {"type": "integer", "minimum": 1},
+          "from_state": {"type": "string", "minLength": 1, "maxLength": 60},
+          "to_state": {"type": "string", "minLength": 1, "maxLength": 60},
+          "at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+          "reason_code": {"type": ["string", "null"], "maxLength": 120}
+        }
+      }
+    },
+    "tool_calls": {
+      "type": "array", "maxItems": 50,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": [
+          "sequence", "call_id", "tool_name", "arguments_sha256",
+          "argument_summary", "result_status", "result_sha256", "started_at",
+          "duration_ms", "error_code"
+        ],
+        "properties": {
+          "sequence": {"type": "integer", "minimum": 1},
+          "call_id": {"type": "string", "pattern": "^tool-[a-f0-9]{20}$"},
+          "tool_name": {"enum": [
+            "get_metric_definition", "get_profile_summary", "list_available_fields",
+            "retrieve_rule_evidence", "validate_rule_draft", "dry_run_rule"
+          ]},
+          "arguments_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "argument_summary": {"type": "object", "maxProperties": 30},
+          "result_status": {"enum": ["ok", "error", "rejected"]},
+          "result_sha256": {"type": ["string", "null"], "pattern": "^[a-f0-9]{64}$"},
+          "started_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+          "duration_ms": {"type": "integer", "minimum": 0, "maximum": 3600000},
+          "error_code": {"type": ["string", "null"], "maxLength": 120}
+        }
+      }
+    },
+    "retrieval": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "query_sha256", "filters", "chunk_ids", "conflict"],
+          "properties": {
+            "status": {"enum": ["ok", "no_results", "conflict"]},
+            "query_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "filters": {"type": "object", "maxProperties": 10},
+            "chunk_ids": {
+              "type": "array", "maxItems": 20, "uniqueItems": true,
+              "items": {"type": "string", "pattern": "^chunk-[a-f0-9]{20}$"}
+            },
+            "conflict": {"type": "boolean"}
+          }
+        }
+      ]
+    },
+    "draft": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["draft_id", "draft_schema_version", "status", "rule_id", "semantic_sha256"],
+          "properties": {
+            "draft_id": {"type": "string", "pattern": "^draft-[a-f0-9]{20}$"},
+            "draft_schema_version": {"type": "string", "maxLength": 20},
+            "status": {"type": "string", "maxLength": 60},
+            "rule_id": {"type": ["string", "null"], "maxLength": 120},
+            "semantic_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+          }
+        }
+      ]
+    },
+    "validation_status": {"enum": ["not_run", "passed", "failed"]},
+    "dry_run_status": {"enum": ["not_run", "passed", "failed"]},
+    "approval_id": {"type": ["string", "null"], "maxLength": 120},
+    "execution_result_id": {"type": ["string", "null"], "pattern": "^execution-[a-f0-9]{20}$"},
+    "retry_count": {"type": "integer", "minimum": 0, "maximum": 1},
+    "fallback_used": {"type": "boolean"},
+    "fallback_reason": {"type": ["string", "null"], "maxLength": 200},
+    "failure": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["stage", "code", "message"],
+          "properties": {
+            "stage": {"type": "string", "minLength": 1, "maxLength": 80},
+            "code": {"type": "string", "minLength": 1, "maxLength": 120},
+            "message": {"type": "string", "minLength": 1, "maxLength": 500}
+          }
+        }
+      ]
+    },
+    "semantic_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

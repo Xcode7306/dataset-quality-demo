@@ -1,0 +1,60 @@
+{
+  "schema_version": "0.1",
+  "cases": [
+    {
+      "case_id": "rag-approved-v1",
+      "documents": [
+        {"path": "harness/corpus/standard-required-v1.md", "approved": true, "effective_status": "active"}
+      ],
+      "query": "service_name 必须填写",
+      "filters": {"metric_id": "db31_020100", "standard_number": "DB31/T 9999-2026", "version": "v1"},
+      "expected": {"status": "ok", "minimum_results": 1, "document_version": "v1", "text_contains": "service_name"}
+    },
+    {
+      "case_id": "rag-no-result",
+      "documents": [
+        {"path": "harness/corpus/standard-required-v1.md", "approved": true, "effective_status": "active"}
+      ],
+      "query": "zz_nonexistent_clause_9988",
+      "filters": {},
+      "expected": {"status": "no_results", "minimum_results": 0, "document_version": null, "text_contains": null}
+    },
+    {
+      "case_id": "rag-version-conflict",
+      "documents": [
+        {"path": "harness/corpus/standard-required-v1.md", "approved": true, "effective_status": "active"},
+        {"path": "harness/corpus/standard-required-v2.md", "approved": true, "effective_status": "active"}
+      ],
+      "query": "service_name 必须填写",
+      "filters": {"metric_id": "db31_020100", "standard_number": "DB31/T 9999-2026"},
+      "expected": {"status": "conflict", "minimum_results": 2, "document_version": null, "text_contains": "service_name"}
+    },
+    {
+      "case_id": "rag-unapproved-source",
+      "documents": [
+        {"path": "harness/corpus/standard-required-v1.md", "approved": false, "effective_status": "active"}
+      ],
+      "query": "service_name 必须填写",
+      "filters": {},
+      "expected": {"status": "no_results", "minimum_results": 0, "document_version": null, "text_contains": null}
+    },
+    {
+      "case_id": "rag-expired-source",
+      "documents": [
+        {"path": "harness/corpus/standard-required-v1.md", "approved": true, "effective_status": "expired"}
+      ],
+      "query": "service_name 必须填写",
+      "filters": {},
+      "expected": {"status": "no_results", "minimum_results": 0, "document_version": null, "text_contains": null}
+    },
+    {
+      "case_id": "rag-wrong-version",
+      "documents": [
+        {"path": "harness/corpus/standard-required-v1.md", "approved": true, "effective_status": "active"}
+      ],
+      "query": "service_name 必须填写",
+      "filters": {"version": "v9"},
+      "expected": {"status": "no_results", "minimum_results": 0, "document_version": null, "text_contains": null}
+    }
+  ]
+}

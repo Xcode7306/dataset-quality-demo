@@ -6,7 +6,7 @@ Provider 只负责把用户自然语言解析成候选结构，不拥有审批�
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 import re
@@ -23,12 +23,15 @@ from .rule_dsl import (
 from .model_api import (
     extract_message_content,
     normalize_chat_completions_url,
-    parse_json_object_text,
     response_error_detail,
+)
+from .rule_authoring_prompts import (
+    DEFAULT_RULE_AUTHORING_PROMPT_VERSION,
+    get_rule_authoring_prompt,
 )
 
 
-RULE_AUTHORING_PROMPT_VERSION = "quality-rule-authoring-v0.9.0"
+RULE_AUTHORING_PROMPT_VERSION = DEFAULT_RULE_AUTHORING_PROMPT_VERSION
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEEPSEEK_CHAT_COMPLETIONS_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_TIMEOUT_SECONDS = 20.0
@@ -106,12 +109,13 @@ def _metadata(
     request_id: str | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
+    prompt_version: str = RULE_AUTHORING_PROMPT_VERSION,
 ) -> ProviderMetadata:
     return ProviderMetadata(
         provider=provider,
         model=model,
         mode="model" if mode == "model" else "template",
-        prompt_version=RULE_AUTHORING_PROMPT_VERSION,
+        prompt_version=prompt_version,
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
         request_id=request_id,
@@ -172,7 +176,26 @@ class TemplateRuleAuthoringProvider:
 
     cache_namespace = f"template:{RULE_AUTHORING_PROMPT_VERSION}"
 
+    def __init__(self, *, prompt_version: str = RULE_AUTHORING_PROMPT_VERSION) -> None:
+        self.prompt_version = get_rule_authoring_prompt(prompt_version).version
+        self.cache_namespace = f"template:{self.prompt_version}"
+
     def generate(
+        self,
+        context: Mapping[str, Any],
+        *,
+        user_intent: str,
+    ) -> RuleAuthoringProviderResult:
+        result = self._generate(context, user_intent=user_intent)
+        return replace(
+            result,
+            metadata=replace(
+                result.metadata,
+                prompt_version=self.prompt_version,
+            ),
+        )
+
+    def _generate(
         self,
         context: Mapping[str, Any],
         *,
@@ -571,14 +594,77 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
     """严格解析外部模型返回的 JSON，不做宽松修复。"""
 
     if isinstance(payload, str):
-        payload = parse_json_object_text(payload)
-        if payload is None:
-            raise RuleAuthoringProviderError("模型未返回合法 JSON 规则。")
+        try:
+            payload_size = len(payload.encode("utf-8", errors="strict"))
+        except UnicodeEncodeError as error:
+            raise RuleAuthoringProviderError("模型规则结果包含非法 Unicode。") from error
+        if payload_size > 64 * 1024:
+            raise RuleAuthoringProviderError("模型规则结果超过 64 KiB 上限。")
+
+        def reject_duplicate_pairs(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise RuleAuthoringProviderError(f"模型 JSON 包含重复键：{key}。")
+                result[key] = value
+            return result
+
+        try:
+            payload = json.loads(
+                payload,
+                object_pairs_hook=reject_duplicate_pairs,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    RuleAuthoringProviderError(
+                        f"模型 JSON 包含非标准数值：{value}。"
+                    )
+                ),
+            )
+        except RuleAuthoringProviderError:
+            raise
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise RuleAuthoringProviderError("模型未返回严格 JSON 规则。") from error
     if not isinstance(payload, Mapping):
         raise RuleAuthoringProviderError("模型规则结果必须是 JSON 对象。")
     payload = dict(payload)
+    if not all(isinstance(key, str) for key in payload):
+        raise RuleAuthoringProviderError("模型规则结果的 JSON 键必须是字符串。")
+    try:
+        json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(
+            "utf-8", errors="strict"
+        )
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise RuleAuthoringProviderError(
+            "模型规则结果包含不可序列化、非有限数值或非法 Unicode。"
+        ) from error
+
+    wrapper_fields = {
+        "outcome",
+        "rule_spec",
+        "evidence",
+        "assumptions",
+        "clarification_questions",
+        "unsupported_reason",
+    }
+    rule_spec_fields = {
+        "rule_type",
+        "rule_id",
+        "name",
+        "description",
+        "fields",
+        "parameters",
+        "severity",
+        "denominator_policy",
+        "missing_value_policy",
+        "evidence_ids",
+        "resource_policy",
+    }
     if not {"outcome", "rule_spec"}.issubset(payload):
         if "rule_type" in payload and "fields" in payload:
+            unknown = sorted(set(payload) - rule_spec_fields)
+            if unknown:
+                raise RuleAuthoringProviderError(
+                    f"模型 rule_spec 包含未允许字段：{unknown}。"
+                )
             payload = {
                 "outcome": "draft",
                 "rule_spec": payload,
@@ -587,6 +673,13 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
                 "unsupported_reason": None,
             }
         elif "clarification_questions" in payload:
+            unknown = sorted(
+                set(payload) - {"assumptions", "clarification_questions"}
+            )
+            if unknown:
+                raise RuleAuthoringProviderError(
+                    f"模型澄清结果包含未允许字段：{unknown}。"
+                )
             payload = {
                 "outcome": "clarification",
                 "rule_spec": None,
@@ -600,6 +693,11 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
             raise RuleAuthoringProviderError(
                 "模型规则结果缺少 outcome、rule_spec 或 clarification_questions。"
             )
+    unknown = sorted(set(payload) - wrapper_fields)
+    if unknown:
+        raise RuleAuthoringProviderError(
+            f"模型规则结果包含未允许字段：{unknown}。"
+        )
     payload.setdefault("assumptions", [])
     payload.setdefault("clarification_questions", [])
     payload.setdefault("unsupported_reason", None)
@@ -620,9 +718,31 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
     if not isinstance(raw_evidence, list) or len(raw_evidence) > 20:
         raise RuleAuthoringProviderError("模型返回的 evidence 必须是不超过 20 项的数组。")
     evidence: list[RuleEvidence] = []
+    evidence_fields = {
+        "type",
+        "text",
+        "source_id",
+        "source_label",
+        "location",
+        "authoritative",
+        "document_id",
+        "document_name",
+        "document_version",
+        "section",
+        "clause",
+        "chunk_id",
+        "page",
+    }
     for index, item in enumerate(raw_evidence):
         if not isinstance(item, Mapping):
             raise RuleAuthoringProviderError(f"evidence[{index}] 必须是对象。")
+        if not all(isinstance(key, str) for key in item):
+            raise RuleAuthoringProviderError(f"evidence[{index}] 的 JSON 键必须是字符串。")
+        unknown = sorted(set(item) - evidence_fields)
+        if unknown:
+            raise RuleAuthoringProviderError(
+                f"evidence[{index}] 包含未允许字段：{unknown}。"
+            )
         evidence_type = item.get("type")
         if evidence_type not in {"standard_clause", "data_dictionary"}:
             raise RuleAuthoringProviderError(
@@ -638,6 +758,29 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
             isinstance(page, bool) or not isinstance(page, int) or page < 1
         ):
             raise RuleAuthoringProviderError(f"evidence[{index}].page 无效。")
+        authoritative = item.get("authoritative", False)
+        if not isinstance(authoritative, bool):
+            raise RuleAuthoringProviderError(
+                f"evidence[{index}].authoritative 必须是布尔值。"
+            )
+        for key, maximum in (
+            ("source_id", 300),
+            ("source_label", 300),
+            ("location", 500),
+            ("document_id", 120),
+            ("document_name", 300),
+            ("document_version", 100),
+            ("section", 300),
+            ("clause", 120),
+            ("chunk_id", 120),
+        ):
+            value = item.get(key)
+            if value is not None and (
+                not isinstance(value, str) or len(value) > maximum
+            ):
+                raise RuleAuthoringProviderError(
+                    f"evidence[{index}].{key} 必须是不超过 {maximum} 个字符的字符串或 null。"
+                )
         evidence.append(
             new_evidence(
                 evidence_type,  # type: ignore[arg-type]
@@ -645,7 +788,7 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
                 source_id=item.get("source_id"),
                 source_label=item.get("source_label"),
                 location=item.get("location"),
-                authoritative=bool(item.get("authoritative", False)),
+                authoritative=authoritative,
                 document_id=item.get("document_id"),
                 document_name=item.get("document_name"),
                 document_version=item.get("document_version"),
@@ -660,6 +803,13 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
     if rule_spec_payload is not None:
         if not isinstance(rule_spec_payload, Mapping):
             raise RuleAuthoringProviderError("rule_spec 必须是对象或 null。")
+        if not all(isinstance(key, str) for key in rule_spec_payload):
+            raise RuleAuthoringProviderError("rule_spec 的 JSON 键必须是字符串。")
+        unknown = sorted(set(rule_spec_payload) - rule_spec_fields)
+        if unknown:
+            raise RuleAuthoringProviderError(
+                f"模型 rule_spec 包含未允许字段：{unknown}。"
+            )
         normalized_rule_spec = {
             "rule_type": rule_spec_payload.get("rule_type"),
             "rule_id": rule_spec_payload.get("rule_id", "model-candidate"),
@@ -687,6 +837,8 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
             raise RuleAuthoringProviderError(
                 f"模型规则字段无法转换：{error}"
             ) from error
+        if len(set(rule_spec.fields)) != len(rule_spec.fields):
+            raise RuleAuthoringProviderError("模型 rule_spec.fields 不能包含重复字段。")
         try:
             json.dumps(rule_spec.to_dict(), ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as error:
@@ -696,6 +848,12 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
     unsupported_reason = payload["unsupported_reason"]
     if unsupported_reason is not None and not isinstance(unsupported_reason, str):
         raise RuleAuthoringProviderError("unsupported_reason 必须是字符串或 null。")
+    if isinstance(unsupported_reason, str) and (
+        not unsupported_reason.strip() or len(unsupported_reason) > 2000
+    ):
+        raise RuleAuthoringProviderError(
+            "unsupported_reason 必须是 1 到 2000 个字符。"
+        )
     if outcome == "draft" and rule_spec is None:
         raise RuleAuthoringProviderError("draft outcome 必须携带 rule_spec。")
     if outcome != "draft" and rule_spec is not None:
@@ -713,9 +871,6 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
     )
 
 
-_MODEL_SYSTEM_PROMPT = """你是政务数据质量规则编译器。只将用户依据编译为当前允许的 Rule DSL：primary_key、required、update_freshness、allowed_values、numeric_range、regex_format、string_length、conditional_required、field_comparison。不得输出 Python、SQL、脚本、外键、跨表查询或任意函数。关键字段、阈值、频率、正则、条件值或比较运算符缺失时输出 clarification；跨表参照、自动清洗、数据写回和删除需求输出 unsupported。若输入包含 rag_evidence，只能引用其中真实存在的 chunk_id，不能创建文档、版本或条款；没有检索依据时不得声称符合标准。只返回指定 JSON，不要 Markdown。"""
-
-
 class DeepSeekRuleAuthoringProvider:
     """可选 Chat Completions 结构化输出适配。"""
 
@@ -728,6 +883,7 @@ class DeepSeekRuleAuthoringProvider:
         provider_name: str = "deepseek",
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         client_factory: Callable[..., Any] | None = None,
+        prompt_version: str = RULE_AUTHORING_PROMPT_VERSION,
     ) -> None:
         self.model = model or os.environ.get("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL
         self._api_key = api_key
@@ -735,6 +891,8 @@ class DeepSeekRuleAuthoringProvider:
         self.provider_name = provider_name.strip() or "deepseek"
         self.timeout_seconds = float(timeout_seconds)
         self._client_factory = client_factory
+        self.prompt = get_rule_authoring_prompt(prompt_version)
+        self.prompt_version = self.prompt.version
 
     def _client(self) -> tuple[Any, dict[str, str]]:
         api_key = (
@@ -865,7 +1023,7 @@ class DeepSeekRuleAuthoringProvider:
                 payload={
                     "model": self.model,
                     "messages": [
-                        {"role": "system", "content": _MODEL_SYSTEM_PROMPT},
+                        {"role": "system", "content": self.prompt.system_prompt},
                         {
                             "role": "user",
                     "content": json.dumps(
@@ -903,6 +1061,7 @@ class DeepSeekRuleAuthoringProvider:
                     request_id=request_id,
                     input_tokens=usage.get("prompt_tokens", 0),
                     output_tokens=usage.get("completion_tokens", 0),
+                    prompt_version=self.prompt_version,
                 ),
             )
         finally:
@@ -922,6 +1081,7 @@ class OpenAICompatibleRuleAuthoringProvider(DeepSeekRuleAuthoringProvider):
         model: str,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         client_factory: Callable[..., Any] | None = None,
+        prompt_version: str = RULE_AUTHORING_PROMPT_VERSION,
     ) -> None:
         super().__init__(
             model=model,
@@ -930,6 +1090,7 @@ class OpenAICompatibleRuleAuthoringProvider(DeepSeekRuleAuthoringProvider):
             provider_name="custom",
             timeout_seconds=timeout_seconds,
             client_factory=client_factory,
+            prompt_version=prompt_version,
         )
 
 

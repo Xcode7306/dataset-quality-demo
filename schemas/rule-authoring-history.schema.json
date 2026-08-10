@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rule-authoring-history.schema.json",
+  "title": "RuleAuthoringHistory v1.0",
+  "description": "Bounded summary history kept only in the current application session.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "storage",
+    "cross_session_persistence",
+    "limit",
+    "records"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "storage": {"const": "current_session_memory"},
+    "cross_session_persistence": {"const": false},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+    "records": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"$ref": "rule-authoring-workflow.schema.json"}
+    }
+  }
+}

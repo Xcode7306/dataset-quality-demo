@@ -1,0 +1,269 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rule-authoring-workflow.schema.json",
+  "title": "RuleAuthoringWorkflow v1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "workflow_id",
+    "target",
+    "context",
+    "state",
+    "message",
+    "revision",
+    "retry_count",
+    "draft",
+    "validation",
+    "dry_run",
+    "approval_id",
+    "execution_result_id",
+    "failure",
+    "transitions",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "workflow_id": {
+      "type": "string",
+      "pattern": "^workflow-[a-z0-9][a-z0-9._-]{5,79}$"
+    },
+    "target": {"$ref": "#/$defs/target"},
+    "context": {"$ref": "#/$defs/context"},
+    "state": {"$ref": "#/$defs/state"},
+    "message": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "maxLength": 500}
+      ]
+    },
+    "revision": {"type": "integer", "minimum": 1, "maximum": 1000000},
+    "retry_count": {"type": "integer", "minimum": 0, "maximum": 1},
+    "draft": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/draftSummary"}]
+    },
+    "validation": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/validationSummary"}]
+    },
+    "dry_run": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/dryRunSummary"}]
+    },
+    "approval_id": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^approval-[a-f0-9]{20}$"}
+      ]
+    },
+    "execution_result_id": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^execution-[a-f0-9]{20}$"}
+      ]
+    },
+    "failure": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/failure"}]
+    },
+    "transitions": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/transition"}
+    },
+    "created_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "updated_at": {"type": "string", "format": "date-time", "pattern": "Z$"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"target": {"properties": {"type": {"const": "catalog_metric"}}}}},
+      "then": {"properties": {"target": {"properties": {"metric_id": {"type": "string", "minLength": 1}}}}}
+    },
+    {
+      "if": {"properties": {"target": {"properties": {"type": {"const": "custom_rule"}}}}},
+      "then": {"properties": {"target": {"properties": {"metric_id": {"type": "null"}}}}}
+    },
+    {
+      "if": {"properties": {"state": {"enum": ["draft", "validated", "dry_run_complete", "awaiting_approval", "approved", "executed"]}}},
+      "then": {"properties": {"draft": {"$ref": "#/$defs/draftSummary"}}}
+    },
+    {
+      "if": {"properties": {"state": {"enum": ["validated", "dry_run_complete", "awaiting_approval", "approved", "executed"]}}},
+      "then": {
+        "properties": {
+          "validation": {
+            "allOf": [
+              {"$ref": "#/$defs/validationSummary"},
+              {"properties": {"valid": {"const": true}, "error_count": {"const": 0}}}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"state": {"enum": ["dry_run_complete", "awaiting_approval", "approved", "executed"]}}},
+      "then": {"properties": {"dry_run": {"$ref": "#/$defs/dryRunSummary"}}}
+    },
+    {
+      "if": {"properties": {"state": {"enum": ["approved", "executed"]}}},
+      "then": {"properties": {"approval_id": {"type": "string", "pattern": "^approval-[a-f0-9]{20}$"}}}
+    },
+    {
+      "if": {"properties": {"state": {"const": "executed"}}},
+      "then": {"properties": {"execution_result_id": {"type": "string", "pattern": "^execution-[a-f0-9]{20}$"}}}
+    },
+    {
+      "if": {"properties": {"state": {"const": "failed"}}},
+      "then": {"properties": {"failure": {"$ref": "#/$defs/failure"}}},
+      "else": {"properties": {"failure": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "state": {
+      "enum": [
+        "collecting",
+        "retrieving",
+        "needs_clarification",
+        "compiling",
+        "draft",
+        "validated",
+        "dry_run_complete",
+        "awaiting_approval",
+        "approved",
+        "executed",
+        "rejected",
+        "failed"
+      ]
+    },
+    "nullableHash": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      ]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "metric_id"],
+      "properties": {
+        "type": {"enum": ["catalog_metric", "custom_rule"]},
+        "metric_id": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "minLength": 1, "maxLength": 120}
+          ]
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["report_sha256", "input_sha256", "reference_date", "selected_metric_ids", "request_fingerprint"],
+      "properties": {
+        "report_sha256": {"$ref": "#/$defs/nullableHash"},
+        "input_sha256": {"$ref": "#/$defs/nullableHash"},
+        "reference_date": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "format": "date", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+          ]
+        },
+        "selected_metric_ids": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 120}
+        },
+        "request_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "draftSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["draft_id", "draft_sha256", "status", "rule_id", "rule_type", "evidence_ids"],
+      "properties": {
+        "draft_id": {"type": "string", "pattern": "^draft-[a-f0-9]{20}$"},
+        "draft_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "status": {"$ref": "#/$defs/state"},
+        "rule_id": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^[a-z][a-z0-9._-]{2,79}$"}
+          ]
+        },
+        "rule_type": {
+          "oneOf": [
+            {"type": "null"},
+            {"enum": ["primary_key", "required", "update_freshness", "allowed_values", "numeric_range", "regex_format", "string_length", "conditional_required", "field_comparison"]}
+          ]
+        },
+        "evidence_ids": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 120}
+        }
+      }
+    },
+    "validationSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "error_count", "warning_count"],
+      "properties": {
+        "valid": {"type": "boolean"},
+        "error_count": {"type": "integer", "minimum": 0},
+        "warning_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "dryRunSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "rule_pack_id", "rule_pack_version", "counts"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "rule_pack_id": {
+          "oneOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 120}]
+        },
+        "rule_pack_version": {
+          "oneOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 100}]
+        },
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "checked": {"type": "integer", "minimum": 0},
+            "compliant": {"type": "integer", "minimum": 0},
+            "issues": {"type": "integer", "minimum": 0},
+            "not_assessable": {"type": "integer", "minimum": 0},
+            "issue_locations": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "code", "message", "recoverable_state"],
+      "properties": {
+        "stage": {"type": "string", "minLength": 1, "maxLength": 80},
+        "code": {"type": "string", "minLength": 1, "maxLength": 120},
+        "message": {"type": "string", "minLength": 1, "maxLength": 500},
+        "recoverable_state": {
+          "enum": ["compiling", "validated", "dry_run_complete", "approved"]
+        }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "from_state", "to_state", "at", "reason_code"],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 1, "maximum": 64},
+        "from_state": {"$ref": "#/$defs/state"},
+        "to_state": {"$ref": "#/$defs/state"},
+        "at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+        "reason_code": {
+          "oneOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 120}]
+        }
+      }
+    }
+  }
+}
