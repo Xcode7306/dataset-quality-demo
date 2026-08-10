@@ -58,14 +58,19 @@ class StreamlitAppTests(unittest.TestCase):
         dataset_name="",
         sheet_name=None,
     ):
-        app.file_uploader[0].set_value((file_name, content, mime_type))
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value((file_name, content, mime_type))
         app.run()
         app.date_input[0].set_value(REFERENCE_DATE)
         if dataset_name:
-            app.text_input[0].set_value(dataset_name)
+            next(
+                item for item in app.text_input if item.label == "数据集名称（可选）"
+            ).set_value(dataset_name)
         if sheet_name is not None:
-            self.assertGreaterEqual(len(app.text_input), 2)
-            app.text_input[1].set_value(sheet_name)
+            next(
+                item for item in app.text_input if item.label == "工作表名称（可选）"
+            ).set_value(sheet_name)
         run_button = self._button_by_label(app, "运行质量评估")
         self.assertFalse(run_button.disabled)
         run_button.click().run()
@@ -191,7 +196,9 @@ class StreamlitAppTests(unittest.TestCase):
         self._metric_checkbox(app, "db31_010100").set_value(True)
         app.run()
 
-        app.file_uploader[0].set_value(
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(
             (sample.name, sample.read_bytes(), "text/csv")
         )
         app.run()
@@ -309,7 +316,9 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertIn("agent_ui_state", app.session_state.filtered_state)
         self.assertIn("rule_ui_state", app.session_state.filtered_state)
 
-        app.file_uploader[0].set_value(None)
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(None)
         app.run()
         self.assertFalse(app.exception)
         self.assertNotIn("quality_report", app.session_state.filtered_state)
@@ -350,7 +359,9 @@ class StreamlitAppTests(unittest.TestCase):
         )
         self.assertEqual(len(app.checkbox), 0)
         self.assertIn("quality_report", app.session_state.filtered_state)
-        app.file_uploader[0].set_value(None)
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(None)
         app.run()
 
         self.assertFalse(app.exception)
@@ -405,7 +416,9 @@ class StreamlitAppTests(unittest.TestCase):
         )
         self.assertEqual(app.session_state["quality_report"].dataset.file_type, "csv")
 
-        app.file_uploader[0].set_value(
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(
             (
                 "minimal_dataset.json",
                 (samples / "minimal_dataset.json").read_bytes(),
@@ -545,9 +558,13 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertTrue(state["history"][0]["is_question"])
         self.assertGreaterEqual(len(app.chat_message), 2)
 
-        app.file_uploader[0].set_value(None)
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(None)
         app.run()
-        app.file_uploader[0].set_value(
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(
             (sample.name, sample.read_bytes(), "application/json")
         )
         app.run()

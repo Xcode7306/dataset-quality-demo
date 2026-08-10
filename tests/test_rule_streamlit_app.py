@@ -30,7 +30,9 @@ class RuleStreamlitAppTests(unittest.TestCase):
             default_timeout=60,
         )
         app.run()
-        app.file_uploader[0].set_value(
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(
             (sample.name, sample.read_bytes(), "text/csv")
         )
         app.run()
@@ -176,7 +178,9 @@ class RuleStreamlitAppTests(unittest.TestCase):
         )
 
         sample = PROJECT_ROOT / "sample_data" / "minimal_dataset.json"
-        app.file_uploader[0].set_value(
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(
             (sample.name, sample.read_bytes(), "application/json")
         )
         app.run()

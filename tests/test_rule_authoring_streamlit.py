@@ -37,7 +37,9 @@ class RuleAuthoringStreamlitTests(unittest.TestCase):
         app.run()
 
         sample = ROOT / "sample_data" / "good_dataset.csv"
-        app.file_uploader[0].set_value(
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value(
             (sample.name, sample.read_bytes(), "text/csv")
         )
         app.run()
