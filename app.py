@@ -42,20 +42,23 @@ from src.presentation import (
 )
 from src.resource_limits import MAX_INPUT_FILE_MIB
 from src.rule_engine import RulePackExecutionError
-from src.rule_authoring_service import (
-    build_rule_pack_from_draft,
-    compile_custom_rule_draft,
-    compile_rule_draft,
-    validate_rule_draft,
+from src.rule_authoring_coordinator import (
+    RuleAuthoringCoordinatorError,
+    RuleAuthoringRun,
+    approve_rule_authoring_run,
+    begin_rule_authoring_run,
+    compile_rule_authoring_run,
+    dry_run_rule_authoring_run,
+    execute_rule_authoring_run,
+    retry_rule_authoring_run,
+    validate_rule_authoring_run,
 )
 from src.rule_authoring_providers import (
     DeepSeekRuleAuthoringProvider,
     OpenAICompatibleRuleAuthoringProvider,
-    RuleAuthoringProviderError,
-    RuleAuthoringProviderUnavailable,
     build_rule_input_guidance,
 )
-from src.rule_dsl import RuleDraftValidationError
+from src.rule_authoring_workflow import RuleAuthoringHistory
 from src.rule_authoring_tools import build_rule_authoring_context
 from src.rag.citations import response_source_summary
 from src.rag.ingestion import RagIngestionError
@@ -92,6 +95,7 @@ AGENT_STATE_KEY = "agent_ui_state"
 RULE_STATE_KEY = "rule_ui_state"
 RULE_AUTHORING_STATE_KEY = "rule_authoring_ui_state"
 CUSTOM_RULE_STATE_KEY = "custom_rule_ui_state"
+RULE_WORKFLOW_HISTORY_KEY = "rule_authoring_workflow_history"
 RAG_STATE_KEY = "rag_ui_state"
 METRIC_SELECTION_KEY = "selected_metric_ids"
 METRIC_SELECTION_WIDGET_PREFIX = "metric_selection_checkbox_"
@@ -685,6 +689,102 @@ def _report_sha256(report: QualityReport) -> str:
     )
 
 
+def _rule_workflow_history() -> RuleAuthoringHistory:
+    """返回当前浏览器会话内、最多 20 条的工作流摘要历史。"""
+
+    history = st.session_state.get(RULE_WORKFLOW_HISTORY_KEY)
+    if not isinstance(history, RuleAuthoringHistory):
+        history = RuleAuthoringHistory()
+        st.session_state[RULE_WORKFLOW_HISTORY_KEY] = history
+    return history
+
+
+def _store_rule_authoring_run(run: RuleAuthoringRun) -> None:
+    """只把脱敏工作流摘要写入当前会话历史，不保存上传字节。"""
+
+    st.session_state[RULE_WORKFLOW_HISTORY_KEY] = _rule_workflow_history().upsert(
+        run.workflow
+    )
+
+
+def _render_rule_workflow_status(run: RuleAuthoringRun) -> None:
+    """展示由本地代码控制的状态与完整转换链。"""
+
+    workflow = run.workflow
+    state_labels = {
+        "collecting": "收集请求",
+        "retrieving": "检索依据",
+        "needs_clarification": "等待补充",
+        "compiling": "编译规则",
+        "draft": "规则草案",
+        "validated": "校验通过",
+        "dry_run_complete": "试运行完成",
+        "awaiting_approval": "等待审批",
+        "approved": "已审批",
+        "executed": "已执行",
+        "rejected": "已拒绝",
+        "failed": "执行失败",
+    }
+    st.caption(
+        "v1.0 工作流 · "
+        f"{state_labels.get(workflow.state, workflow.state)} · "
+        f"重试 {workflow.retry_count}/1 · {workflow.workflow_id}"
+    )
+    with st.expander(
+        "查看工作流状态与恢复记录",
+        expanded=workflow.state == "failed",
+    ):
+        st.json(workflow.to_dict())
+        st.caption("状态由本地确定性代码推进；模型不能审批、执行或选择恢复点。")
+
+
+def _render_rule_workflow_history() -> None:
+    """展示并导出当前会话的有界摘要历史。"""
+
+    history = _rule_workflow_history()
+    with st.expander("规则工作流历史（当前会话）"):
+        st.caption(
+            "最多保留 20 条脱敏摘要；不包含原始上传内容、API 密钥，关闭会话后不持久化。"
+        )
+        if not history.records:
+            st.info("当前会话还没有规则工作流记录。")
+            return
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "更新时间": item.updated_at,
+                        "目标": item.target_metric_id or "自定义规则",
+                        "状态": item.state,
+                        "重试": f"{item.retry_count}/1",
+                        "工作流": item.workflow_id,
+                    }
+                    for item in reversed(history.records)
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        st.download_button(
+            "下载工作流历史（JSON）",
+            data=json.dumps(
+                history.to_dict(),
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            ).encode("utf-8"),
+            file_name="rule_authoring_history_v1.0.json",
+            mime="application/json",
+            key="download_rule_workflow_history_v10",
+        )
+        if st.button(
+            "清空当前会话工作流历史",
+            key="clear_rule_workflow_history_v10",
+        ):
+            st.session_state[RULE_WORKFLOW_HISTORY_KEY] = history.clear()
+            st.success("当前会话工作流历史已清空。")
+
+
 def _selected_metric_ids_for_report(
     report: QualityReport,
 ) -> tuple[str, ...]:
@@ -786,13 +886,14 @@ def _rule_state_for(report: QualityReport) -> dict:
 
 
 def _rule_authoring_state_for(report: QualityReport) -> dict:
-    """返回绑定当前报告的 v0.7 指标规则编制状态。"""
+    """返回绑定当前报告的 v1.0 指标规则编制状态。"""
 
     report_sha256 = _report_sha256(report)
     state = st.session_state.get(RULE_AUTHORING_STATE_KEY)
     if not isinstance(state, dict) or state.get("report_sha256") != report_sha256:
         state = {
             "report_sha256": report_sha256,
+            "runs": {},
             "drafts": {},
             "draft_signatures": {},
             "validations": {},
@@ -831,6 +932,7 @@ def _reset_metric_authoring_state(
 
     updated = dict(state)
     for collection_name in (
+        "runs",
         "drafts",
         "validations",
         "dry_runs",
@@ -849,6 +951,68 @@ def _reset_metric_authoring_state(
         signatures[metric_id] = draft_signature
     updated["draft_signatures"] = signatures
     return updated
+
+
+def _sync_metric_authoring_run(
+    state: dict,
+    metric_id: str,
+    run: RuleAuthoringRun,
+    *,
+    draft_signature: str,
+) -> dict:
+    """把 v1.0 run 同步到兼容旧页面测试的各个视图字段。"""
+
+    updated = _reset_metric_authoring_state(
+        state,
+        metric_id,
+        draft_signature=draft_signature,
+    )
+    mappings = {
+        "runs": run,
+        "drafts": run.workflow.draft,
+        "validations": run.workflow.validation,
+        "dry_runs": run.preview.to_dict() if run.preview is not None else None,
+        "approved_packs": run.approved_pack,
+        "results": run.result,
+        "execution_errors": (
+            run.workflow.error
+            if run.workflow.state in {"failed", "needs_clarification", "rejected"}
+            else None
+        ),
+    }
+    for collection_name, value in mappings.items():
+        collection = dict(updated.get(collection_name, {}))
+        if value is None:
+            collection.pop(metric_id, None)
+        else:
+            collection[metric_id] = value
+        updated[collection_name] = collection
+    _store_rule_authoring_run(run)
+    return updated
+
+
+def _custom_authoring_state(
+    *,
+    signature: str,
+    run: RuleAuthoringRun,
+    error: str | None = None,
+) -> dict:
+    """构造 v1.0 自定义规则状态，并保留旧字段兼容。"""
+
+    _store_rule_authoring_run(run)
+    return {
+        "signature": signature,
+        "run": run,
+        "draft": run.workflow.draft,
+        "dry_run": run.preview.to_dict() if run.preview is not None else None,
+        "approved_pack": run.approved_pack,
+        "result": run.result,
+        "error": error or (
+            run.workflow.error
+            if run.workflow.state in {"failed", "needs_clarification", "rejected"}
+            else None
+        ),
+    }
 
 
 def _clear_rule_approval_widgets() -> None:
@@ -1792,12 +1956,13 @@ def _render_custom_rule_authoring(
     reference_date: date,
     selected_metric_ids: tuple[str, ...],
 ) -> None:
-    """渲染 v0.9 自然语言自定义规则闭环。"""
+    """渲染 v1.0 可恢复的自然语言自定义规则闭环。"""
 
-    st.subheader("自定义规则（v0.9）")
+    st.subheader("自定义规则（v1.0）")
     st.caption(
         "用自然语言新增一条业务规则。当前支持格式/正则、字符长度、"
         "条件必填和跨字段比较；规则仍须经过确定性校验、试运行和人工批准。"
+        "工作流状态、一次失败恢复及当前会话历史均由本地代码控制。"
     )
     if uploaded_file is None:
         st.info("当前上传内容已不可用，请重新选择文件。")
@@ -1844,39 +2009,101 @@ def _render_custom_rule_authoring(
         "AI 解析自定义规则",
         key="compile_custom_rule_v08",
         width="stretch",
-        disabled=not bool(basis),
+        disabled=(
+            not bool(basis)
+            or isinstance(state.get("run"), RuleAuthoringRun)
+        ),
     ):
+        run = None
         try:
+            run = begin_rule_authoring_run(
+                report,
+                target_metric_id=None,
+                user_intent=basis,
+                selected_metric_ids=selected_metric_ids,
+                selected_chunk_ids=rag_chunk_ids,
+            )
             provider = _build_rule_authoring_provider()
-            compile_kwargs = {
-                "user_intent": basis,
-                "allow_template_fallback": provider is None,
-                "rag_response": rag_response,
-                "selected_chunk_ids": rag_chunk_ids,
-            }
-            if provider is not None:
-                compile_kwargs["provider"] = provider
-            draft = compile_custom_rule_draft(report, **compile_kwargs)
-        except (RuleAuthoringProviderUnavailable, RuleAuthoringProviderError, RuleDraftValidationError, ValueError) as error:
-            state = {
-                "signature": signature,
-                "error": _model_error_detail(error),
-            }
+            run = compile_rule_authoring_run(
+                run,
+                report,
+                user_intent=basis,
+                provider=provider,
+                allow_template_fallback=provider is None,
+                rag_response=rag_response,
+                selected_chunk_ids=rag_chunk_ids,
+            )
+            if run.workflow.state == "draft":
+                run = validate_rule_authoring_run(run, report)
+        except (RuleAuthoringCoordinatorError, ValueError) as error:
+            if run is not None and run.workflow.state == "compiling":
+                run = RuleAuthoringRun(
+                    workflow=run.workflow.fail(
+                        stage="compiling",
+                        code="provider_configuration_failed",
+                        message=str(error),
+                    )
+                )
+                state = _custom_authoring_state(signature=signature, run=run)
+            else:
+                state = {
+                    "signature": signature,
+                    "error": _model_error_detail(error),
+                }
             st.session_state[CUSTOM_RULE_STATE_KEY] = state
             st.error(f"自定义规则解析失败：{_escape_markdown(str(error))}")
         else:
-            state = {
-                "signature": signature,
-                "draft": draft,
-                "dry_run": None,
-                "approved_pack": None,
-                "result": None,
-                "error": None,
-            }
+            state = _custom_authoring_state(signature=signature, run=run)
             st.session_state[CUSTOM_RULE_STATE_KEY] = state
 
     state = st.session_state.get(CUSTOM_RULE_STATE_KEY, state)
-    if state.get("error"):
+    run = state.get("run")
+    if (
+        isinstance(run, RuleAuthoringRun)
+        and run.workflow.state == "failed"
+        and run.workflow.recoverable_state == "compiling"
+    ):
+        st.error(f"规则编译失败：{_escape_markdown(run.workflow.error or '未知错误')}")
+        if run.workflow.can_retry and st.button(
+            "重试失败步骤（最多一次）",
+            key="retry_custom_compile_v10",
+            width="stretch",
+        ):
+            try:
+                run = retry_rule_authoring_run(
+                    run,
+                    user_intent=basis,
+                    selected_chunk_ids=rag_chunk_ids,
+                )
+                provider = _build_rule_authoring_provider()
+                run = compile_rule_authoring_run(
+                    run,
+                    report,
+                    user_intent=basis,
+                    provider=provider,
+                    allow_template_fallback=provider is None,
+                    rag_response=rag_response,
+                    selected_chunk_ids=rag_chunk_ids,
+                )
+                if run.workflow.state == "draft":
+                    run = validate_rule_authoring_run(run, report)
+            except (RuleAuthoringCoordinatorError, ValueError) as error:
+                if run.workflow.state == "compiling":
+                    run = RuleAuthoringRun(
+                        workflow=run.workflow.fail(
+                            stage="compiling",
+                            code="provider_configuration_failed",
+                            message=str(error),
+                        )
+                    )
+            state = _custom_authoring_state(signature=signature, run=run)
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+    run = state.get("run")
+    if isinstance(run, RuleAuthoringRun):
+        _render_rule_workflow_status(run)
+    if state.get("error") and not (
+        isinstance(run, RuleAuthoringRun) and run.workflow.state == "failed"
+    ):
         st.error(f"自定义规则未完成：{_escape_markdown(state['error'])}")
     draft = state.get("draft")
     if draft is None:
@@ -1903,41 +2130,114 @@ def _render_custom_rule_authoring(
 
     with st.expander("查看自定义规则草案", expanded=True):
         st.json(draft.rule_spec.to_dict())
-    validation = validate_rule_draft(draft, report)
-    if not validation.valid:
+    validation = run.workflow.validation if isinstance(run, RuleAuthoringRun) else None
+    if validation is None or not validation.valid:
         st.error("自定义规则未通过确定性校验，不能试运行。")
-        for error in validation.errors:
+        for error in validation.errors if validation is not None else ():
             st.text(error)
         return
     st.success("自定义规则已通过字段、参数和当前报告画像校验。")
-    try:
-        pack = build_rule_pack_from_draft(draft, report)
-    except RuleDraftValidationError as error:
-        st.error(f"RulePack 转换失败：{_escape_markdown(str(error))}")
-        return
 
-    if st.button("试运行自定义规则", key="dry_run_custom_rule_v08", width="stretch"):
-        try:
-            preview = dry_run_uploaded_dataset_with_rule_pack(
-                uploaded_file.getvalue(),
-                uploaded_file.name,
-                pack,
-                dataset_name=dataset_name.strip() or None,
-                sheet_name=sheet_name.strip() or None,
-                reference_date=reference_date,
-                selected_metric_ids=selected_metric_ids,
-            )
-        except Exception as error:
-            st.error(f"自定义规则试运行未完成：{_escape_markdown(str(error))}")
-        else:
-            state["dry_run"] = preview.to_dict()
+    dry_run_clicked = False
+    if isinstance(run, RuleAuthoringRun) and run.workflow.state == "validated":
+        dry_run_clicked = st.button(
+            "试运行自定义规则",
+            key="dry_run_custom_rule_v08",
+            width="stretch",
+        )
+    if dry_run_clicked:
+        run = dry_run_rule_authoring_run(
+            run,
+            report,
+            content=uploaded_file.getvalue(),
+            file_name=uploaded_file.name,
+            dataset_name=dataset_name.strip() or None,
+            sheet_name=sheet_name.strip() or None,
+            reference_date=reference_date,
+            selected_metric_ids=selected_metric_ids,
+        )
+        state = _custom_authoring_state(signature=signature, run=run)
+        st.session_state[CUSTOM_RULE_STATE_KEY] = state
+
+    run = state.get("run")
+    if (
+        isinstance(run, RuleAuthoringRun)
+        and run.workflow.state == "failed"
+        and run.workflow.recoverable_state == "validated"
+    ):
+        st.error(f"试运行未完成：{_escape_markdown(run.workflow.error or '未知错误')}")
+        if run.workflow.can_retry and st.button(
+            "重试失败步骤（最多一次）",
+            key="retry_custom_dry_run_v10",
+            width="stretch",
+        ):
+            try:
+                run = retry_rule_authoring_run(
+                    run,
+                    user_intent=basis,
+                    selected_chunk_ids=rag_chunk_ids,
+                )
+                run = dry_run_rule_authoring_run(
+                    run,
+                    report,
+                    content=uploaded_file.getvalue(),
+                    file_name=uploaded_file.name,
+                    dataset_name=dataset_name.strip() or None,
+                    sheet_name=sheet_name.strip() or None,
+                    reference_date=reference_date,
+                    selected_metric_ids=selected_metric_ids,
+                )
+            except RuleAuthoringCoordinatorError as error:
+                st.error(_escape_markdown(str(error)))
+            state = _custom_authoring_state(signature=signature, run=run)
             st.session_state[CUSTOM_RULE_STATE_KEY] = state
 
     preview = state.get("dry_run")
     if preview is None:
+        if isinstance(run, RuleAuthoringRun) and run.workflow.state == "failed":
+            return
         st.info("规则草案已校验；点击“试运行自定义规则”查看影响摘要。")
         return
     _render_rule_dry_run(preview)
+
+    if isinstance(run, RuleAuthoringRun) and run.workflow.state == "executed":
+        if run.result is not None:
+            _render_rule_result(run.result)
+        return
+
+    if (
+        isinstance(run, RuleAuthoringRun)
+        and run.workflow.state == "failed"
+        and run.workflow.recoverable_state == "approved"
+    ):
+        st.error(f"正式重评未完成：{_escape_markdown(run.workflow.error or '未知错误')}")
+        if run.workflow.can_retry and st.button(
+            "重试失败步骤（最多一次）",
+            key="retry_custom_execution_v10",
+            width="stretch",
+        ):
+            try:
+                run = retry_rule_authoring_run(
+                    run,
+                    user_intent=basis,
+                    selected_chunk_ids=rag_chunk_ids,
+                )
+                run = execute_rule_authoring_run(
+                    run,
+                    content=uploaded_file.getvalue(),
+                    file_name=uploaded_file.name,
+                    dataset_name=dataset_name.strip() or None,
+                    sheet_name=sheet_name.strip() or None,
+                    reference_date=reference_date,
+                    selected_metric_ids=selected_metric_ids,
+                )
+            except RuleAuthoringCoordinatorError as error:
+                st.error(_escape_markdown(str(error)))
+            state = _custom_authoring_state(signature=signature, run=run)
+            st.session_state[CUSTOM_RULE_STATE_KEY] = state
+        if run.result is not None:
+            _render_rule_result(run.result)
+        return
 
     approver = st.text_input(
         "审批人标识（自定义规则，本地自声明）",
@@ -1957,26 +2257,30 @@ def _render_custom_rule_authoring(
     )
     if approve_clicked:
         try:
-            approved_pack = approve_rule_pack(
-                pack,
+            run = approve_rule_authoring_run(
+                run,
                 report,
                 approver=approver,
             )
-            result = evaluate_uploaded_dataset_with_rule_pack(
-                uploaded_file.getvalue(),
-                uploaded_file.name,
-                approved_pack,
+            run = execute_rule_authoring_run(
+                run,
+                content=uploaded_file.getvalue(),
+                file_name=uploaded_file.name,
                 dataset_name=dataset_name.strip() or None,
                 sheet_name=sheet_name.strip() or None,
                 reference_date=reference_date,
                 selected_metric_ids=selected_metric_ids,
             )
-        except (RulePackValidationError, RulePackExecutionError, ValueError) as error:
+        except RuleAuthoringCoordinatorError as error:
             st.error(f"自定义规则未执行：{_escape_markdown(str(error))}")
         else:
-            state["approved_pack"] = approved_pack
-            state["result"] = result
+            state = _custom_authoring_state(signature=signature, run=run)
             st.session_state[CUSTOM_RULE_STATE_KEY] = state
+            if run.workflow.state == "failed":
+                st.error(
+                    "自定义规则已保留审批，但正式重评未完成："
+                    f"{_escape_markdown(run.workflow.error or '未知错误')}"
+                )
 
     if state.get("result") is not None:
         _render_rule_result(state["result"])
@@ -1991,13 +2295,14 @@ def _render_rule_authoring(
     reference_date: date,
     selected_metric_ids: tuple[str, ...],
 ) -> None:
-    """渲染 v0.9“检索依据 → RuleDraft → 试运行 → 审批重评”闭环。"""
+    """渲染 v1.0 显式状态、可恢复的规则编制闭环。"""
 
     st.subheader("补充评价标准")
     st.caption(
         "针对需要外部标准的指标补充评价依据，再由 Agent 生成受限规则草案。"
         "流程为：补充标准 → AI 解析 → 确定性试运行 → 批准并重新评估。"
-        "模型只负责理解和编译；校验、试运行、审批和正式重评仍由本地确定性代码完成。"
+        "模型只负责理解和编译；校验、试运行、审批、正式重评和失败恢复"
+        "均由本地确定性代码完成。"
     )
     if report.status != "success":
         st.info("零配置评估成功后才能编制指标规则。")
@@ -2077,106 +2382,135 @@ def _render_rule_authoring(
                     **_rag_binding_signature(),
                 }
             )
-            draft = state.get("drafts", {}).get(metric_id)
-            if draft is not None and state.get("draft_signatures", {}).get(metric_id) != basis_signature:
-                state = _reset_metric_authoring_state(
-                    state,
-                    metric_id,
-                )
+            previous_signature = state.get("draft_signatures", {}).get(metric_id)
+            if previous_signature and previous_signature != basis_signature:
+                state = _reset_metric_authoring_state(state, metric_id)
                 st.session_state[RULE_AUTHORING_STATE_KEY] = state
-                draft = None
                 st.info("评价依据已变化，旧规则草案、试运行和审批状态已清除。")
+            run = state.get("runs", {}).get(metric_id)
+            if (
+                isinstance(run, RuleAuthoringRun)
+                and run.workflow.state == "failed"
+                and run.workflow.recoverable_state == "compiling"
+            ):
+                st.error(
+                    "规则编译失败："
+                    f"{_escape_markdown(run.workflow.error or '未知错误')}"
+                )
+                if run.workflow.can_retry and st.button(
+                    "重试失败步骤（最多一次）",
+                    key=f"retry_metric_compile_v10_{metric_id}",
+                    width="stretch",
+                ):
+                    try:
+                        run = retry_rule_authoring_run(
+                            run,
+                            user_intent=basis,
+                            selected_chunk_ids=rag_chunk_ids,
+                        )
+                        provider = _build_rule_authoring_provider()
+                        run = compile_rule_authoring_run(
+                            run,
+                            report,
+                            user_intent=basis,
+                            provider=provider,
+                            allow_template_fallback=provider is None,
+                            rag_response=rag_response,
+                            selected_chunk_ids=rag_chunk_ids,
+                        )
+                        if run.workflow.state == "draft":
+                            run = validate_rule_authoring_run(run, report)
+                    except (RuleAuthoringCoordinatorError, ValueError) as error:
+                        if run.workflow.state == "compiling":
+                            run = RuleAuthoringRun(
+                                workflow=run.workflow.fail(
+                                    stage="compiling",
+                                    code="provider_configuration_failed",
+                                    message=str(error),
+                                )
+                            )
+                    state = _sync_metric_authoring_run(
+                        state,
+                        metric_id,
+                        run,
+                        draft_signature=basis_signature,
+                    )
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+            run = state.get("runs", {}).get(metric_id)
+            if isinstance(run, RuleAuthoringRun):
+                _render_rule_workflow_status(run)
 
+            run = state.get("runs", {}).get(metric_id)
+            draft = state.get("drafts", {}).get(metric_id)
             compile_clicked = st.button(
                 "AI 解析依据",
                 key=f"compile_metric_rule_{metric_id}",
                 width="stretch",
-                disabled=not bool(basis),
+                disabled=(
+                    not bool(basis)
+                    or isinstance(
+                        state.get("runs", {}).get(metric_id),
+                        RuleAuthoringRun,
+                    )
+                ),
             )
             if compile_clicked:
-                provider = None
+                run = None
                 try:
+                    run = begin_rule_authoring_run(
+                        report,
+                        target_metric_id=metric_id,
+                        user_intent=basis,
+                        selected_metric_ids=selected_metric_ids,
+                        selected_chunk_ids=rag_chunk_ids,
+                    )
                     provider = _build_rule_authoring_provider()
-                    compile_kwargs = {
-                        "target_metric_id": metric_id,
-                        "user_intent": basis,
-                        "rag_response": rag_response,
-                        "selected_chunk_ids": rag_chunk_ids,
-                        # 仅无 API 的暂行演示模式允许本地模板；一旦配置
-                        # 外部模型，失败必须返回页面，不能伪装成模型草案。
-                        "allow_template_fallback": provider is None,
-                    }
-                    if provider is not None:
-                        compile_kwargs["provider"] = provider
-                    draft = compile_rule_draft(report, **compile_kwargs)
-                except (RuleAuthoringProviderUnavailable, RuleAuthoringProviderError) as error:
-                    state = _reset_metric_authoring_state(state, metric_id)
-                    execution_errors = dict(state.get("execution_errors", {}))
-                    execution_errors[metric_id] = str(error)
-                    state["execution_errors"] = execution_errors
+                    run = compile_rule_authoring_run(
+                        run,
+                        report,
+                        user_intent=basis,
+                        provider=provider,
+                        allow_template_fallback=provider is None,
+                        rag_response=rag_response,
+                        selected_chunk_ids=rag_chunk_ids,
+                    )
+                    if run.workflow.state == "draft":
+                        run = validate_rule_authoring_run(run, report)
+                except (RuleAuthoringCoordinatorError, ValueError) as error:
+                    if run is not None and run.workflow.state == "compiling":
+                        run = RuleAuthoringRun(
+                            workflow=run.workflow.fail(
+                                stage="compiling",
+                                code="provider_configuration_failed",
+                                message=str(error),
+                            )
+                        )
+                        state = _sync_metric_authoring_run(
+                            state,
+                            metric_id,
+                            run,
+                            draft_signature=basis_signature,
+                        )
+                    else:
+                        state = _reset_metric_authoring_state(state, metric_id)
+                        errors = dict(state.get("execution_errors", {}))
+                        errors[metric_id] = _model_error_detail(error)
+                        state["execution_errors"] = errors
                     st.session_state[RULE_AUTHORING_STATE_KEY] = state
                     st.error(
-                        "AI 解析评价依据失败，未生成本地模板替代规则："
+                        "规则编制未完成："
                         f"{_escape_markdown(_model_error_detail(error))}"
                     )
-                    _render_rule_missing_guidance(report, metric_id, basis)
-                except RuleDraftValidationError as error:
-                    state = _reset_metric_authoring_state(state, metric_id)
-                    execution_errors = dict(state.get("execution_errors", {}))
-                    execution_errors[metric_id] = str(error)
-                    state["execution_errors"] = execution_errors
-                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
-                    st.error(_escape_markdown(f"规则编制未完成：{error}"))
-                    _render_rule_missing_guidance(report, metric_id, basis)
-                    draft = None
-                except ValueError as error:
-                    state = _reset_metric_authoring_state(state, metric_id)
-                    execution_errors = dict(state.get("execution_errors", {}))
-                    execution_errors[metric_id] = str(error)
-                    state["execution_errors"] = execution_errors
-                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
-                    st.error(
-                        "模型配置或规则解析失败："
-                        f"{_escape_markdown(_model_error_detail(error))}"
-                    )
-                    draft = None
                 else:
-                    drafts = dict(state.get("drafts", {}))
-                    drafts[metric_id] = draft
-                    signatures = dict(state.get("draft_signatures", {}))
-                    signatures[metric_id] = basis_signature
-                    state = {
-                        **state,
-                        "drafts": drafts,
-                        "draft_signatures": signatures,
-                        "validations": {
-                            key: value
-                            for key, value in state.get("validations", {}).items()
-                            if key != metric_id
-                        },
-                        "dry_runs": {
-                            key: value
-                            for key, value in state.get("dry_runs", {}).items()
-                            if key != metric_id
-                        },
-                        "approved_packs": {
-                            key: value
-                            for key, value in state.get("approved_packs", {}).items()
-                            if key != metric_id
-                        },
-                        "results": {
-                            key: value
-                            for key, value in state.get("results", {}).items()
-                            if key != metric_id
-                        },
-                        "execution_errors": {
-                            key: value
-                            for key, value in state.get("execution_errors", {}).items()
-                            if key != metric_id
-                        },
-                    }
+                    state = _sync_metric_authoring_run(
+                        state,
+                        metric_id,
+                        run,
+                        draft_signature=basis_signature,
+                    )
                     st.session_state[RULE_AUTHORING_STATE_KEY] = state
 
+            run = state.get("runs", {}).get(metric_id)
             draft = state.get("drafts", {}).get(metric_id)
             if draft is None:
                 if not basis:
@@ -2244,64 +2578,137 @@ def _render_rule_authoring(
                 mime="application/json",
                 key=f"download_metric_rule_draft_{metric_id}",
             )
-            validation = validate_rule_draft(draft, report)
-            validations = dict(state.get("validations", {}))
-            validations[metric_id] = validation
-            state = {**state, "validations": validations}
-            st.session_state[RULE_AUTHORING_STATE_KEY] = state
-            if not validation.valid:
+            validation = run.workflow.validation if isinstance(run, RuleAuthoringRun) else None
+            if validation is None or not validation.valid:
                 st.error("规则草案未通过确定性校验，不能试运行。")
-                for error in validation.errors:
+                for error in validation.errors if validation is not None else ():
                     st.text(error)
                 continue
             st.success("规则草案已通过字段、参数和当前报告画像校验。")
-            try:
-                pack = build_rule_pack_from_draft(draft, report)
-            except RuleDraftValidationError as error:
-                st.error(_escape_markdown(f"RulePack 转换失败：{error}"))
-                continue
 
             st.caption("正式执行前必须先完成试运行和人工审批。")
-            dry_run_clicked = st.button(
-                "试运行规则",
-                key=f"dry_run_metric_rule_{metric_id}",
-                width="stretch",
-            )
+            dry_run_clicked = False
+            if run.workflow.state == "validated":
+                dry_run_clicked = st.button(
+                    "试运行规则",
+                    key=f"dry_run_metric_rule_{metric_id}",
+                    width="stretch",
+                )
             if dry_run_clicked:
-                try:
-                    with st.spinner("正在使用确定性规则引擎进行试运行……"):
-                        preview = dry_run_uploaded_dataset_with_rule_pack(
-                            uploaded_file.getvalue(),
-                            uploaded_file.name,
-                            pack,
+                with st.spinner("正在使用确定性规则引擎进行试运行……"):
+                    run = dry_run_rule_authoring_run(
+                        run,
+                        report,
+                        content=uploaded_file.getvalue(),
+                        file_name=uploaded_file.name,
+                        dataset_name=dataset_name.strip() or None,
+                        sheet_name=sheet_name.strip() or None,
+                        reference_date=reference_date,
+                        selected_metric_ids=selected_metric_ids,
+                    )
+                state = _sync_metric_authoring_run(
+                    state,
+                    metric_id,
+                    run,
+                    draft_signature=basis_signature,
+                )
+                st.session_state[RULE_AUTHORING_STATE_KEY] = state
+
+            run = state.get("runs", {}).get(metric_id)
+            if (
+                isinstance(run, RuleAuthoringRun)
+                and run.workflow.state == "failed"
+                and run.workflow.recoverable_state == "validated"
+            ):
+                st.error(
+                    "试运行未完成："
+                    f"{_escape_markdown(run.workflow.error or '未知错误')}"
+                )
+                if run.workflow.can_retry and st.button(
+                    "重试失败步骤（最多一次）",
+                    key=f"retry_metric_dry_run_v10_{metric_id}",
+                    width="stretch",
+                ):
+                    try:
+                        run = retry_rule_authoring_run(
+                            run,
+                            user_intent=basis,
+                            selected_chunk_ids=rag_chunk_ids,
+                        )
+                        run = dry_run_rule_authoring_run(
+                            run,
+                            report,
+                            content=uploaded_file.getvalue(),
+                            file_name=uploaded_file.name,
                             dataset_name=dataset_name.strip() or None,
                             sheet_name=sheet_name.strip() or None,
                             reference_date=reference_date,
                             selected_metric_ids=selected_metric_ids,
                         )
-                except RulePackExecutionError as error:
-                    errors = dict(state.get("execution_errors", {}))
-                    errors[metric_id] = str(error)
-                    state = {**state, "execution_errors": errors}
-                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
-                    st.error(_escape_markdown(f"试运行未完成：{error}"))
-                except Exception:
-                    errors = dict(state.get("execution_errors", {}))
-                    errors[metric_id] = "试运行未完成，请核对当前上传文件后重试。"
-                    state = {**state, "execution_errors": errors}
-                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
-                    st.error(errors[metric_id])
-                else:
-                    dry_runs = dict(state.get("dry_runs", {}))
-                    dry_runs[metric_id] = preview.to_dict()
-                    state = {**state, "dry_runs": dry_runs}
+                    except RuleAuthoringCoordinatorError as error:
+                        st.error(_escape_markdown(str(error)))
+                    state = _sync_metric_authoring_run(
+                        state,
+                        metric_id,
+                        run,
+                        draft_signature=basis_signature,
+                    )
                     st.session_state[RULE_AUTHORING_STATE_KEY] = state
 
             preview = state.get("dry_runs", {}).get(metric_id)
             if preview is None:
+                if isinstance(run, RuleAuthoringRun) and run.workflow.state == "failed":
+                    continue
                 st.info("规则草案已校验；点击“试运行规则”查看影响摘要。")
                 continue
             _render_rule_dry_run(preview)
+
+            if isinstance(run, RuleAuthoringRun) and run.workflow.state == "executed":
+                if run.result is not None:
+                    _render_rule_result(run.result)
+                continue
+
+            if (
+                isinstance(run, RuleAuthoringRun)
+                and run.workflow.state == "failed"
+                and run.workflow.recoverable_state == "approved"
+            ):
+                st.error(
+                    "AI 规则已保留审批，但正式重评未完成："
+                    f"{_escape_markdown(run.workflow.error or '未知错误')}"
+                )
+                if run.workflow.can_retry and st.button(
+                    "重试失败步骤（最多一次）",
+                    key=f"retry_metric_execution_v10_{metric_id}",
+                    width="stretch",
+                ):
+                    try:
+                        run = retry_rule_authoring_run(
+                            run,
+                            user_intent=basis,
+                            selected_chunk_ids=rag_chunk_ids,
+                        )
+                        run = execute_rule_authoring_run(
+                            run,
+                            content=uploaded_file.getvalue(),
+                            file_name=uploaded_file.name,
+                            dataset_name=dataset_name.strip() or None,
+                            sheet_name=sheet_name.strip() or None,
+                            reference_date=reference_date,
+                            selected_metric_ids=selected_metric_ids,
+                        )
+                    except RuleAuthoringCoordinatorError as error:
+                        st.error(_escape_markdown(str(error)))
+                    state = _sync_metric_authoring_run(
+                        state,
+                        metric_id,
+                        run,
+                        draft_signature=basis_signature,
+                    )
+                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                if run.result is not None:
+                    _render_rule_result(run.result)
+                continue
 
             approver = st.text_input(
                 "审批人标识（AI规则，本地自声明）",
@@ -2312,6 +2719,10 @@ def _render_rule_authoring(
                 "我已核对当前规则、评价依据和试运行摘要，并批准本次确定性重评。",
                 key=f"v07_rule_approval_confirmed_{metric_id}",
             )
+            pack = run.draft_pack
+            if pack is None:
+                st.error("当前工作流缺少试运行 RulePack，不能审批。")
+                continue
             pack_hash = draft_sha256(pack)
             confirmations = dict(state.get("confirmed_pack_sha256", {}))
             if confirmed:
@@ -2333,48 +2744,47 @@ def _render_rule_authoring(
             )
             if approve_clicked:
                 try:
-                    approved_pack = approve_rule_pack(
-                        pack,
+                    run = approve_rule_authoring_run(
+                        run,
                         report,
                         approver=approver,
                     )
                     with st.spinner("正在重新解析当前输入并执行已审批 AI 规则……"):
-                        result = evaluate_uploaded_dataset_with_rule_pack(
-                            uploaded_file.getvalue(),
-                            uploaded_file.name,
-                            approved_pack,
+                        run = execute_rule_authoring_run(
+                            run,
+                            content=uploaded_file.getvalue(),
+                            file_name=uploaded_file.name,
                             dataset_name=dataset_name.strip() or None,
                             sheet_name=sheet_name.strip() or None,
                             reference_date=reference_date,
                             selected_metric_ids=selected_metric_ids,
                         )
-                except (RulePackValidationError, RulePackExecutionError) as error:
+                except RuleAuthoringCoordinatorError as error:
                     errors = dict(state.get("execution_errors", {}))
                     errors[metric_id] = str(error)
                     state = {**state, "execution_errors": errors}
                     st.session_state[RULE_AUTHORING_STATE_KEY] = state
                     st.error(_escape_markdown(f"AI规则未执行：{error}"))
-                except Exception:
-                    errors = dict(state.get("execution_errors", {}))
-                    errors[metric_id] = "AI规则未能完成重评；基础报告不受影响。"
-                    state = {**state, "execution_errors": errors}
-                    st.session_state[RULE_AUTHORING_STATE_KEY] = state
-                    st.error(errors[metric_id])
                 else:
-                    approved_packs = dict(state.get("approved_packs", {}))
-                    results = dict(state.get("results", {}))
-                    approved_packs[metric_id] = approved_pack
-                    results[metric_id] = result
-                    state = {
-                        **state,
-                        "approved_packs": approved_packs,
-                        "results": results,
-                    }
+                    state = _sync_metric_authoring_run(
+                        state,
+                        metric_id,
+                        run,
+                        draft_signature=basis_signature,
+                    )
                     st.session_state[RULE_AUTHORING_STATE_KEY] = state
+                    if run.workflow.state == "failed":
+                        st.error(
+                            "AI 规则已保留审批，但正式重评未完成："
+                            f"{_escape_markdown(run.workflow.error or '未知错误')}"
+                        )
 
             result = state.get("results", {}).get(metric_id)
             if result is not None:
                 _render_rule_result(result)
+
+    st.divider()
+    _render_rule_workflow_history()
 
 
 def _render_rule_enhancement(
@@ -2930,7 +3340,7 @@ def _evaluation_request_signature(
 
 st.title("政务数据集质量评估")
 st.caption(
-    "v0.9 · 上传结构化文件，检索标准依据，补充评价依据或创建自定义规则。"
+    "v1.0 · 上传结构化文件，检索标准依据，并以可恢复、可追溯工作流编制规则。"
 )
 
 _initialize_metric_selection_state()

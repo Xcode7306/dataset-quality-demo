@@ -1,0 +1,4 @@
+record_id,service_name,department,status,update_time,start_date,end_date,source_url,version,handling_days,code
+1,社保查询,人社局,active,2026-07-01,2026-01-01,2026-01-02,https://example.gov.cn/1,v1.0,5,310000
+2,,住建局,inactive,2026-06-01,2026-02-03,2026-02-02,,v2.0,45,31000
+3,企业登记,市场监管局,closed,2026-07-05,2026-03-01,2026-03-01,https://example.gov.cn/3,v3.0,10,310100

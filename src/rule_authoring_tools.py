@@ -11,6 +11,93 @@ from typing import Any, Iterable, Mapping
 from .metric_catalog import get_metric_definition
 
 
+RULE_AUTHORING_TOOL_POLICIES: Mapping[str, Mapping[str, Any]] = {
+    "get_metric_definition": {
+        "required": frozenset({"metric_id"}),
+        "optional": frozenset(),
+    },
+    "get_profile_summary": {"required": frozenset(), "optional": frozenset()},
+    "list_available_fields": {"required": frozenset(), "optional": frozenset()},
+    "retrieve_rule_evidence": {
+        "required": frozenset({"query"}),
+        "optional": frozenset(
+            {
+                "metric_id",
+                "standard_number",
+                "version",
+                "source_namespace",
+                "limit",
+            }
+        ),
+    },
+    "validate_rule_draft": {
+        "required": frozenset({"draft_id"}),
+        "optional": frozenset(),
+    },
+    "dry_run_rule": {
+        "required": frozenset({"draft_id"}),
+        "optional": frozenset(),
+    },
+}
+RULE_AUTHORING_TOOL_NAMES = frozenset(RULE_AUTHORING_TOOL_POLICIES)
+
+
+class RuleAuthoringToolRequestError(ValueError):
+    """A model-requested tool or argument is outside the no-side-effect allowlist."""
+
+
+def _tool_text(value: Any, label: str, *, maximum: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuleAuthoringToolRequestError(f"{label}必须是非空字符串。")
+    text = value.strip()
+    if len(text) > maximum:
+        raise RuleAuthoringToolRequestError(f"{label}超过 {maximum} 个字符。")
+    try:
+        text.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise RuleAuthoringToolRequestError(f"{label}包含非法 Unicode。") from error
+    return text
+
+
+def validate_rule_authoring_tool_request(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a proposed tool call without executing it or touching UI state."""
+
+    name = str(tool_name or "").strip()
+    policy = RULE_AUTHORING_TOOL_POLICIES.get(name)
+    if policy is None:
+        raise RuleAuthoringToolRequestError(f"工具“{name or '空'}”不在规则编制白名单中。")
+    if not isinstance(arguments, Mapping):
+        raise RuleAuthoringToolRequestError("工具参数必须是 JSON 对象。")
+    payload = dict(arguments)
+    required = set(policy["required"])
+    allowed = required | set(policy["optional"])
+    missing = sorted(required - set(payload))
+    unknown = sorted(set(payload) - allowed)
+    if missing:
+        raise RuleAuthoringToolRequestError(f"工具 {name} 缺少参数：{missing}。")
+    if unknown:
+        raise RuleAuthoringToolRequestError(f"工具 {name} 包含未允许参数：{unknown}。")
+
+    normalized: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "query":
+            normalized[key] = _tool_text(value, "query", maximum=2000)
+        elif key in {"metric_id", "draft_id"}:
+            normalized[key] = _tool_text(value, key, maximum=120)
+        elif key in {"standard_number", "version", "source_namespace"}:
+            normalized[key] = (
+                None if value is None else _tool_text(value, key, maximum=200)
+            )
+        elif key == "limit":
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 20:
+                raise RuleAuthoringToolRequestError("limit 必须是 1 到 20 的整数。")
+            normalized[key] = value
+    return normalized
+
+
 def _report_payload(report: Any) -> Mapping[str, Any]:
     to_dict = getattr(report, "to_dict", None)
     if not callable(to_dict):
@@ -245,10 +332,14 @@ def build_custom_rule_authoring_context(
 
 
 __all__ = [
+    "RULE_AUTHORING_TOOL_NAMES",
+    "RULE_AUTHORING_TOOL_POLICIES",
+    "RuleAuthoringToolRequestError",
     "build_rule_authoring_context",
     "build_custom_rule_authoring_context",
     "get_metric_definition_tool",
     "get_profile_summary_tool",
     "list_available_fields_tool",
     "retrieve_rule_evidence_tool",
+    "validate_rule_authoring_tool_request",
 ]
