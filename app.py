@@ -111,7 +111,6 @@ RAG_STATE_KEY = "rag_ui_state"
 METRIC_SELECTION_KEY = "selected_metric_ids"
 METRIC_SELECTION_WIDGET_PREFIX = "metric_selection_checkbox_"
 METRIC_EVIDENCE_WIDGET_PREFIX = "metric_evidence_"
-METRIC_SUPPLEMENT_WIDGET_PREFIX = "metric_rule_supplement_"
 PRE_EVALUATION_RULE_APPROVER_KEY = "pre_evaluation_rule_approver"
 PRE_EVALUATION_RULE_CONFIRM_KEY = "pre_evaluation_rule_confirmed"
 PRE_EVALUATION_IMPORT_VALUES_KEY = "pre_evaluation_import_rule_values"
@@ -265,12 +264,6 @@ def _metric_evidence_key(metric_id: str) -> str:
     """为指标卡下的评价依据输入生成稳定控件键。"""
 
     return f"{METRIC_EVIDENCE_WIDGET_PREFIX}{metric_id}"
-
-
-def _metric_supplement_key(metric_id: str) -> str:
-    """为默认指标附加的可选 AI 规则生成稳定控件键。"""
-
-    return f"{METRIC_SUPPLEMENT_WIDGET_PREFIX}{metric_id}"
 
 
 def _initialize_model_api_state() -> None:
@@ -481,10 +474,6 @@ def _initialize_pre_evaluation_rule_input_state() -> None:
     attachments = st.session_state.get(PRE_EVALUATION_CHAT_ATTACHMENTS_KEY)
     if not isinstance(attachments, list):
         st.session_state[PRE_EVALUATION_CHAT_ATTACHMENTS_KEY] = []
-    for metric_id in ALL_METRIC_IDS:
-        key = _metric_supplement_key(metric_id)
-        if key in st.session_state:
-            st.session_state[key] = st.session_state[key]
     saved_imports = st.session_state.get(PRE_EVALUATION_IMPORT_VALUES_KEY, {})
     if isinstance(saved_imports, dict):
         for item_id, value in saved_imports.items():
@@ -502,10 +491,6 @@ def _preserve_hidden_pre_evaluation_widget_state() -> None:
     these values explicitly before rendering the report view.
     """
 
-    for metric_id in ALL_METRIC_IDS:
-        key = _metric_supplement_key(metric_id)
-        if key not in st.session_state:
-            st.session_state[key] = ""
     for item_id, value in dict(
         st.session_state.get(PRE_EVALUATION_IMPORT_VALUES_KEY, {})
     ).items():
@@ -558,11 +543,14 @@ def _render_metric_card(metric_id: str) -> None:
         st.caption(f"{definition['dimension']} · {capability}")
         st.caption(f"计算方式：{definition['formula']}")
         st.text_area(
-            "评价依据",
+            "评价依据 / 补充规则",
             key=_metric_evidence_key(metric_id),
             height=82,
             max_chars=4000,
-            help="输入业务评价依据，评估报告生成后可由 Agent 解析为规则草案。",
+            help=(
+                "直接填写该指标的评估标准或补充规则；字段、阈值、允许值、频率、"
+                "正则和比较条件会在最终评估前由 AI 检查。"
+            ),
         )
 
 
@@ -583,8 +571,8 @@ def _render_metric_selection_panel() -> tuple[str, ...]:
     st.subheader("选择评价指标")
     st.caption(
         "默认已选中一组基础指标。点击卡片即可自由组合；将鼠标悬停在每张卡片"
-        "右上角的“？”上可查看指标含义。已有规则会预填评价依据；勾选但未补全"
-        "评价依据的指标不能启动评估。"
+        "右上角的“？”上可查看指标含义。每张卡片下方的“评价依据 / 补充规则”"
+        "是该指标唯一的规则补充入口；勾选但未补全评价依据的指标不能启动评估。"
     )
     preset_columns = st.columns(3)
     preset_columns[0].button(
@@ -881,53 +869,42 @@ def _render_pre_evaluation_rule_inputs(
     tuple[str, ...],
     bool,
 ]:
-    """Collect optional per-metric supplement rules below the top chat."""
+    """Collect rule inputs from card criteria, the chat, and file attachments.
 
-    st.subheader("评估前 AI 规则生成（可选）")
-    st.caption(
-        "这里用于给已选默认指标追加规则；自定义规则描述和规则文件请使用上方聊天框。"
-        "每条规则会在最终评估前完成 AI 解析、完整性检查、确定性校验和试运行；"
-        "描述不完整时会立即指出缺少的字段、阈值、取值或条件。"
-    )
+    The card's ``评价依据 / 补充规则`` field is the only metric-specific
+    supplement entry point.  Deterministic default text is left to the normal
+    evaluator; user-entered or edited criteria become pre-evaluation RuleBatch
+    inputs and are checked before the final report is allowed to start.
+    """
+
     requests: list[RuleBatchInput] = []
     errors: list[str] = []
     warnings: list[str] = []
 
-    with st.expander("给默认指标补充评判规则", expanded=False):
-        st.caption("只填写需要新增的规则；原有评价依据不会重复交给模型生成。")
-        if not selected_metric_ids:
-            st.info("选择指标后可在这里追加规则。")
-        for metric_id in selected_metric_ids:
-            definition = get_metric_definition(metric_id)
-            if definition is None:
-                continue
-            st.text_area(
-                f"{definition['name']} · 补充规则",
-                key=_metric_supplement_key(metric_id),
-                height=76,
-                max_chars=4000,
-                placeholder="例如：service_name 必须填写",
+    for metric_id in selected_metric_ids:
+        definition = get_metric_definition(metric_id)
+        if definition is None:
+            continue
+        intent = _metric_evidence_text(metric_id)
+        default_basis = default_evaluation_basis(metric_id).strip()
+        if not intent or intent == default_basis:
+            continue
+        try:
+            requests.append(
+                RuleBatchInput.create(
+                    origin="metric_supplement",
+                    user_intent=intent,
+                    label=f"指标卡片：{definition['name']}",
+                    target_metric_id=metric_id,
+                    source_location=f"metric:{metric_id}:evidence",
+                )
             )
-            intent = str(
-                st.session_state.get(_metric_supplement_key(metric_id), "")
-            ).strip()
-            if intent:
-                try:
-                    requests.append(
-                        RuleBatchInput.create(
-                            origin="metric_supplement",
-                            user_intent=intent,
-                            label=f"指标补充：{definition['name']}",
-                            target_metric_id=metric_id,
-                            source_location=f"metric:{metric_id}:supplement",
-                        )
-                    )
-                except RuleImportError as error:
-                    errors.append(f"{definition['name']}：{error}")
+        except RuleImportError as error:
+            errors.append(f"{definition['name']}：{error}")
 
     if requests:
         st.info(
-            f"当前共有 {len(requests)} 条待生成规则。"
+            f"已从指标卡片下方识别 {len(requests)} 条待生成规则。"
             "点击左侧“AI 检查并生成规则”后，完整性问题会在本页立即列出。"
         )
     return (
@@ -3822,8 +3799,27 @@ with st.sidebar:
                     or bool(pre_rule_input_errors)
                 ),
             )
-            run_evaluation = False
-            st.caption("全部规则通过预检和人工批准后，才会启动最终质量评估。")
+            card_rule_requests_only = bool(pre_rule_requests) and all(
+                item.origin == "metric_supplement"
+                for item in pre_rule_requests
+            )
+            if card_rule_requests_only and not pre_rule_input_errors:
+                st.caption(
+                    "指标卡片中的补充内容默认应先用 AI 检查并生成规则；"
+                    "如只想保留为普通评价依据，也可直接运行质量评估。"
+                )
+                run_evaluation = st.button(
+                    "运行质量评估",
+                    width="stretch",
+                    disabled=(
+                        uploaded_file is None
+                        or not selected_metric_ids
+                        or bool(missing_metric_evidence_ids)
+                    ),
+                )
+            else:
+                run_evaluation = False
+                st.caption("全部规则通过预检和人工批准后，才会启动最终质量评估。")
         else:
             run_evaluation = st.button(
                 "运行质量评估",
