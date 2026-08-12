@@ -61,15 +61,16 @@ from src.rule_authoring_providers import (
 from src.rule_authoring_workflow import RuleAuthoringHistory
 from src.rule_authoring_tools import build_rule_authoring_context
 from src.rule_batch import (
+    MAX_RULE_IMPORT_BYTES,
     RuleBatchInput,
     RuleBatchPreflight,
     RuleImportError,
+    SUPPORTED_RULE_IMPORT_EXTENSIONS,
     compile_rule_batch,
     parse_rule_import,
-    rule_inputs_from_dialog,
+    rule_inputs_from_chat_messages,
 )
 from src.rag.citations import response_source_summary
-from src.rag.ingestion import RagIngestionError
 from src.rag.models import (
     RAG_NAMESPACE_DATA_DICTIONARY,
     RAG_NAMESPACE_STANDARDS,
@@ -111,10 +112,11 @@ METRIC_SELECTION_KEY = "selected_metric_ids"
 METRIC_SELECTION_WIDGET_PREFIX = "metric_selection_checkbox_"
 METRIC_EVIDENCE_WIDGET_PREFIX = "metric_evidence_"
 METRIC_SUPPLEMENT_WIDGET_PREFIX = "metric_rule_supplement_"
-PRE_EVALUATION_CUSTOM_RULE_KEY = "custom_rule_intent"
 PRE_EVALUATION_RULE_APPROVER_KEY = "pre_evaluation_rule_approver"
 PRE_EVALUATION_RULE_CONFIRM_KEY = "pre_evaluation_rule_confirmed"
 PRE_EVALUATION_IMPORT_VALUES_KEY = "pre_evaluation_import_rule_values"
+PRE_EVALUATION_CHAT_MESSAGES_KEY = "pre_evaluation_rule_chat_messages"
+PRE_EVALUATION_CHAT_ATTACHMENTS_KEY = "pre_evaluation_rule_chat_attachments"
 MODEL_API_URL_KEY = "model_api_url"
 MODEL_API_KEY_KEY = "model_api_key"
 MODEL_NAME_KEY = "model_name"
@@ -158,6 +160,9 @@ RAG_NAMESPACE_LABELS = {
     RAG_NAMESPACE_USER_SPEC: "用户规范",
 }
 RAG_ALL_NAMESPACE_LABEL = "全部已批准来源"
+RULE_CHAT_FILE_TYPES = tuple(
+    sorted(extension.lstrip(".") for extension in SUPPORTED_RULE_IMPORT_EXTENSIONS)
+)
 
 METRIC_PRESET_BUTTON_KEYS = {
     "default": "metric_preset_default",
@@ -179,7 +184,11 @@ def _clear_agent_state() -> None:
     st.session_state.pop(AGENT_STATE_KEY, None)
 
 
-def _clear_rule_state(*, preserve_rag_binding: bool = False) -> None:
+def _clear_rule_state(
+    *,
+    preserve_rag_binding: bool = False,
+    preserve_chat: bool = False,
+) -> None:
     """清除当前报告的规则草案、审批、增强结果及表单缓存。"""
 
     st.session_state.pop(RULE_STATE_KEY, None)
@@ -187,6 +196,10 @@ def _clear_rule_state(*, preserve_rag_binding: bool = False) -> None:
     st.session_state.pop(CUSTOM_RULE_STATE_KEY, None)
     st.session_state.pop(PRE_EVALUATION_RULE_STATE_KEY, None)
     st.session_state.pop(PRE_EVALUATION_RULE_RESULT_KEY, None)
+    if not preserve_chat:
+        st.session_state.pop(PRE_EVALUATION_CHAT_MESSAGES_KEY, None)
+        st.session_state.pop(PRE_EVALUATION_CHAT_ATTACHMENTS_KEY, None)
+        st.session_state.pop(PRE_EVALUATION_IMPORT_VALUES_KEY, None)
     rag_state = st.session_state.get(RAG_STATE_KEY)
     if isinstance(rag_state, dict):
         # 文档库属于当前会话的依据来源，不因更换业务数据而丢失。
@@ -462,18 +475,43 @@ def _initialize_metric_evidence_state() -> None:
 def _initialize_pre_evaluation_rule_input_state() -> None:
     """Keep optional rule text available when Streamlit temporarily hides widgets."""
 
-    if PRE_EVALUATION_CUSTOM_RULE_KEY not in st.session_state:
-        st.session_state[PRE_EVALUATION_CUSTOM_RULE_KEY] = ""
+    messages = st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY)
+    if not isinstance(messages, list):
+        st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = []
+    attachments = st.session_state.get(PRE_EVALUATION_CHAT_ATTACHMENTS_KEY)
+    if not isinstance(attachments, list):
+        st.session_state[PRE_EVALUATION_CHAT_ATTACHMENTS_KEY] = []
     for metric_id in ALL_METRIC_IDS:
         key = _metric_supplement_key(metric_id)
-        if key not in st.session_state:
-            st.session_state[key] = ""
+        if key in st.session_state:
+            st.session_state[key] = st.session_state[key]
     saved_imports = st.session_state.get(PRE_EVALUATION_IMPORT_VALUES_KEY, {})
     if isinstance(saved_imports, dict):
         for item_id, value in saved_imports.items():
             key = f"pre_import_rule_text_{item_id}"
             if key not in st.session_state and isinstance(value, str):
                 st.session_state[key] = value
+
+
+def _preserve_hidden_pre_evaluation_widget_state() -> None:
+    """Keep optional rule text available while the report view hides its widgets.
+
+    Streamlit normally removes widget-backed keys when a widget is not rendered
+    on the next run.  The AppTest harness (and a browser event already queued
+    against the previous page) can still hold the old widget node, so preserve
+    these values explicitly before rendering the report view.
+    """
+
+    for metric_id in ALL_METRIC_IDS:
+        key = _metric_supplement_key(metric_id)
+        if key not in st.session_state:
+            st.session_state[key] = ""
+    for item_id, value in dict(
+        st.session_state.get(PRE_EVALUATION_IMPORT_VALUES_KEY, {})
+    ).items():
+        key = f"pre_import_rule_text_{item_id}"
+        if isinstance(value, str):
+            st.session_state[key] = value
 
 
 def _selected_metric_ids_from_cards() -> tuple[str, ...]:
@@ -666,14 +704,188 @@ def _render_metric_selection_panel() -> tuple[str, ...]:
     return selected_metric_ids
 
 
+def _render_rule_chat_input(
+    *,
+    header_slot=None,
+    chat_shell=None,
+) -> tuple[
+    tuple[RuleBatchInput, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    bool,
+]:
+    """Render the top-of-page rule chat and its integrated file attachment flow."""
+
+    requests: list[RuleBatchInput] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if header_slot is None:
+        st.markdown("## 与大模型对话创建规则")
+        st.caption(
+            "描述你想创建的规则；可以连续补充字段、阈值、允许值、频率或比较条件。"
+            "点击输入框左侧的“＋”或直接拖拽规则文件，可批量导入规则。"
+        )
+    else:
+        with header_slot.container():
+            st.markdown("## 与大模型对话创建规则")
+            st.caption(
+                "描述你想创建的规则；可以连续补充字段、阈值、允许值、频率或比较条件。"
+                "点击输入框左侧的“＋”或直接拖拽规则文件，可批量导入规则。"
+            )
+    chat_messages = list(
+        st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
+    )
+    for message in chat_messages:
+        role = message.get("role") if isinstance(message, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if role not in {"user", "assistant"} or not content:
+            continue
+        with st.chat_message(role):
+            st.text(str(content))
+    # ``st.chat_input`` is pinned to the viewport bottom when rendered
+    # directly in the main container.  Put it in a horizontal container so
+    # Streamlit renders it inline, immediately below the guidance above.
+    if chat_shell is None:
+        chat_shell = st.empty()
+    with chat_shell.container(horizontal=True, gap="small"):
+        chat_value = st.chat_input(
+            "描述你想创建的规则，例如：service_name 必须填写",
+            key="pre_evaluation_rule_chat_input",
+            max_chars=4000,
+            accept_file="multiple",
+            file_type=RULE_CHAT_FILE_TYPES,
+            max_upload_size=max(1, MAX_RULE_IMPORT_BYTES // (1024 * 1024)),
+            width="stretch",
+        )
+    if isinstance(chat_value, str):
+        chat_text = chat_value.strip()
+        attached_files = []
+    elif chat_value is not None:
+        chat_text = str(getattr(chat_value, "text", "") or "").strip()
+        attached_files = list(getattr(chat_value, "files", []) or [])
+    else:
+        chat_text = ""
+        attached_files = []
+    chat_submitted = bool(chat_text or attached_files)
+    if chat_text:
+        chat_messages.append({"role": "user", "content": chat_text})
+    if attached_files:
+        attachment_names = [
+            str(getattr(item, "name", "规则文件")) for item in attached_files
+        ]
+        chat_messages.append(
+            {
+                "role": "user",
+                "kind": "attachment",
+                "content": "已附加规则文件：" + "、".join(attachment_names),
+            }
+        )
+        existing_attachments = list(
+            st.session_state.get(PRE_EVALUATION_CHAT_ATTACHMENTS_KEY, [])
+        )
+        for item in attached_files:
+            existing_attachments.append(
+                {
+                    "name": str(getattr(item, "name", "规则文件")),
+                    "content": item.getvalue(),
+                }
+            )
+        st.session_state[PRE_EVALUATION_CHAT_ATTACHMENTS_KEY] = existing_attachments
+    if chat_text or attached_files:
+        st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
+
+    if chat_messages:
+        if st.button(
+            "清空规则对话",
+            key="clear_pre_evaluation_rule_chat",
+            width="stretch",
+        ):
+            st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = []
+            st.session_state[PRE_EVALUATION_CHAT_ATTACHMENTS_KEY] = []
+            st.session_state[PRE_EVALUATION_IMPORT_VALUES_KEY] = {}
+            st.rerun()
+
+    try:
+        requests.extend(
+            rule_inputs_from_chat_messages(
+                st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
+            )
+        )
+    except RuleImportError as error:
+        errors.append(str(error))
+
+    attachment_items = list(
+        st.session_state.get(PRE_EVALUATION_CHAT_ATTACHMENTS_KEY, [])
+    )
+    for attachment in attachment_items:
+        source_name = str(attachment.get("name", "规则文件"))
+        try:
+            imported = parse_rule_import(attachment.get("content", b""), source_name)
+        except RuleImportError as error:
+            errors.append(f"规则文件“{source_name}”无法导入：{error}")
+            continue
+        warnings.extend(imported.warnings)
+        st.caption(
+            f"已附加：{source_name} · 识别 {len(imported.items)} 条规则；可在生成前逐条修改。"
+        )
+        with st.expander(f"检查并编辑：{source_name}", expanded=True):
+            for item in imported.items:
+                edit_key = f"pre_import_rule_text_{item.item_id}"
+                if edit_key not in st.session_state:
+                    st.session_state[edit_key] = item.user_intent
+                st.text_area(
+                    item.label,
+                    key=edit_key,
+                    height=72,
+                    max_chars=4000,
+                    help=(
+                        f"目标指标：{item.target_metric_id}"
+                        if item.target_metric_id
+                        else "未指定指标时按自定义规则生成。"
+                    ),
+                )
+                edited_intent = str(st.session_state.get(edit_key, "")).strip()
+                saved_import_values = dict(
+                    st.session_state.get(PRE_EVALUATION_IMPORT_VALUES_KEY, {})
+                )
+                saved_import_values[item.item_id] = edited_intent
+                st.session_state[PRE_EVALUATION_IMPORT_VALUES_KEY] = saved_import_values
+                try:
+                    requests.append(
+                        RuleBatchInput.create(
+                            origin="file_import",
+                            user_intent=edited_intent,
+                            label=item.label,
+                            target_metric_id=item.target_metric_id,
+                            source_name=item.source_name,
+                            source_location=item.source_location,
+                        )
+                    )
+                except RuleImportError as error:
+                    errors.append(f"{item.label}：{error}")
+
+    return (
+        tuple(requests),
+        tuple(dict.fromkeys(errors)),
+        tuple(dict.fromkeys(warnings)),
+        chat_submitted,
+    )
+
+
 def _render_pre_evaluation_rule_inputs(
     selected_metric_ids: tuple[str, ...],
-) -> tuple[tuple[RuleBatchInput, ...], tuple[str, ...], tuple[str, ...]]:
-    """Collect optional metric supplements, dialog rules, and imported rules."""
+) -> tuple[
+    tuple[RuleBatchInput, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    bool,
+]:
+    """Collect optional per-metric supplement rules below the top chat."""
 
     st.subheader("评估前 AI 规则生成（可选）")
     st.caption(
-        "可给已选默认指标追加规则，也可直接描述新规则或导入规则文件。"
+        "这里用于给已选默认指标追加规则；自定义规则描述和规则文件请使用上方聊天框。"
         "每条规则会在最终评估前完成 AI 解析、完整性检查、确定性校验和试运行；"
         "描述不完整时会立即指出缺少的字段、阈值、取值或条件。"
     )
@@ -713,82 +925,6 @@ def _render_pre_evaluation_rule_inputs(
                 except RuleImportError as error:
                     errors.append(f"{definition['name']}：{error}")
 
-    st.text_input(
-        "评估前自定义规则描述（可选）",
-        key=PRE_EVALUATION_CUSTOM_RULE_KEY,
-        max_chars=4000,
-        placeholder="例如：status 为 inactive 时，name 必须填写",
-        help="关键信息不足时会在最终评估前直接追问；多条规则请使用文件导入。",
-    )
-    try:
-        requests.extend(
-            rule_inputs_from_dialog(
-                str(st.session_state.get(PRE_EVALUATION_CUSTOM_RULE_KEY, ""))
-            )
-        )
-    except RuleImportError as error:
-        errors.append(str(error))
-
-    rule_file = st.file_uploader(
-        "导入规则文件（批量，可选）",
-        type=["txt", "md", "csv", "xls", "xlsx", "json", "jsonl", "ndjson"],
-        key="pre_evaluation_rule_file",
-        help=(
-            "TXT/Markdown 每个非空行一条规则；CSV/Excel 使用“规则描述”列，"
-            "可选“指标ID”列；JSON 使用字符串数组或规则对象数组。最多 100 条、2 MiB。"
-        ),
-    )
-    if rule_file is not None:
-        try:
-            imported = parse_rule_import(rule_file.getvalue(), rule_file.name)
-        except RuleImportError as error:
-            errors.append(f"规则文件“{rule_file.name}”无法导入：{error}")
-        else:
-            warnings.extend(imported.warnings)
-            st.caption(
-                f"已识别 {len(imported.items)} 条文件规则；可在生成前逐条修改。"
-            )
-            with st.expander("检查并编辑导入的规则", expanded=True):
-                for item in imported.items:
-                    edit_key = f"pre_import_rule_text_{item.item_id}"
-                    if edit_key not in st.session_state:
-                        st.session_state[edit_key] = item.user_intent
-                    st.text_area(
-                        item.label,
-                        key=edit_key,
-                        height=72,
-                        max_chars=4000,
-                        help=(
-                            f"目标指标：{item.target_metric_id}"
-                            if item.target_metric_id
-                            else "未指定指标时按自定义规则生成。"
-                        ),
-                    )
-                    edited_intent = str(st.session_state.get(edit_key, "")).strip()
-                    saved_import_values = dict(
-                        st.session_state.get(
-                            PRE_EVALUATION_IMPORT_VALUES_KEY,
-                            {},
-                        )
-                    )
-                    saved_import_values[item.item_id] = edited_intent
-                    st.session_state[PRE_EVALUATION_IMPORT_VALUES_KEY] = (
-                        saved_import_values
-                    )
-                    try:
-                        requests.append(
-                            RuleBatchInput.create(
-                                origin="file_import",
-                                user_intent=edited_intent,
-                                label=item.label,
-                                target_metric_id=item.target_metric_id,
-                                source_name=item.source_name,
-                                source_location=item.source_location,
-                            )
-                        )
-                    except RuleImportError as error:
-                        errors.append(f"{item.label}：{error}")
-
     if requests:
         st.info(
             f"当前共有 {len(requests)} 条待生成规则。"
@@ -798,6 +934,7 @@ def _render_pre_evaluation_rule_inputs(
         tuple(requests),
         tuple(dict.fromkeys(errors)),
         tuple(dict.fromkeys(warnings)),
+        False,
     )
 
 
@@ -1635,36 +1772,18 @@ def _render_rag_panel(
     *,
     selected_metric_ids: tuple[str, ...],
 ) -> None:
-    """渲染 v0.9 标准依据摄取、检索、冲突提示和引用绑定。"""
+    """渲染项目预置标准依据的检索、冲突提示和引用绑定。"""
 
     st.subheader("标准依据 RAG（v0.9）")
     st.caption(
-        "仅从项目预置或用户明确批准的标准、数据字典和用户规范中检索。"
+        "仅从项目预置的标准、数据字典和用户规范中检索。"
         "结果带文档、版本、条款/章节和稳定 chunk ID；没有可定位来源时，不会形成标准合规依据。"
     )
     state = _rag_ui_state()
     knowledge_base = state["knowledge_base"]
 
-    st.markdown("#### 1. 上传标准依据文档")
-    rag_file = st.file_uploader(
-        "选择标准依据文档",
-        type=["md", "markdown", "txt", "pdf"],
-        key="rag_document_upload_v09",
-        help=(
-            "支持 Markdown、TXT 和可抽取文本层的 PDF；"
-            "文档只在当前会话内存中处理，不会与业务数据混入。"
-        ),
-    )
-    if rag_file is None:
-        st.info("先上传一份标准、数据字典或用户规范，再确认来源并加入知识库。")
-    else:
-        st.caption(
-            f"已选择：{_escape_markdown(rag_file.name)}；"
-            "系统会自动识别标题、标准号、版本和发布日期。"
-        )
-
     summary = knowledge_base.summary()
-    st.markdown("#### 当前已批准文档")
+    st.markdown("#### 当前可检索的项目标准依据")
     documents = summary.get("documents", [])
     if documents:
         st.dataframe(
@@ -1691,138 +1810,6 @@ def _render_rag_panel(
         )
     else:
         st.info("当前知识库没有已批准文档。")
-
-    with st.expander(
-        "2. 确认来源并加入知识库（元数据可选）",
-        expanded=False,
-    ):
-        st.caption(
-            "通常只需选择用途并确认来源；下列文档信息留空时，会从正文自动识别。"
-        )
-        title = st.text_input(
-            "文档名称（可选）",
-            key="rag_document_title_v09",
-            max_chars=300,
-            placeholder="默认使用文档标题或文件名",
-        )
-        standard_number = st.text_input(
-            "标准号（可选）",
-            key="rag_document_standard_v09",
-            max_chars=100,
-            placeholder="例如 DB31/T 1523-2024",
-        )
-        version = st.text_input(
-            "版本（可选）",
-            key="rag_document_version_v09",
-            max_chars=80,
-            placeholder="例如 2024、v0.9",
-        )
-        published_at = st.text_input(
-            "发布日期（可选）",
-            key="rag_document_published_v09",
-            max_chars=30,
-            placeholder="例如 2024-06-01",
-        )
-        namespace = st.selectbox(
-            "文档用途",
-            options=tuple(RAG_NAMESPACE_LABELS),
-            format_func=lambda value: RAG_NAMESPACE_LABELS[value],
-            key="rag_document_namespace_v09",
-        )
-        effective_status = st.selectbox(
-            "生效状态",
-            options=("active", "draft", "superseded", "expired", "unknown"),
-            format_func=lambda value: {
-                "active": "生效中",
-                "draft": "草稿",
-                "superseded": "已被替代",
-                "expired": "已失效",
-                "unknown": "未知",
-            }[value],
-            key="rag_document_status_v09",
-        )
-        approved = st.selectbox(
-            "文档来源确认",
-            options=("未确认", "已确认"),
-            format_func=lambda value: (
-                "我尚未确认该文档可以作为标准依据"
-                if value == "未确认"
-                else "我确认该文档可以作为标准依据"
-            ),
-            key="rag_document_approved_v09",
-        ) == "已确认"
-
-        normalized_standard = "".join(standard_number.split()).casefold()
-        existing_versions = [
-            item
-            for item in knowledge_base.documents
-            if normalized_standard
-            and "".join((item.standard_number or "").split()).casefold()
-            == normalized_standard
-            and item.source_namespace == namespace
-        ]
-        version_change_confirmed = False
-        if existing_versions:
-            if any((version or None) != item.version for item in existing_versions):
-                warning = (
-                    "检测到同一标准号的其他版本。新增后检索可能出现版本冲突，"
-                    "需要在检索结果中明确选择适用版本。"
-                )
-            else:
-                warning = (
-                    "检测到同一标准号和版本的现有文档。新增内容会形成新的内容哈希，"
-                    "需要重新确认来源并重新绑定引用。"
-                )
-            st.warning(warning)
-            version_change_confirmed = st.selectbox(
-                "版本变化确认",
-                options=("未确认", "已确认"),
-                format_func=lambda value: (
-                    "未确认新增版本"
-                    if value == "未确认"
-                    else "我确认新增版本，并接受后续检索显示版本冲突"
-                ),
-                key="rag_version_change_confirmed_v09",
-            ) == "已确认"
-
-        if st.button(
-            "摄取并加入标准依据库",
-            key="rag_ingest_document_v09",
-            width="stretch",
-            disabled=rag_file is None,
-        ):
-            if not approved:
-                st.error("请先确认该文档可以作为标准依据来源。")
-            elif existing_versions and not version_change_confirmed:
-                st.error("新增标准版本前，请先确认版本变化。")
-            else:
-                try:
-                    document = knowledge_base.ingest_bytes(
-                        rag_file.getvalue(),
-                        rag_file.name,
-                        title=title.strip() or None,
-                        standard_number=standard_number.strip() or None,
-                        version=version.strip() or None,
-                        published_at=published_at.strip() or None,
-                        effective_status=effective_status,
-                        source_namespace=namespace,
-                        approved=True,
-                        metadata={
-                            "origin": "user_upload_v0.9",
-                            "approved_by": "page_confirmation",
-                        },
-                    )
-                except (RagIngestionError, ValueError) as error:
-                    st.error(f"文档摄取失败：{_escape_markdown(str(error))}")
-                else:
-                    state["response"] = None
-                    state["bound_response"] = None
-                    state["selected_chunk_ids"] = ()
-                    st.session_state[RAG_STATE_KEY] = state
-                    st.success(
-                        f"已加入：{_escape_markdown(document.title)}，"
-                        f"共 {len(document.chunk_ids)} 个可定位片段。"
-                    )
 
     if documents:
         st.markdown("#### 文档移除")
@@ -1867,7 +1854,7 @@ def _render_rag_panel(
                 st.session_state[RAG_STATE_KEY] = state
                 st.success("文档已从当前会话知识库移除。")
 
-    st.markdown("#### 3. 检索与绑定")
+    st.markdown("#### 检索与绑定")
     query = st.text_input(
         "检索问题或条款关键词",
         key="rag_query_v09",
@@ -3688,7 +3675,7 @@ def _evaluation_request_signature(
 
 st.title("政务数据集质量评估")
 st.caption(
-    "v1.1 · 在最终评估前生成、补充或批量导入规则，并以受控工作流执行。"
+    "v1.1 · 在首页与大模型对话创建规则，或批量导入规则，并以受控工作流执行。"
 )
 
 _initialize_metric_selection_state()
@@ -3696,21 +3683,40 @@ _initialize_metric_evidence_state()
 _initialize_pre_evaluation_rule_input_state()
 _initialize_model_api_state()
 report_is_displayed = st.session_state.get("quality_report") is not None
-rag_slot = st.empty()
+if report_is_displayed:
+    _preserve_hidden_pre_evaluation_widget_state()
+pre_rule_chat_header = st.empty()
+pre_rule_chat_shell = st.empty()
+if report_is_displayed:
+    pre_rule_chat_header.empty()
+    pre_rule_chat_shell.empty()
 pre_rule_requests: tuple[RuleBatchInput, ...] = ()
 pre_rule_input_errors: tuple[str, ...] = ()
 pre_rule_input_warnings: tuple[str, ...] = ()
+pre_rule_chat_submitted = False
 if not report_is_displayed:
+    (
+        chat_rule_requests,
+        chat_rule_errors,
+        chat_rule_warnings,
+        pre_rule_chat_submitted,
+    ) = _render_rule_chat_input(
+        header_slot=pre_rule_chat_header,
+        chat_shell=pre_rule_chat_shell,
+    )
     selected_metric_ids = _render_metric_selection_panel()
     (
-        pre_rule_requests,
-        pre_rule_input_errors,
-        pre_rule_input_warnings,
+        metric_rule_requests,
+        metric_rule_errors,
+        metric_rule_warnings,
+        _,
     ) = _render_pre_evaluation_rule_inputs(selected_metric_ids)
+    pre_rule_requests = tuple((*chat_rule_requests, *metric_rule_requests))
+    pre_rule_input_errors = tuple((*chat_rule_errors, *metric_rule_errors))
+    pre_rule_input_warnings = tuple((*chat_rule_warnings, *metric_rule_warnings))
     for warning in pre_rule_input_warnings:
         st.warning(_escape_markdown(warning))
 else:
-    rag_slot.empty()
     selected_metric_ids = tuple(
         metric_id
         for metric_id in ALL_METRIC_IDS
@@ -3766,12 +3772,21 @@ with st.sidebar:
         reference_date,
         selected_metric_ids,
     )
-    if st.session_state.get("evaluation_request_signature") != request_signature:
+    previous_request_signature = st.session_state.get(
+        "evaluation_request_signature"
+    )
+    if previous_request_signature != request_signature:
         had_report = st.session_state.get("quality_report") is not None
         st.session_state["evaluation_request_signature"] = request_signature
         st.session_state.pop("quality_report", None)
         _clear_agent_state()
-        _clear_rule_state(preserve_rag_binding=not had_report)
+        preserve_chat = not had_report
+        _clear_rule_state(
+            preserve_rag_binding=not had_report,
+            # Rule descriptions and attachments remain available while the
+            # user changes or first supplies the dataset.
+            preserve_chat=preserve_chat,
+        )
         if had_report:
             st.rerun()
     if not report_is_displayed:
@@ -3820,18 +3835,33 @@ with st.sidebar:
                     or bool(missing_metric_evidence_ids)
                 ),
             )
+        if pre_rule_chat_submitted and not pre_rule_requests:
+            preflight_rules = False
+            run_evaluation = False
     else:
+        run_evaluation = False
+    # The chat input is rendered before the sidebar uploader; carry its submit
+    # event into the preflight once the uploaded data is known.
+    if pre_rule_chat_submitted and uploaded_file is not None:
+        preflight_rules = True
         run_evaluation = False
     st.caption("原始文件仅写入临时目录用于本次计算，评估结束后自动删除。")
 
-if not report_is_displayed:
-    with rag_slot.container():
-        rag_tab = st.tabs(["标准依据 RAG"])[0]
-        with rag_tab:
-            _render_rag_panel(selected_metric_ids=selected_metric_ids)
+if pre_rule_chat_submitted and uploaded_file is None:
+    chat_messages = list(
+        st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
+    )
+    chat_messages.append(
+        {
+            "role": "assistant",
+            "content": "我已收到规则描述。请先上传数据文件，我才能结合字段画像生成并检查规则。",
+        }
+    )
+    st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
+    st.rerun()
 
 if (
-    preflight_rules
+    (preflight_rules or pre_rule_chat_submitted)
     and uploaded_file is not None
     and selected_metric_ids
     and pre_rule_requests
@@ -3887,6 +3917,37 @@ if (
                 "result": None,
                 "error": None,
             }
+            chat_messages = list(
+                st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
+            )
+            if pre_rule_chat_submitted:
+                if preflight.ready:
+                    chat_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"我已生成 {len(preflight.draft_pack.rules)} 条规则，"
+                                "并完成确定性校验和试运行。请在下方核对后批准。"
+                            ),
+                        }
+                    )
+                else:
+                    details = []
+                    for item in preflight.items:
+                        if item.status != "ready":
+                            details.append(
+                                f"{item.request.label}：" + "；".join(item.messages)
+                            )
+                    chat_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "这条规则暂时不能执行，请补充："
+                                + "；".join(details[:5])
+                            ),
+                        }
+                    )
+                st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
         except (
             DatasetReadError,
             UnsupportedFileTypeError,
@@ -3895,15 +3956,44 @@ if (
             RulePackExecutionError,
             ValueError,
         ) as error:
+            error_detail = _model_error_detail(error)
             st.session_state[PRE_EVALUATION_RULE_STATE_KEY] = {
                 "signature": pre_rule_signature,
-                "error": _model_error_detail(error),
+                "error": error_detail,
             }
+            if pre_rule_chat_submitted:
+                chat_messages = list(
+                    st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
+                )
+                chat_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "这条规则暂时无法生成："
+                            f"{error_detail} 请修改描述或检查模型配置后重试。"
+                        ),
+                    }
+                )
+                st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
         except Exception:
             st.session_state[PRE_EVALUATION_RULE_STATE_KEY] = {
                 "signature": pre_rule_signature,
                 "error": "模型服务或临时解析环境不可用，请检查配置后重试。",
             }
+            if pre_rule_chat_submitted:
+                chat_messages = list(
+                    st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
+                )
+                chat_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "这条规则暂时无法生成：模型服务或临时解析环境不可用，"
+                            "请检查配置后重试。"
+                        ),
+                    }
+                )
+                st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
     st.rerun()
 
 if not report_is_displayed and pre_rule_signature:
@@ -3949,8 +4039,8 @@ if (
 report = st.session_state.get("quality_report")
 if report is None:
     st.info(
-        "可以先在“标准依据 RAG”中上传标准文档；准备好业务数据后，"
-        "再从左侧上传 CSV、Excel、JSON、JSONL、GeoJSON 或 ZIP 文件。"
+        "请先从左侧上传 CSV、Excel、JSON、JSONL、GeoJSON 或 ZIP 文件；"
+        "如果需要自定义业务规则，可直接在首页与大模型对话创建。"
     )
 else:
     _agent_state_for(report)

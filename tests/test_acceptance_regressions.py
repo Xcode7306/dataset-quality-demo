@@ -217,10 +217,7 @@ class StreamlitStateAcceptanceTests(unittest.TestCase):
         self.assertEqual(len(app.metric), 0)
         self.assertEqual(len(app.download_button), 0)
         self.assertTrue(
-            any(
-                "可以先在“标准依据 RAG”中上传标准文档" in message.value
-                for message in app.info
-            )
+            any("首页与大模型对话创建" in message.value for message in app.info)
         )
 
     def _upload_and_run(self, app, file_name, content, mime_type):

@@ -437,6 +437,37 @@ def rule_inputs_from_dialog(text: str) -> tuple[RuleBatchInput, ...]:
     return tuple(items)
 
 
+def rule_inputs_from_chat_messages(
+    messages: Sequence[Mapping[str, Any]],
+) -> tuple[RuleBatchInput, ...]:
+    """Convert the current rule conversation into one evolving request.
+
+    A follow-up such as ``service_name 是必填字段`` completes the previous
+    turn instead of creating a second independent rule.  Batch creation remains
+    available through the rule-file importer.
+    """
+
+    user_turns = [
+        str(message.get("content", "")).strip()
+        for message in messages
+        if isinstance(message, Mapping)
+        and message.get("role") == "user"
+        and message.get("kind") != "attachment"
+        and str(message.get("content", "")).strip()
+    ]
+    if not user_turns:
+        return ()
+    intent = "\n".join(user_turns)
+    return (
+        RuleBatchInput.create(
+            origin="dialog",
+            user_intent=intent,
+            label="首页规则对话",
+            source_location=f"dialog:{len(user_turns)}",
+        ),
+    )
+
+
 def _resolve_metric_id(value: str | None) -> str | None:
     if not value:
         return None
@@ -608,4 +639,5 @@ __all__ = [
     "compile_rule_batch",
     "parse_rule_import",
     "rule_inputs_from_dialog",
+    "rule_inputs_from_chat_messages",
 ]

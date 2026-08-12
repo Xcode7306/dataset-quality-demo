@@ -175,15 +175,8 @@ class RuleBatchV11Tests(unittest.TestCase):
         next(
             item for item in app.file_uploader if item.label == "选择数据文件"
         ).set_value((SAMPLE.name, self.content, "text/csv")).run()
-        app.date_input[0].set_value(REFERENCE_DATE)
-        next(
-            item
-            for item in app.text_input
-            if item.label == "评估前自定义规则描述（可选）"
-        ).set_value("service_name需要规范").run()
-        next(
-            button for button in app.button if button.label == "AI 检查并生成规则"
-        ).click().run()
+        app.date_input[0].set_value(REFERENCE_DATE).run()
+        app.chat_input[0].set_value("service_name需要规范").run()
 
         self.assertNotIn("quality_report", app.session_state.filtered_state)
         preflight = app.session_state["pre_evaluation_rule_state"]["preflight"]
@@ -192,14 +185,7 @@ class RuleBatchV11Tests(unittest.TestCase):
             any("最终评估尚未启动" in warning.value for warning in app.warning)
         )
 
-        next(
-            item
-            for item in app.text_input
-            if item.label == "评估前自定义规则描述（可选）"
-        ).set_value("service_name为必填字段").run()
-        next(
-            button for button in app.button if button.label == "AI 检查并生成规则"
-        ).click().run()
+        app.chat_input[0].set_value("service_name为必填字段").run()
         preflight_state = app.session_state["pre_evaluation_rule_state"]
         self.assertTrue(preflight_state["preflight"].ready)
         self.assertIsNotNone(preflight_state["preview"])
@@ -232,21 +218,7 @@ class RuleBatchV11Tests(unittest.TestCase):
         next(
             item for item in app.file_uploader if item.label == "选择数据文件"
         ).set_value((SAMPLE.name, self.content, "text/csv"))
-        next(
-            item
-            for item in app.file_uploader
-            if item.label == "导入规则文件（批量，可选）"
-        ).set_value(
-            (
-                "rules.csv",
-                (
-                    "规则描述\n"
-                    "service_name为必填字段\n"
-                    "handling_days数值范围为0至30\n"
-                ).encode("utf-8"),
-                "text/csv",
-            )
-        )
+        app.chat_input[0].set_value("service_name为必填字段")
         app.run()
         app.date_input[0].set_value(REFERENCE_DATE)
         next(
@@ -256,9 +228,31 @@ class RuleBatchV11Tests(unittest.TestCase):
         self.assertFalse(app.exception)
         state = app.session_state["pre_evaluation_rule_state"]
         self.assertTrue(state["preflight"].ready)
-        self.assertEqual(len(state["preflight"].items), 2)
-        self.assertEqual(len(state["preflight"].draft_pack.rules), 2)
+        self.assertEqual(len(state["preflight"].items), 1)
+        self.assertEqual(len(state["preflight"].draft_pack.rules), 1)
         self.assertNotIn("quality_report", app.session_state.filtered_state)
+
+    def test_homepage_rule_chat_is_visible_before_upload(self):
+        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
+        self.assertFalse(app.exception)
+        self.assertEqual(len(app.chat_input), 1)
+        self.assertTrue(
+            any("与大模型对话创建规则" in item.value for item in app.markdown)
+        )
+
+        app.chat_input[0].set_value("service_name需要规范").run()
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            any("请先上传数据文件" in item.value for item in app.text)
+        )
+
+    def test_rule_chat_accepts_multiple_file_attachments(self):
+        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
+        self.assertEqual(len(app.chat_input), 1)
+        proto = app.chat_input[0].proto
+        self.assertEqual(proto.accept_file, 2)  # ChatInput accepts multiple files.
+        self.assertIn(".csv", proto.file_type)
+        self.assertIn(".json", proto.file_type)
 
 
 if __name__ == "__main__":

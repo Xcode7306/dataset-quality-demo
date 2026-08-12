@@ -339,29 +339,18 @@ class RagV09Tests(unittest.TestCase):
             )
         )
 
-    def test_streamlit_uploads_standard_inside_rag_panel(self):
+    def test_streamlit_rag_exposes_preloaded_sources_without_user_ingestion(self):
         app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
         app.run()
-        rag_upload = next(
-            item for item in app.file_uploader if item.label == "选择标准依据文档"
+        self.assertFalse(app.exception)
+        self.assertFalse(
+            any(item.label == "选择标准依据文档" for item in app.file_uploader)
         )
-        rag_upload.set_value(("local-standard.md", LOCAL_RAG_TEXT, "text/markdown")).run()
-        self.assertFalse(app.exception)
-        self.assertEqual(rag_upload.label, "选择标准依据文档")
-
-        next(
-            item for item in app.selectbox if item.label == "文档来源确认"
-        ).set_value("已确认").run()
-        next(
-            button for button in app.button if button.label == "摄取并加入标准依据库"
-        ).click().run()
-        self.assertFalse(app.exception)
-        self.assertTrue(any("已加入" in item.value for item in app.success))
-        self.assertTrue(
-            any(
-                item.get("title") == "Local Test Standard"
-                for item in app.session_state["rag_ui_state"]["knowledge_base"].summary()["documents"]
-            )
+        self.assertFalse(
+            any(item.label == "摄取并加入标准依据库" for item in app.button)
+        )
+        self.assertFalse(
+            any(item.label == "文档来源确认" for item in app.selectbox)
         )
 
         next(item for item in app.file_uploader if item.label == "选择数据文件").set_value(
@@ -371,23 +360,14 @@ class RagV09Tests(unittest.TestCase):
             button for button in app.button if button.label == "运行质量评估"
         ).click().run()
         self.assertFalse(app.exception)
-        self.assertTrue(
-            any(
-                item.get("title") == "Local Test Standard"
-                for item in app.session_state["rag_ui_state"]["knowledge_base"].summary()["documents"]
-            )
-        )
-
         next(
             item for item in app.text_input if item.label == "检索问题或条款关键词"
-        ).set_value("local_field")
+        ).set_value("更新频率")
         next(
             button for button in app.button if button.label == "检索标准依据"
         ).click().run()
-        self.assertFalse(app.exception)
         response = app.session_state["rag_ui_state"]["response"]
         self.assertEqual(response.status, "ok")
-        self.assertTrue(any("local_field" in result.chunk.text for result in response.results))
 
 
 if __name__ == "__main__":
