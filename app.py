@@ -738,7 +738,7 @@ def _render_rule_chat_input(
         chat_shell = st.empty()
     with chat_shell.container(horizontal=True, gap="small"):
         chat_value = st.chat_input(
-            "描述你想创建的规则，例如：service_name 必须填写",
+            "描述你想创建的规则",
             key="pre_evaluation_rule_chat_input",
             max_chars=4000,
             accept_file="multiple",
