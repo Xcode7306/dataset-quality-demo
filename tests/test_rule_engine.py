@@ -16,7 +16,13 @@ import src.rule_engine as rule_engine
 from src.parser import parse_dataset
 from src.resource_limits import ResourceLimitExceeded
 from src.rule_engine import RulePackExecutionError
-from src.rule_pack import Rule, approve_rule_pack, build_rule_pack
+from src.rule_pack import (
+    Rule,
+    RuleMetricTarget,
+    RulePackValidationError,
+    approve_rule_pack,
+    build_rule_pack,
+)
 from src.rule_service import (
     evaluate_uploaded_dataset_with_rule_pack,
     serialize_rule_evaluation_result,
@@ -269,6 +275,57 @@ class RuleEngineTests(unittest.TestCase):
             self._evaluate().to_dict(),
             self._evaluate().to_dict(),
         )
+
+    def test_update_target_uses_frequency_result_and_auto_metric_cannot_be_overridden(self):
+        content = (Path(__file__).resolve().parents[1] / "sample_data" / "good_dataset.csv").read_bytes()
+        selected = ("db31_050200",)
+        report = evaluate_uploaded_dataset(
+            content,
+            "good_dataset.csv",
+            reference_date=REFERENCE_DATE,
+            selected_metric_ids=selected,
+        )
+        rule = Rule(
+            type="update_freshness",
+            rule_id="freshness-target",
+            fields=("update_time",),
+            frequency="monthly",
+            max_age_days=31,
+        )
+        draft = build_rule_pack(
+            report,
+            name="时效目标",
+            version="1.0",
+            rules=(rule,),
+            metric_targets=(RuleMetricTarget(rule.rule_id, "db31_050200"),),
+        )
+        approved = approve_rule_pack(draft, report, approver="target-test")
+        result = evaluate_uploaded_dataset_with_rule_pack(
+            content,
+            "good_dataset.csv",
+            approved,
+            reference_date=REFERENCE_DATE,
+            selected_metric_ids=selected,
+        )
+        target = next(metric for metric in result.enhanced_report.metrics if metric.id == "db31_050200")
+        self.assertEqual(target.evidence["projection_semantics"], "update_frequency_compliance")
+        self.assertEqual(target.evidence["source_business_metric_id"], "business_update_frequency_compliance")
+        self.assertTrue(any(metric.id == "business_update_time_parseability" for metric in result.enhanced_report.metrics))
+
+        auto_report = evaluate_uploaded_dataset(
+            content,
+            "good_dataset.csv",
+            reference_date=REFERENCE_DATE,
+            selected_metric_ids=("db31_030400",),
+        )
+        with self.assertRaisesRegex(RulePackValidationError, "自动可评估指标"):
+            build_rule_pack(
+                auto_report,
+                name="非法覆盖",
+                version="1.0",
+                rules=(Rule(type="primary_key", rule_id="pk", fields=("record_id",)),),
+                metric_targets=(RuleMetricTarget("pk", "db31_030400"),),
+            )
 
     def test_diff_is_v04_additions_only_and_contains_no_history_conclusion(self):
         payload = self._evaluate().diff.to_dict()

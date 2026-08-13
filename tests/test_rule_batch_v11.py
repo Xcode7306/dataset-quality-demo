@@ -150,6 +150,78 @@ class RuleBatchV11Tests(unittest.TestCase):
         self.assertEqual(incomplete.items[1].status, "needs_clarification")
         self.assertTrue(incomplete.items[1].messages)
 
+    def test_metric_supplement_projects_result_but_custom_rule_stays_business_only(self):
+        selected = ("db31_020100",)
+        report = evaluate_uploaded_dataset(
+            self.content,
+            SAMPLE.name,
+            reference_date=REFERENCE_DATE,
+            selected_metric_ids=selected,
+        )
+        request = RuleBatchInput.create(
+            origin="metric_supplement",
+            user_intent="service_name为必填字段",
+            label="数据元素完整性补充规则",
+            target_metric_id="db31_020100",
+        )
+        preflight = compile_rule_batch(report, (request,))
+        self.assertTrue(preflight.ready)
+        self.assertEqual(
+            [item.to_dict() for item in preflight.draft_pack.metric_targets],
+            [{
+                "rule_id": preflight.draft_pack.rules[0].rule_id,
+                "target_metric_id": "db31_020100",
+            }],
+        )
+        approved = approve_rule_pack(
+            preflight.draft_pack,
+            report,
+            approver="metric-target-test",
+        )
+        result = evaluate_uploaded_dataset_with_rule_pack(
+            self.content,
+            SAMPLE.name,
+            approved,
+            reference_date=REFERENCE_DATE,
+            selected_metric_ids=selected,
+        )
+        target = next(
+            metric
+            for metric in result.enhanced_report.metrics
+            if metric.id == "db31_020100"
+        )
+        self.assertEqual(target.status, "evaluated")
+        self.assertEqual(target.value, 1.0)
+        self.assertEqual(
+            target.evidence["source_business_metric_id"],
+            "business_required_compliance",
+        )
+        self.assertFalse(
+            any(
+                item.metric_key == target.metric_key
+                for item in result.enhanced_report.not_assessable
+            )
+        )
+        self.assertTrue(
+            any(
+                metric.id == "business_required_compliance"
+                for metric in result.enhanced_report.metrics
+            )
+        )
+
+        custom = compile_rule_batch(
+            report,
+            (
+                RuleBatchInput.create(
+                    origin="dialog",
+                    user_intent="service_name为必填字段",
+                    label="首页自定义规则",
+                ),
+            ),
+        )
+        self.assertTrue(custom.ready)
+        self.assertEqual(custom.draft_pack.metric_targets, ())
+
     def test_model_cannot_guess_critical_inputs_from_a_vague_description(self):
         preflight = compile_rule_batch(
             self.report,

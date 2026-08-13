@@ -16,6 +16,7 @@
     "source",
     "field_semantics",
     "rules",
+    "metric_targets",
     "approval"
   ],
   "properties": {
@@ -63,6 +64,13 @@
       "maxItems": 100,
       "items": {
         "$ref": "#/$defs/rule"
+      }
+    },
+    "metric_targets": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/metricTarget"
       }
     },
     "evidence": {
@@ -160,6 +168,21 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 1000
+    },
+    "metricTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_id", "target_metric_id"],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+        },
+        "target_metric_id": {
+          "type": "string",
+          "pattern": "^db31_[0-9]{6}$"
+        }
+      }
     },
     "fieldSemantics": {
       "type": "object",

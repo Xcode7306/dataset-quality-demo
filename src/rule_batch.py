@@ -21,12 +21,18 @@ import pandas as pd
 from .metric_catalog import ALL_METRIC_IDS, get_metric_definition
 from .parser import DatasetReadError, parse_dataset
 from .rule_authoring_service import (
+    _metric_targets_for_draft,
     compile_custom_rule_draft,
     compile_rule_draft,
     validate_rule_draft,
 )
 from .rule_dsl import RuleDraft, RuleDraftValidationResult
-from .rule_pack import MAX_RULES, RulePack, RulePackValidationError, build_rule_pack
+from .rule_pack import (
+    MAX_RULES,
+    RulePack,
+    RulePackValidationError,
+    build_rule_pack,
+)
 
 
 MAX_RULE_IMPORT_BYTES = 2 * 1024 * 1024
@@ -513,6 +519,8 @@ def build_rule_pack_from_drafts(
     evidence: dict[str, Mapping[str, Any]] = {}
     warnings: list[str] = []
     seen_rule_ids: set[str] = set()
+    target_by_rule_id: dict[str, str | None] = {}
+    metric_targets = []
     has_standard_evidence = False
     for draft in drafts:
         validation = validate_rule_draft(draft, report)
@@ -521,11 +529,26 @@ def build_rule_pack_from_drafts(
                 tuple(validation.errors) or (f"草案 {draft.draft_id} 尚不可执行。",)
             )
         rule = draft.rule_spec.to_rule()
+        draft_metric_targets = _metric_targets_for_draft(draft, report)
+        target_metric_id = (
+            draft_metric_targets[0].target_metric_id
+            if draft_metric_targets
+            else None
+        )
         if rule.rule_id in seen_rule_ids:
+            if target_by_rule_id[rule.rule_id] != target_metric_id:
+                raise RulePackValidationError(
+                    (
+                        f"语义相同的规则 {rule.rule_id} 绑定了不同指标目标，"
+                        "不能安全合并。",
+                    )
+                )
             warnings.append(f"规则 {rule.rule_id} 与前一条语义相同，合并时已去重。")
             continue
         seen_rule_ids.add(rule.rule_id)
+        target_by_rule_id[rule.rule_id] = target_metric_id
         rules.append(rule)
+        metric_targets.extend(draft_metric_targets)
         for item in draft.evidence:
             evidence[item.id] = item.to_dict()
             if item.type in {"standard_clause", "data_dictionary"}:
@@ -545,6 +568,7 @@ def build_rule_pack_from_drafts(
         source_type=source_type,
         generator=generator,
         evidence=tuple(evidence.values()),
+        metric_targets=tuple(metric_targets),
     )
     return pack, tuple(dict.fromkeys(warnings))
 

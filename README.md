@@ -1,6 +1,8 @@
 # 政务数据集质量评估 Demo
 
-版本：v1.1
+版本：v1.2
+
+v1.2 增加 DeepSeek 协议兼容性、固定提示词版本、规则卡片目标指标映射、API Key 安全保存和矛盾规则输出拦截。
 
 一个本地运行的 Streamlit Demo，用于对 CSV、Excel（`.xls`、`.xlsx`）、表格型 JSON、JSON Lines、GeoJSON FeatureCollection 和同构 JSON 分片 ZIP 数据集生成可复现的质量指标、风险提示、疑似问题位置 CSV 与无法评估项。
 
@@ -96,7 +98,7 @@ export DEEPSEEK_MODEL="deepseek-v4-flash"
 python3 run_demo.py
 ```
 
-`DEEPSEEK_MODEL` 可切换模型，`DEEPSEEK_API_URL` 可覆盖默认接口地址。本项目通过 `httpx` 直接调用 Chat Completions，不依赖 OpenAI API 或 SDK。页面自定义模型使用不依赖工具调用的普通消息模式，并会在端点不支持 JSON 模式等可选参数时自动重试兼容请求；模型可返回标准 JSON 或完整文本，系统会整理为 Agent 解读。已配置外部模型时，API 超时、鉴权失败、响应为空或规则解析失败会直接在页面显示原因，不会回退模板或继续生成假结果。API Key 不会写入报告、Agent 审计信息或缓存键。
+`DEEPSEEK_MODEL` 可切换模型，`DEEPSEEK_API_URL` 可覆盖默认接口地址。本项目通过 `httpx` 直接调用 Chat Completions，不依赖 OpenAI API 或 SDK。页面自定义模型使用不依赖工具调用的普通消息模式，并会在端点不支持 JSON 模式等可选参数时自动重试兼容请求；模型可返回标准 JSON 或完整文本，系统会整理为 Agent 解读。已配置外部模型时，API 超时、鉴权失败、响应为空或规则解析失败会直接在页面显示原因，不会回退模板或继续生成假结果。页面 Key 需点击“保存 API Key”；在 macOS 上保存到当前用户钥匙串，新浏览器会话会自动恢复，只有点击“清除 API Key”才删除；其他系统安全退回当前 Streamlit 会话保存，跨重启建议使用部署环境变量或系统凭据库。API Key 不会写入报告、Agent 审计信息、项目文件或缓存键。
 
 启用外部模型前仍应完成所在单位的数据分类分级、服务采购和跨境/外发审批。白名单上下文虽然不包含原始单元格值，但字段名、聚合统计和风险说明仍可能属于内部元数据。
 

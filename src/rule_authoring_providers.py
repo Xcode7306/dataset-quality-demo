@@ -598,6 +598,54 @@ def inspect_rule_intent(
     matched_fields = _find_fields(text, fields)
     questions: list[str] = []
 
+    rule_signal = re.compile(
+        r"主键|唯一|必填|必须填写|不得为空|允许值|枚举|只能|数值范围|范围|区间|不低于|不超过|不高于|正则|格式|位数字|位字符|数字代码|长度|字符|更新|时效|新鲜度|不得晚于|小于等于|大于等于|"
+        r"条件必填|字段比较|跨字段",
+    )
+
+    def independent_rule_segments(separator_pattern: str) -> list[str]:
+        return [
+            segment.strip(" \t\r\n，,。；;，")
+            for segment in re.split(separator_pattern, text)
+            if segment.strip(" \t\r\n，,。；;")
+            and rule_signal.search(segment)
+        ]
+
+    strong_segments = independent_rule_segments(r"[；;。\n]+")
+    comma_segments = independent_rule_segments(r"[，,]+")
+    conjunction_segments = independent_rule_segments(r"(?:并且|同时|以及|且)")
+    multi_segments = strong_segments
+    if len(multi_segments) < 2:
+        distinct_comma_fields = {
+            field
+            for segment in comma_segments
+            for field in _find_fields(segment, fields)
+        }
+        if len(comma_segments) >= 2 and len(distinct_comma_fields) >= 2:
+            multi_segments = comma_segments
+    if len(multi_segments) < 2:
+        distinct_conjunction_fields = {
+            field
+            for segment in conjunction_segments
+            for field in _find_fields(segment, fields)
+        }
+        if len(conjunction_segments) >= 2 and len(distinct_conjunction_fields) >= 2:
+            multi_segments = conjunction_segments
+    if len(multi_segments) >= 2:
+        fields_in_request = tuple(dict.fromkeys(
+            field
+            for segment in multi_segments[:5]
+            for field in _find_fields(segment, fields)
+        ))
+        field_hint = "、".join(fields_in_request)
+        detail = f"（涉及字段：{field_hint}）" if field_hint else ""
+        return RuleIntentInspection(
+            None,
+            (
+                f"已识别出多条独立规则{detail}，当前一次只能编制一条；请拆分后分别提交。",
+            ),
+        )
+
     def require_fields(count: int, message: str) -> None:
         if len(matched_fields) < count:
             questions.append(message)
@@ -756,8 +804,88 @@ def build_rule_input_guidance(
     return tuple(dict.fromkeys(questions))[:5]
 
 
+def _move_provider_alias(
+    payload: dict[str, Any],
+    canonical: str,
+    aliases: tuple[str, ...],
+) -> None:
+    """归一化已知的模型字段别名，不解决有冲突的输出。"""
+
+    present_aliases = [alias for alias in aliases if alias in payload]
+    if not present_aliases:
+        return
+    if canonical in payload or len(present_aliases) > 1:
+        names = [canonical] if canonical in payload else []
+        names.extend(present_aliases)
+        raise RuleAuthoringProviderError(
+            f"模型 JSON 同时包含语义重复字段：{names}。"
+        )
+    payload[canonical] = payload.pop(present_aliases[0])
+
+
+def _normalize_provider_outcome(payload: dict[str, Any]) -> None:
+    """将常见结果标签保守地映射到 Demo 的三态协议。"""
+
+    outcome = payload.get("outcome")
+    if not isinstance(outcome, str):
+        raise RuleAuthoringProviderError("模型 outcome 必须是字符串。")
+    normalized = re.sub(r"[\s\-]+", "_", outcome.strip().casefold())
+    aliases = {
+        "draft": {
+            "draft",
+            "success",
+            "succeeded",
+            "ready",
+            "valid",
+            "supported",
+            "candidate",
+            "complete",
+            "completed",
+            "ok",
+            "草案",
+            "成功",
+            "已生成",
+        },
+        "clarification": {
+            "clarification",
+            "clarify",
+            "need_clarification",
+            "needs_clarification",
+            "ask_user",
+            "澄清",
+            "需要澄清",
+            "需补充信息",
+        },
+        "unsupported": {
+            "unsupported",
+            "not_supported",
+            "out_of_scope",
+            "unsupported_request",
+            "不支持",
+            "超出范围",
+        },
+    }
+    canonical = next(
+        (name for name, values in aliases.items() if normalized in values),
+        None,
+    )
+    if canonical is None:
+        raise RuleAuthoringProviderError("模型 outcome 不在允许范围内。")
+
+    rule_spec = payload.get("rule_spec")
+    if canonical == "draft" and not isinstance(rule_spec, Mapping):
+        raise RuleAuthoringProviderError(
+            "模型将结果标记为可用草案，但未返回 rule_spec 对象。"
+        )
+    if canonical != "draft" and rule_spec is not None:
+        raise RuleAuthoringProviderError(
+            "模型非草案结果不得携带 rule_spec。"
+        )
+    payload["outcome"] = canonical
+
+
 def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
-    """严格解析外部模型返回的 JSON，不做宽松修复。"""
+    """严格解析外部模型 JSON，仅归一化无歧义的已知别名。"""
 
     if isinstance(payload, str):
         try:
@@ -824,6 +952,14 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
         "evidence_ids",
         "resource_policy",
     }
+    _move_provider_alias(payload, "outcome", ("status", "result_type"))
+    _move_provider_alias(payload, "rule_spec", ("rule", "ruleSpec", "rule_draft"))
+    _move_provider_alias(
+        payload,
+        "clarification_questions",
+        ("questions", "clarifications"),
+    )
+    _move_provider_alias(payload, "unsupported_reason", ("reason",))
     if not {"outcome", "rule_spec"}.issubset(payload):
         if "rule_type" in payload and "fields" in payload:
             unknown = sorted(set(payload) - rule_spec_fields)
@@ -840,20 +976,36 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
             }
         elif "clarification_questions" in payload:
             unknown = sorted(
-                set(payload) - {"assumptions", "clarification_questions"}
+                set(payload)
+                - {"outcome", "assumptions", "clarification_questions"}
             )
             if unknown:
                 raise RuleAuthoringProviderError(
                     f"模型澄清结果包含未允许字段：{unknown}。"
                 )
             payload = {
-                "outcome": "clarification",
+                "outcome": payload.get("outcome", "clarification"),
                 "rule_spec": None,
                 "assumptions": payload.get("assumptions", []),
                 "clarification_questions": payload.get(
                     "clarification_questions", []
                 ),
                 "unsupported_reason": None,
+            }
+        elif "outcome" in payload and "unsupported_reason" in payload:
+            unknown = sorted(
+                set(payload) - {"outcome", "assumptions", "unsupported_reason"}
+            )
+            if unknown:
+                raise RuleAuthoringProviderError(
+                    f"模型不支持结果包含未允许字段：{unknown}。"
+                )
+            payload = {
+                "outcome": payload["outcome"],
+                "rule_spec": None,
+                "assumptions": payload.get("assumptions", []),
+                "clarification_questions": [],
+                "unsupported_reason": payload["unsupported_reason"],
             }
         else:
             raise RuleAuthoringProviderError(
@@ -867,9 +1019,8 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
     payload.setdefault("assumptions", [])
     payload.setdefault("clarification_questions", [])
     payload.setdefault("unsupported_reason", None)
+    _normalize_provider_outcome(payload)
     outcome = payload["outcome"]
-    if outcome not in {"draft", "clarification", "unsupported"}:
-        raise RuleAuthoringProviderError("模型 outcome 不在允许范围内。")
     assumptions = payload["assumptions"]
     questions = payload["clarification_questions"]
     if not isinstance(assumptions, list) or not all(isinstance(item, str) for item in assumptions):
@@ -1024,6 +1175,28 @@ def parse_provider_payload(payload: Any) -> RuleAuthoringProviderResult:
         raise RuleAuthoringProviderError("draft outcome 必须携带 rule_spec。")
     if outcome != "draft" and rule_spec is not None:
         raise RuleAuthoringProviderError("非 draft outcome 不能携带 rule_spec。")
+    if outcome == "draft":
+        if questions:
+            raise RuleAuthoringProviderError(
+                "draft outcome 不能同时携带 clarification_questions。"
+            )
+        if unsupported_reason is not None:
+            raise RuleAuthoringProviderError(
+                "draft outcome 不能同时携带 unsupported_reason。"
+            )
+    elif outcome == "clarification":
+        if not questions:
+            raise RuleAuthoringProviderError(
+                "clarification outcome 必须至少提出一个问题。"
+            )
+        if unsupported_reason is not None:
+            raise RuleAuthoringProviderError(
+                "clarification outcome 不能携带 unsupported_reason。"
+            )
+    elif questions:
+        raise RuleAuthoringProviderError(
+            "unsupported outcome 不能携带 clarification_questions。"
+        )
     if outcome == "unsupported" and not str(unsupported_reason or "").strip():
         raise RuleAuthoringProviderError("unsupported outcome 必须说明原因。")
     return RuleAuthoringProviderResult(

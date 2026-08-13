@@ -163,6 +163,13 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertEqual(self._selected_metric_ids(app), ORIGINAL_METRIC_IDS)
 
+    def test_initial_upload_guidance_omits_zip_text(self):
+        app = self._new_app()
+
+        guidance = [item.value for item in app.info]
+        self.assertTrue(any("请先从左侧上传" in value for value in guidance))
+        self.assertTrue(all("ZIP" not in value and ".zip" not in value for value in guidance))
+
     def test_custom_model_api_settings_are_available_on_initial_page(self):
         app = self._new_app()
         labels = [item.label for item in app.text_input]
@@ -182,10 +189,109 @@ class StreamlitAppTests(unittest.TestCase):
             item for item in app.text_input if item.label == "模型名称"
         ).set_value("custom-chat-model")
         app.run()
+        self._button_by_label(app, "保存 API Key").click().run()
 
         self.assertFalse(app.exception)
         self.assertTrue(
-            any("已配置自定义大模型 API" in item.value for item in app.success)
+            any("API Key 已保存到当前会话" in item.value for item in app.success)
+        )
+
+    def test_saved_model_api_key_survives_upload_until_explicit_clear(self):
+        sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
+        app = self._new_app()
+        next(
+            item for item in app.text_input if item.label == "API Key"
+        ).set_value("page-only-test-key")
+        app.run()
+        self._button_by_label(app, "保存 API Key").click().run()
+
+        self.assertEqual(
+            "page-only-test-key",
+            app.session_state["model_api_key"],
+        )
+        next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value((sample.name, sample.read_bytes(), "text/csv"))
+        app.run()
+
+        self.assertFalse(app.exception)
+        self.assertEqual(
+            "page-only-test-key",
+            app.session_state["model_api_key"],
+        )
+        self.assertEqual(
+            "page-only-test-key",
+            app.session_state["model_api_key_input"],
+        )
+        self._button_by_label(app, "清除 API Key").click().run()
+
+        self.assertFalse(app.exception)
+        self.assertEqual("", app.session_state["model_api_key"])
+        self.assertEqual("", app.session_state["model_api_key_input"])
+
+    def test_saved_model_api_key_can_retry_after_credential_store_warning(self):
+        app = self._new_app()
+        next(
+            item for item in app.text_input if item.label == "API Key"
+        ).set_value("page-only-test-key")
+        app.run()
+        self._button_by_label(app, "保存 API Key").click().run()
+
+        app.session_state["model_api_key_store_message"] = (
+            "warning",
+            "API Key 已保存在当前会话，但系统凭据库暂时不可用。",
+        )
+        app.run()
+
+        self.assertFalse(
+            self._button_by_label(app, "保存 API Key").disabled
+        )
+
+    def test_model_api_key_rejects_non_ascii_input_before_save(self):
+        app = self._new_app()
+        next(
+            item for item in app.text_input if item.label == "API Key"
+        ).set_value("API Key：错误内容")
+        app.run()
+
+        self.assertFalse(app.exception)
+        self.assertEqual("", app.session_state["model_api_key"])
+        self.assertTrue(self._button_by_label(app, "保存 API Key").disabled)
+        self.assertTrue(
+            any("ASCII 字符" in item.value for item in app.warning)
+        )
+
+    def test_custom_rule_provider_error_hides_saved_api_key(self):
+        sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
+        secret = "page-secret-value-12345678"
+        app = self._new_app()
+        next(
+            item for item in app.text_input if item.label == "API Key"
+        ).set_value(secret)
+        app.run()
+        self._button_by_label(app, "保存 API Key").click().run()
+        self._upload_and_run(
+            app,
+            sample.name,
+            sample.read_bytes(),
+            "text/csv",
+        )
+        next(
+            item for item in app.text_input if item.label == "自定义规则描述"
+        ).set_value("service_name为必填字段")
+        app.run()
+
+        with patch(
+            "src.rule_authoring_coordinator.compile_rule_authoring_run",
+            side_effect=ValueError(f"provider rejected API Key {secret}"),
+        ):
+            self._button_by_label(app, "AI 解析自定义规则").click().run()
+
+        self.assertFalse(app.exception)
+        self.assertFalse(any(secret in item.value for item in app.error))
+        self.assertNotIn(
+            secret,
+            app.session_state["custom_rule_ui_state"]["error"],
         )
 
     def test_selected_metric_without_evidence_blocks_run(self):

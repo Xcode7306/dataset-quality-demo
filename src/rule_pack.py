@@ -16,6 +16,8 @@ import math
 import re
 from typing import Any, Literal, Mapping, Sequence
 
+from .metric_catalog import get_metric_definition
+
 
 RULE_PACK_SCHEMA_VERSION = "0.1"
 RULE_PACK_GENERATOR = "quality-rule-agent-v0.4"
@@ -171,6 +173,20 @@ class RulePackSource:
 
 
 @dataclass(frozen=True)
+class RuleMetricTarget:
+    """把一条已审批规则绑定到一个需补充依据的目录指标。"""
+
+    rule_id: str
+    target_metric_id: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "rule_id": self.rule_id,
+            "target_metric_id": self.target_metric_id,
+        }
+
+
+@dataclass(frozen=True)
 class ApprovalRecord:
     """本地生成的审批记录；审批人身份仅为自声明。"""
 
@@ -212,6 +228,7 @@ class RulePack:
     source: RulePackSource
     field_semantics: FieldSemanticMapping
     rules: tuple[Rule, ...]
+    metric_targets: tuple[RuleMetricTarget, ...] = ()
     approval: ApprovalRecord | None = None
     schema_version: str = RULE_PACK_SCHEMA_VERSION
     evidence: tuple[Mapping[str, Any], ...] = ()
@@ -229,6 +246,7 @@ class RulePack:
             "source": self.source.to_dict(),
             "field_semantics": self.field_semantics.to_dict(),
             "rules": [rule.to_dict() for rule in self.rules],
+            "metric_targets": [item.to_dict() for item in self.metric_targets],
             "evidence": [dict(item) for item in self.evidence],
             "approval": (
                 self.approval.to_dict()
@@ -317,6 +335,10 @@ def _draft_payload(pack: RulePack) -> dict[str, Any]:
         "source": pack.source.to_dict(),
         "field_semantics": pack.field_semantics.to_dict(),
         "rules": [rule.to_dict() for rule in pack.rules],
+        "metric_targets": [
+            item.to_dict() if isinstance(item, RuleMetricTarget) else item
+            for item in pack.metric_targets
+        ],
         "evidence": [dict(item) for item in pack.evidence],
     }
 
@@ -945,6 +967,65 @@ def validate_rule_pack(
     if len(signatures) != len(set(signatures)):
         errors.append("RulePack 不能包含同类型、同字段的重复规则。")
 
+    if not isinstance(pack.metric_targets, tuple):
+        errors.append("RulePack metric_targets 必须是元组。")
+        metric_targets: tuple[Any, ...] = ()
+    else:
+        metric_targets = pack.metric_targets
+    if len(metric_targets) > len(rules):
+        errors.append("RulePack 指标目标数量不能超过规则数量。")
+    target_rule_ids: list[str] = []
+    target_metric_ids: list[str] = []
+    baseline_metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
+    baseline_by_id: dict[str, list[Mapping[str, Any]]] = {}
+    if isinstance(baseline_metrics, list):
+        for metric in baseline_metrics:
+            if isinstance(metric, Mapping) and isinstance(metric.get("id"), str):
+                baseline_by_id.setdefault(str(metric["id"]), []).append(metric)
+    selected_metric_ids = report_context.get("selected_metric_ids")
+    selected_metric_set = (
+        {str(item) for item in selected_metric_ids}
+        if isinstance(selected_metric_ids, list)
+        else set()
+    )
+    for index, target in enumerate(metric_targets):
+        if not isinstance(target, RuleMetricTarget):
+            errors.append(f"RulePack metric_targets[{index}] 结构无效。")
+            continue
+        target_rule_ids.append(target.rule_id)
+        target_metric_ids.append(target.target_metric_id)
+        if target.rule_id not in rule_ids:
+            errors.append(
+                f"指标目标引用了不存在的规则：{target.rule_id}。"
+            )
+        definition = get_metric_definition(target.target_metric_id)
+        if definition is None:
+            errors.append(
+                f"指标目标引用了未知目录指标：{target.target_metric_id}。"
+            )
+            continue
+        if bool(definition.get("auto_assessable")):
+            errors.append(
+                f"自动可评估指标不能由补充规则覆盖：{target.target_metric_id}。"
+            )
+        if target.target_metric_id not in selected_metric_set:
+            errors.append(
+                f"指标目标未包含在当前评估选择中：{target.target_metric_id}。"
+            )
+        matching_metrics = baseline_by_id.get(target.target_metric_id, [])
+        if len(matching_metrics) != 1:
+            errors.append(
+                f"当前报告中未唯一找到指标目标：{target.target_metric_id}。"
+            )
+        elif matching_metrics[0].get("status") != "not_assessable":
+            errors.append(
+                f"指标目标当前并非需补充依据状态：{target.target_metric_id}。"
+            )
+    if len(target_rule_ids) != len(set(target_rule_ids)):
+        errors.append("同一规则不能绑定多个目录指标目标。")
+    if len(target_metric_ids) != len(set(target_metric_ids)):
+        errors.append("同一目录指标不能绑定多条规则。")
+
     expected_mapping = _mapping_from_rules(typed_rules)
     if pack.field_semantics != expected_mapping:
         errors.append("字段语义映射与当前规则不一致。")
@@ -1028,6 +1109,7 @@ def build_rule_pack(
     source_type: RulePackSourceType = "local_guided",
     generator: str | None = None,
     evidence: Sequence[Mapping[str, Any]] = (),
+    metric_targets: Sequence[RuleMetricTarget] = (),
 ) -> RulePack:
     """基于当前零配置报告创建仍未生效的 RulePack 草案。"""
 
@@ -1061,6 +1143,7 @@ def build_rule_pack(
         source=source,
         field_semantics=_mapping_from_rules(typed_rules),
         rules=typed_rules,
+        metric_targets=tuple(metric_targets),
         approval=None,
         evidence=tuple(dict(item) for item in evidence),
     )

@@ -22,6 +22,7 @@ from src.rule_authoring_prompts import (
     DEFAULT_RULE_AUTHORING_PROMPT_VERSION,
     RULE_AUTHORING_PROMPT_V090,
     RULE_AUTHORING_PROMPT_V091,
+    RULE_AUTHORING_PROMPT_V110,
     get_rule_authoring_prompt,
     list_rule_authoring_prompts,
 )
@@ -61,15 +62,32 @@ class AgentHarnessV091Tests(unittest.TestCase):
     def test_versioned_prompt_registry_has_stable_fingerprints(self):
         self.assertEqual(
             DEFAULT_RULE_AUTHORING_PROMPT_VERSION,
-            RULE_AUTHORING_PROMPT_V091,
+            RULE_AUTHORING_PROMPT_V110,
         )
-        old = get_rule_authoring_prompt(RULE_AUTHORING_PROMPT_V090)
-        current = get_rule_authoring_prompt(RULE_AUTHORING_PROMPT_V091)
-        self.assertNotEqual(old.sha256, current.sha256)
+        v090 = get_rule_authoring_prompt(RULE_AUTHORING_PROMPT_V090)
+        v091 = get_rule_authoring_prompt(RULE_AUTHORING_PROMPT_V091)
+        current = get_rule_authoring_prompt(RULE_AUTHORING_PROMPT_V110)
+        self.assertEqual(
+            v090.sha256,
+            "e099561feef7c643cc53aa96597f7304adeb000076255fe227a8ea4a1e47a761",
+        )
+        self.assertEqual(
+            v091.sha256,
+            "26ce7ff8b688def59de5460667517b882c4ea1c52c0f5237f7315e784115297b",
+        )
+        self.assertEqual(
+            current.sha256,
+            "50a54b40b475b5686a276f393c999b71ad27422facab5ddfca2281f0a627d2ae",
+        )
+        self.assertEqual(len({v090.sha256, v091.sha256, current.sha256}), 3)
         self.assertEqual(current.sha256, get_rule_authoring_prompt().sha256)
         self.assertEqual(
             {item["version"] for item in list_rule_authoring_prompts()},
-            {RULE_AUTHORING_PROMPT_V090, RULE_AUTHORING_PROMPT_V091},
+            {
+                RULE_AUTHORING_PROMPT_V090,
+                RULE_AUTHORING_PROMPT_V091,
+                RULE_AUTHORING_PROMPT_V110,
+            },
         )
         legacy_result = TemplateRuleAuthoringProvider(
             prompt_version=RULE_AUTHORING_PROMPT_V090
@@ -81,6 +99,51 @@ class AgentHarnessV091Tests(unittest.TestCase):
             legacy_result.metadata.prompt_version,
             RULE_AUTHORING_PROMPT_V090,
         )
+
+    def test_v110_prompt_defines_exact_rule_dsl_and_chinese_boundaries(self):
+        prompt = get_rule_authoring_prompt(RULE_AUTHORING_PROMPT_V110).system_prompt
+
+        for outcome in ('"draft"', '"clarification"', '"unsupported"'):
+            self.assertIn(outcome, prompt)
+        for forbidden_outcome in ("success", "ready", "completed"):
+            self.assertIn(forbidden_outcome, prompt)
+        for wrapper_field in (
+            "outcome",
+            "rule_spec",
+            "evidence",
+            "assumptions",
+            "clarification_questions",
+            "unsupported_reason",
+        ):
+            self.assertIn(wrapper_field, prompt)
+        for rule_type in (
+            "primary_key",
+            "required",
+            "update_freshness",
+            "allowed_values",
+            "numeric_range",
+            "regex_format",
+            "string_length",
+            "conditional_required",
+            "field_comparison",
+        ):
+            self.assertIn(f"- {rule_type}：", prompt)
+
+        self.assertIn('["条件字段","条件成立时必填的字段"]', prompt)
+        self.assertIn('["左操作数字段","右操作数字段"]', prompt)
+        self.assertIn("operator 只能是 lt、lte、gt、gte、eq、neq 之一", prompt)
+        self.assertIn(
+            "comparison_type 只能是 auto、numeric、datetime、text 之一",
+            prompt,
+        )
+        self.assertIn("context.fields[*].name", prompt)
+        self.assertIn("不得翻译、简写、归一化、模糊匹配、自动纠正或创造字段名", prompt)
+        self.assertIn("不得只返回第一条、不得静默遗漏", prompt)
+        self.assertIn('"事项名称"', prompt)
+        self.assertIn('"办理状态","注销日期"', prompt)
+        self.assertIn("字段“事项名成”不在当前字段列表中", prompt)
+        self.assertIn("当前 Rule DSL 不支持跨表或外键关联校验", prompt)
+        self.assertIn("已识别出两条独立规则", prompt)
 
     def test_template_rule_goldens_reach_all_v1_thresholds(self):
         report = run_rule_authoring_harness(ROOT, replay=True)

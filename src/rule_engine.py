@@ -1341,6 +1341,84 @@ def _business_not_assessable(
     ]
 
 
+_TARGET_RESULT_METRIC_BY_RULE_TYPE = {
+    "primary_key": "business_primary_key_compliance",
+    "required": "business_required_compliance",
+    # 更新时间规则会同时产生“可解析率”和“频率符合性”。目录指标接收
+    # 用户明确审批的时效阈值结果；可解析率仍作为独立 business 指标保留。
+    "update_freshness": "business_update_frequency_compliance",
+    "allowed_values": "business_allowed_values_compliance",
+    "numeric_range": "business_numeric_range_compliance",
+    "regex_format": "business_regex_format_compliance",
+    "string_length": "business_string_length_compliance",
+    "conditional_required": "business_conditional_required_compliance",
+    "field_comparison": "business_field_comparison_compliance",
+}
+
+
+def _project_business_metrics_to_catalog_targets(
+    baseline_report: QualityReport,
+    business_metrics: list[MetricResult],
+    pack: RulePack,
+) -> dict[str, MetricResult]:
+    """按审批哈希覆盖的显式绑定生成目录指标结果，不做名称或类型猜测。"""
+
+    if not pack.metric_targets:
+        return {}
+    rules_by_id = {rule.rule_id: rule for rule in pack.rules}
+    business_by_rule_and_id = {
+        (str(metric.evidence.get("rule_id", "")), metric.id): metric
+        for metric in business_metrics
+    }
+    baseline_by_id = {metric.id: metric for metric in baseline_report.metrics}
+    projected: dict[str, MetricResult] = {}
+    for target in pack.metric_targets:
+        rule = rules_by_id.get(target.rule_id)
+        baseline_metric = baseline_by_id.get(target.target_metric_id)
+        if rule is None or baseline_metric is None:
+            raise RulePackExecutionError(
+                ["RulePack 指标目标在当前报告中失效，已拒绝执行。"]
+            )
+        source_metric_id = _TARGET_RESULT_METRIC_BY_RULE_TYPE.get(rule.type)
+        source_metric = business_by_rule_and_id.get(
+            (rule.rule_id, str(source_metric_id or ""))
+        )
+        if source_metric is None:
+            raise RulePackExecutionError(
+                [
+                    f"规则 {rule.rule_id} 未产生可映射到目录指标的确定性结果，"
+                    "已拒绝执行。"
+                ]
+            )
+        projection_semantics = (
+            "update_frequency_compliance"
+            if rule.type == "update_freshness"
+            else "rule_compliance"
+        )
+        projected[target.target_metric_id] = MetricResult(
+            id=baseline_metric.id,
+            name=baseline_metric.name,
+            category=baseline_metric.category,
+            status=source_metric.status,
+            value=source_metric.value,
+            unit=source_metric.unit,
+            scope=baseline_metric.scope,
+            field=baseline_metric.field,
+            evidence={
+                **deepcopy(baseline_metric.evidence),
+                **deepcopy(source_metric.evidence),
+                "method": "approved_rule_pack_projection",
+                "target_metric_id": target.target_metric_id,
+                "source_business_metric_id": source_metric.id,
+                "source_business_metric_key": source_metric.metric_key,
+                "projection_semantics": projection_semantics,
+            },
+            issue_locations=deepcopy(source_metric.issue_locations),
+            reason=source_metric.reason,
+        )
+    return projected
+
+
 def _validate_for_execution(
     pack: RulePack,
     baseline_report: QualityReport,
@@ -1482,11 +1560,47 @@ def _evaluate_rule_pack_on_verified_dataframe(
         rule_pack,
     )
     business_not_assessable = _business_not_assessable(business_metrics)
+    projected_metrics = _project_business_metrics_to_catalog_targets(
+        baseline_report,
+        business_metrics,
+        rule_pack,
+    )
 
     result_baseline_report = _report_snapshot_without_locations(
         baseline_report
     )
     enhanced_report = _report_snapshot_without_locations(baseline_report)
+    if projected_metrics:
+        enhanced_report.metrics = [
+            projected_metrics.get(metric.id, metric)
+            for metric in enhanced_report.metrics
+        ]
+        target_metric_keys = {
+            metric.metric_key for metric in projected_metrics.values()
+        }
+        enhanced_report.not_assessable = [
+            item
+            for item in enhanced_report.not_assessable
+            if item.metric_key not in target_metric_keys
+        ]
+        enhanced_report.not_assessable.extend(
+            NotAssessableItem(
+                id=(
+                    f"{metric.id}:{metric.field}"
+                    if metric.field
+                    else metric.id
+                ),
+                name=(
+                    f"{metric.name}（{metric.field}）"
+                    if metric.field
+                    else metric.name
+                ),
+                reason=metric.reason or "当前已审批规则无法评估。",
+                metric_key=metric.metric_key,
+            )
+            for metric in projected_metrics.values()
+            if metric.status == "not_assessable"
+        )
     enhanced_report.metrics.extend(business_metrics)
     enhanced_report.risks.extend(business_risks)
     enhanced_report.not_assessable.extend(business_not_assessable)
@@ -1496,13 +1610,15 @@ def _evaluate_rule_pack_on_verified_dataframe(
         raise RuntimeError("规则增强过程意外修改了基线 QualityReport。")
     baseline_metric_count = len(baseline_report.metrics)
     baseline_risk_count = len(baseline_report.risks)
-    if (
-        enhanced_report.metrics[:baseline_metric_count]
-        != baseline_report.metrics
-        or enhanced_report.risks[:baseline_risk_count]
-        != baseline_report.risks
-    ):
-        raise RuntimeError("规则增强过程改变了既有指标或风险。")
+    for index, baseline_metric in enumerate(baseline_report.metrics):
+        enhanced_metric = enhanced_report.metrics[index]
+        if baseline_metric.id in projected_metrics:
+            if enhanced_metric.id != baseline_metric.id:
+                raise RuntimeError("规则增强过程改变了目录指标身份。")
+        elif enhanced_metric != baseline_metric:
+            raise RuntimeError("规则增强过程改变了未绑定的既有指标。")
+    if enhanced_report.risks[:baseline_risk_count] != baseline_report.risks:
+        raise RuntimeError("规则增强过程改变了既有风险。")
 
     diff = RuleEvaluationDiff(
         added_metric_keys=tuple(metric.metric_key for metric in business_metrics),

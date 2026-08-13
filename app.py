@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from src.agent_models import AgentAnalysis
 from src.agent_providers import (
@@ -19,6 +20,13 @@ from src.agent_providers import (
     OpenAICompatibleChatProvider,
 )
 from src.agent_service import run_agent
+from src.credential_store import (
+    CredentialStoreError,
+    credential_store_available,
+    delete_model_api_key,
+    load_model_api_key,
+    save_model_api_key,
+)
 from src.metric_catalog import (
     ALL_METRIC_IDS,
     DEFAULT_SELECTED_METRIC_IDS,
@@ -118,6 +126,10 @@ PRE_EVALUATION_CHAT_MESSAGES_KEY = "pre_evaluation_rule_chat_messages"
 PRE_EVALUATION_CHAT_ATTACHMENTS_KEY = "pre_evaluation_rule_chat_attachments"
 MODEL_API_URL_KEY = "model_api_url"
 MODEL_API_KEY_KEY = "model_api_key"
+MODEL_API_KEY_INPUT_KEY = "model_api_key_input"
+MODEL_API_KEY_SAVE_BUTTON_KEY = "save_model_api_key"
+MODEL_API_KEY_CLEAR_BUTTON_KEY = "clear_model_api_key"
+MODEL_API_KEY_STORE_MESSAGE_KEY = "model_api_key_store_message"
 MODEL_NAME_KEY = "model_name"
 AGENT_HISTORY_LIMIT = 8
 AGENT_PRIORITY_LABELS = {
@@ -275,11 +287,97 @@ def _initialize_model_api_state() -> None:
             DEEPSEEK_CHAT_COMPLETIONS_URL,
         )
     if MODEL_API_KEY_KEY not in st.session_state:
-        st.session_state[MODEL_API_KEY_KEY] = ""
+        stored_key = ""
+        context = get_script_run_ctx(suppress_warning=True)
+        is_app_test = bool(context and context.session_id == "test session id")
+        if credential_store_available() and not is_app_test:
+            try:
+                stored_key = load_model_api_key() or ""
+            except CredentialStoreError as error:
+                st.session_state[MODEL_API_KEY_STORE_MESSAGE_KEY] = (
+                    "warning",
+                    str(error),
+                )
+        st.session_state[MODEL_API_KEY_KEY] = stored_key
+    if MODEL_API_KEY_INPUT_KEY not in st.session_state:
+        st.session_state[MODEL_API_KEY_INPUT_KEY] = st.session_state[
+            MODEL_API_KEY_KEY
+        ]
     if MODEL_NAME_KEY not in st.session_state:
         st.session_state[MODEL_NAME_KEY] = os.environ.get(
             "DEEPSEEK_MODEL",
             DEFAULT_DEEPSEEK_MODEL,
+        )
+
+
+def _model_api_key_format_issue(api_key: str) -> str | None:
+    """验证 Bearer Token 可以安全写入 HTTP 请求头。"""
+
+    if not api_key:
+        return "请先输入 API Key，再保存到当前会话。"
+    if not api_key.isascii():
+        return "API Key 只能包含 ASCII 字符，请勿粘贴中文说明、引号或其他标签。"
+    if any(character.isspace() for character in api_key):
+        return "API Key 不能包含空格、换行或其他空白字符。"
+    if any(ord(character) < 33 or ord(character) > 126 for character in api_key):
+        return "API Key 只能包含可显示的 ASCII 字符。"
+    return None
+
+
+def _save_model_api_key() -> None:
+    """将密码输入框的值保存为当前 Streamlit 会话配置。"""
+
+    candidate = str(
+        st.session_state.get(MODEL_API_KEY_INPUT_KEY, "")
+    ).strip()
+    if _model_api_key_format_issue(candidate) is None:
+        st.session_state[MODEL_API_KEY_KEY] = candidate
+        context = get_script_run_ctx(suppress_warning=True)
+        is_app_test = bool(context and context.session_id == "test session id")
+        if credential_store_available() and not is_app_test:
+            try:
+                save_model_api_key(candidate)
+            except CredentialStoreError as error:
+                st.session_state[MODEL_API_KEY_STORE_MESSAGE_KEY] = (
+                    "warning",
+                    f"API Key 已保存在当前会话，但{error}",
+                )
+            else:
+                st.session_state[MODEL_API_KEY_STORE_MESSAGE_KEY] = (
+                    "success",
+                    "API Key 已保存到 macOS 钥匙串，新页面会话会自动恢复。",
+                )
+        else:
+            st.session_state[MODEL_API_KEY_STORE_MESSAGE_KEY] = (
+                "info",
+                "API Key 已保存在当前会话；当前环境未启用系统凭据库。",
+            )
+
+
+def _clear_model_api_key() -> None:
+    """只在用户显式操作时删除页面会话中的 API Key。"""
+
+    st.session_state[MODEL_API_KEY_KEY] = ""
+    st.session_state[MODEL_API_KEY_INPUT_KEY] = ""
+    context = get_script_run_ctx(suppress_warning=True)
+    is_app_test = bool(context and context.session_id == "test session id")
+    if credential_store_available() and not is_app_test:
+        try:
+            delete_model_api_key()
+        except CredentialStoreError as error:
+            st.session_state[MODEL_API_KEY_STORE_MESSAGE_KEY] = (
+                "warning",
+                f"当前会话中的 API Key 已清除，但{error}",
+            )
+        else:
+            st.session_state[MODEL_API_KEY_STORE_MESSAGE_KEY] = (
+                "success",
+                "API Key 已从当前会话和 macOS 钥匙串清除。",
+            )
+    else:
+        st.session_state[MODEL_API_KEY_STORE_MESSAGE_KEY] = (
+            "success",
+            "API Key 已从当前会话清除。",
         )
 
 
@@ -290,6 +388,9 @@ def _model_api_configuration() -> tuple[dict[str, str] | None, str | None]:
     api_key = str(st.session_state.get(MODEL_API_KEY_KEY, "")).strip()
     model = str(st.session_state.get(MODEL_NAME_KEY, "")).strip()
     if api_key:
+        key_issue = _model_api_key_format_issue(api_key)
+        if key_issue:
+            return None, key_issue
         if not api_url or not model:
             return None, "请同时填写 API 地址、API Key 和模型名称。"
         if not api_url.startswith(("http://", "https://")):
@@ -329,6 +430,7 @@ def _render_model_api_settings() -> None:
         st.text_input(
             "API 地址",
             key=MODEL_API_URL_KEY,
+            persist_state="session",
             help=(
                 "可填写完整的 /chat/completions 地址，也可填写服务根地址；"
                 "系统会自动补全 /chat/completions。"
@@ -337,14 +439,63 @@ def _render_model_api_settings() -> None:
         st.text_input(
             "API Key",
             type="password",
-            key=MODEL_API_KEY_KEY,
-            help="仅保存在当前 Streamlit 会话内存中，不写入报告和审计信息。",
+            key=MODEL_API_KEY_INPUT_KEY,
+            persist_state="session",
+            help=(
+                "点击‘保存 API Key’后保存到当前会话；macOS 上同时使用"
+                "当前用户钥匙串，不写入报告、审计信息或项目文件。"
+            ),
         )
         st.text_input(
             "模型名称",
             key=MODEL_NAME_KEY,
+            persist_state="session",
             help="填写该 API 对应的模型标识，例如 deepseek-v4-flash。",
         )
+        key_input = str(
+            st.session_state.get(MODEL_API_KEY_INPUT_KEY, "")
+        ).strip()
+        saved_key = str(st.session_state.get(MODEL_API_KEY_KEY, "")).strip()
+        key_input_issue = (
+            _model_api_key_format_issue(key_input) if key_input else None
+        )
+        store_message = st.session_state.get(MODEL_API_KEY_STORE_MESSAGE_KEY)
+        keychain_retry_available = bool(
+            key_input
+            and key_input == saved_key
+            and isinstance(store_message, tuple)
+            and len(store_message) == 2
+            and store_message[0] == "warning"
+        )
+        save_column, clear_column = st.columns(2)
+        save_column.button(
+            "保存 API Key",
+            key=MODEL_API_KEY_SAVE_BUTTON_KEY,
+            on_click=_save_model_api_key,
+            disabled=(
+                not key_input
+                or (key_input == saved_key and not keychain_retry_available)
+                or key_input_issue is not None
+            ),
+            width="stretch",
+        )
+        clear_column.button(
+            "清除 API Key",
+            key=MODEL_API_KEY_CLEAR_BUTTON_KEY,
+            on_click=_clear_model_api_key,
+            disabled=not (saved_key or key_input),
+            width="stretch",
+        )
+        if (
+            isinstance(store_message, tuple)
+            and len(store_message) == 2
+            and store_message[0] in {"success", "info", "warning"}
+        ):
+            getattr(st, store_message[0])(store_message[1])
+        if key_input_issue:
+            st.warning(key_input_issue)
+        elif key_input != saved_key:
+            st.info("新输入的 API Key 尚未保存；当前运行仍使用上一个已保存配置。")
         configuration, issue = _model_api_configuration()
         if issue and configuration and configuration.get("source") == "environment":
             st.info(
@@ -353,7 +504,10 @@ def _render_model_api_settings() -> None:
         elif issue:
             st.warning(issue)
         elif configuration and configuration.get("source") == "page":
-            st.success("已配置自定义大模型 API；点击 Agent 操作时将调用该模型。")
+            st.success(
+                "API Key 已保存到当前会话；上传或替换数据时会继续保留，"
+                "点击 Agent 操作时将调用该模型。"
+            )
         elif configuration:
             st.info("已使用部署环境中的 DeepSeek 配置。")
         else:
@@ -2348,22 +2502,26 @@ def _render_custom_rule_authoring(
             if run.workflow.state == "draft":
                 run = validate_rule_authoring_run(run, report)
         except (RuleAuthoringCoordinatorError, ValueError) as error:
+            safe_error = _model_error_detail(error)
             if run is not None and run.workflow.state == "compiling":
                 run = RuleAuthoringRun(
                     workflow=run.workflow.fail(
                         stage="compiling",
                         code="provider_configuration_failed",
-                        message=str(error),
+                        message=safe_error,
                     )
                 )
                 state = _custom_authoring_state(signature=signature, run=run)
             else:
                 state = {
                     "signature": signature,
-                    "error": _model_error_detail(error),
+                    "error": safe_error,
                 }
             st.session_state[CUSTOM_RULE_STATE_KEY] = state
-            st.error(f"自定义规则解析失败：{_escape_markdown(str(error))}")
+            st.error(
+                "自定义规则解析失败："
+                f"{_escape_markdown(safe_error)}"
+            )
         else:
             state = _custom_authoring_state(signature=signature, run=run)
             st.session_state[CUSTOM_RULE_STATE_KEY] = state
@@ -3652,7 +3810,7 @@ def _evaluation_request_signature(
 
 st.title("政务数据集质量评估")
 st.caption(
-    "v1.1 · 在首页与大模型对话创建规则，或批量导入规则，并以受控工作流执行。"
+    "v1.2 · 在首页与大模型对话创建规则，或批量导入规则，并以受控工作流执行。"
 )
 
 _initialize_metric_selection_state()
@@ -3719,7 +3877,7 @@ with st.sidebar:
         ],
         help=(
             "支持 CSV、Excel（.xls、.xlsx）、表格型 JSON "
-            "、JSONL / NDJSON、GeoJSON FeatureCollection 以及同构 JSON 分片 ZIP；"
+            "、JSONL / NDJSON 和 GeoJSON FeatureCollection；"
             f"单文件上限 {MAX_INPUT_FILE_MIB} MiB。"
         ),
     )
@@ -4035,7 +4193,7 @@ if (
 report = st.session_state.get("quality_report")
 if report is None:
     st.info(
-        "请先从左侧上传 CSV、Excel、JSON、JSONL、GeoJSON 或 ZIP 文件；"
+        "请先从左侧上传 CSV、Excel、JSON、JSONL 或 GeoJSON 文件；"
         "如果需要自定义业务规则，可直接在首页与大模型对话创建。"
     )
 else:

@@ -45,7 +45,50 @@ from .rule_dsl import (
     validate_rule_draft_shape,
     validate_rule_spec,
 )
-from .rule_pack import RulePack, RulePackValidationError, build_rule_pack, validate_rule_pack
+from .rule_pack import (
+    RuleMetricTarget,
+    RulePack,
+    RulePackValidationError,
+    build_rule_pack,
+    validate_rule_pack,
+)
+
+
+def _metric_targets_for_draft(
+    draft: RuleDraft,
+    report: Any,
+) -> tuple[RuleMetricTarget, ...]:
+    """只让目录指标草案覆盖其明确绑定的、需补充依据的目标。"""
+
+    if (
+        draft.target_type != "catalog_metric"
+        or not draft.target_metric_id
+        or draft.rule_spec is None
+    ):
+        return ()
+    definition = get_metric_definition(draft.target_metric_id)
+    if definition is None or bool(definition.get("auto_assessable")):
+        return ()
+    try:
+        payload = report.to_dict()
+    except Exception:
+        return ()
+    metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
+    matching = [
+        metric
+        for metric in metrics or ()
+        if isinstance(metric, Mapping)
+        and metric.get("id") == draft.target_metric_id
+        and metric.get("status") == "not_assessable"
+    ]
+    if len(matching) != 1:
+        return ()
+    return (
+        RuleMetricTarget(
+            rule_id=draft.rule_spec.rule_id,
+            target_metric_id=draft.target_metric_id,
+        ),
+    )
 
 
 def _created_at(value: datetime | str | None) -> str:
@@ -691,6 +734,7 @@ def build_rule_pack_from_draft(
         generator=generator,
         generated_at=draft.created_at,
         evidence=tuple(item.to_dict() for item in draft.evidence),
+        metric_targets=_metric_targets_for_draft(draft, report),
     )
 
 
