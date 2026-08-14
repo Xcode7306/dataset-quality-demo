@@ -160,6 +160,15 @@ def _unsupported(reason: str) -> RuleAuthoringProviderResult:
     )
 
 
+def _bounded_display_text(value: str, maximum: int) -> str:
+    """截断仅供展示的 DSL 文本，字段标识仍在 ``fields`` 中逐字保留。"""
+
+    text = str(value).strip()
+    if len(text) <= maximum:
+        return text
+    return f"{text[: maximum - 1]}…"
+
+
 def _candidate(
     *,
     rule_type: str,
@@ -174,8 +183,8 @@ def _candidate(
         rule_spec=RuleSpec(
             rule_type=rule_type,
             rule_id=make_rule_id(rule_type, field_names, parameters),
-            name=name,
-            description=description,
+            name=_bounded_display_text(name, 120),
+            description=_bounded_display_text(description, 2000),
             fields=tuple(field_names),
             parameters=parameters,
             evidence_ids=(),
@@ -1309,9 +1318,12 @@ class DeepSeekRuleAuthoringProvider:
             except RuleAuthoringProviderError:
                 raise
             except Exception as error:
-                last_error = error
-                if index == len(variants) - 1:
-                    break
+                # 降级请求仅用于已知的 HTTP 参数不兼容。网络、超时或协议级
+                # 异常重复发送同一请求既不能恢复，又会让批量页面累积等待。
+                raise RuleAuthoringProviderError(
+                    "模型 API 规则请求未完成（"
+                    f"{type(error).__name__.casefold()}）。"
+                ) from error
         raise RuleAuthoringProviderError(
             f"模型 API 规则请求失败：{str(last_error)[:500] if last_error else '未知错误'}"
         ) from last_error

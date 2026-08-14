@@ -543,6 +543,81 @@ ALL_METRIC_IDS: tuple[str, ...] = tuple(
 DEFAULT_SELECTED_METRIC_IDS: tuple[str, ...] = ORIGINAL_METRIC_IDS
 
 
+# 目录指标只能接收与其语义相符的 Rule DSL 类型。这个映射是有意保持显式
+# 的：规则引擎会为每条规则生成 ``business_*`` 审计指标，执行层不能根据
+# 指标名称猜测映射关系，也不能把“必填”这类完整性规则投影到格式、时效
+# 或一致性指标上。未列出的指标没有可直接投影的 DSL 类型，必须继续要求
+# 用户提供标准依据或使用自定义业务规则。
+_ALL_RULE_TYPES: frozenset[str] = frozenset(
+    {
+        "primary_key",
+        "required",
+        "update_freshness",
+        "allowed_values",
+        "numeric_range",
+        "regex_format",
+        "string_length",
+        "conditional_required",
+        "field_comparison",
+    }
+)
+METRIC_RULE_TYPE_ALLOWLIST: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        # 数据标准的父级指标需要 010101/010102/010103 分项，不能由一条
+        # 规则直接覆盖；数据类型和元数据本身也没有对应的本地 DSL。
+        "db31_010100": frozenset(),
+        "db31_010101": frozenset(),
+        "db31_010102": frozenset(
+            {"allowed_values", "numeric_range", "regex_format", "field_comparison"}
+        ),
+        "db31_010103": frozenset({"string_length"}),
+        "db31_010200": frozenset({"primary_key", "field_comparison"}),
+        "db31_010300": frozenset(),
+        "db31_010400": _ALL_RULE_TYPES,
+        "db31_010500": frozenset({"allowed_values", "field_comparison"}),
+        "db31_010600": frozenset(),
+        "db31_020100": frozenset({"required", "conditional_required"}),
+        "db31_020200": frozenset(
+            {"primary_key", "required", "conditional_required"}
+        ),
+        "db31_030100": frozenset(
+            {
+                "allowed_values",
+                "numeric_range",
+                "regex_format",
+                "string_length",
+                "field_comparison",
+            }
+        ),
+        "db31_030200": frozenset(
+            {"allowed_values", "numeric_range", "regex_format", "string_length"}
+        ),
+        "db31_030500": frozenset(
+            {
+                "allowed_values",
+                "numeric_range",
+                "regex_format",
+                "string_length",
+            }
+        ),
+        "db31_030600": frozenset({"allowed_values", "field_comparison"}),
+        "db31_040100": frozenset({"field_comparison"}),
+        "db31_040200": frozenset({"field_comparison"}),
+        "db31_040201": frozenset({"field_comparison"}),
+        "db31_040202": frozenset({"field_comparison"}),
+        "db31_040203": frozenset({"field_comparison"}),
+        "db31_040204": frozenset({"field_comparison"}),
+        "db31_040300": frozenset(),
+        "db31_050100": frozenset({"numeric_range", "field_comparison"}),
+        "db31_050200": frozenset({"update_freshness"}),
+        "db31_050300": frozenset({"field_comparison"}),
+        "db31_050400": frozenset({"update_freshness"}),
+        "db31_060100": frozenset(),
+        "db31_060200": frozenset(),
+    }
+)
+
+
 # 已有确定性计算逻辑的指标提供可编辑的默认评价依据；其余指标必须由
 # 用户结合业务标准补充，避免把通用示例误当成实际评价规则。
 DEFAULT_EVALUATION_BASES: Mapping[str, str] = MappingProxyType(
@@ -580,6 +655,34 @@ def get_metric_definition(metric_id: str) -> Mapping[str, Any] | None:
     """按稳定 ID 获取只读目录项。"""
 
     return METRIC_BY_ID.get(metric_id)
+
+
+def allowed_rule_types_for_metric(metric_id: str) -> frozenset[str]:
+    """返回目录指标允许直接投影的 Rule DSL 类型。"""
+
+    return METRIC_RULE_TYPE_ALLOWLIST.get(metric_id, frozenset())
+
+
+def metric_rule_type_error(metric_id: str, rule_type: str) -> str | None:
+    """检查规则类型与目录指标语义是否兼容，返回可展示的错误。"""
+
+    definition = get_metric_definition(metric_id)
+    if definition is None:
+        return f"指标目标引用了未知目录指标：{metric_id}。"
+    allowed = allowed_rule_types_for_metric(metric_id)
+    if rule_type in allowed:
+        return None
+    name = str(definition.get("name") or metric_id)
+    if not allowed:
+        return (
+            f"规则类型“{rule_type}”不能直接绑定指标“{name}”；"
+            "该指标当前没有可直接投影的本地 Rule DSL 类型。"
+        )
+    allowed_text = "、".join(sorted(allowed))
+    return (
+        f"规则类型“{rule_type}”不能绑定指标“{name}”；"
+        f"该指标只允许：{allowed_text}。"
+    )
 
 
 def metric_description(metric_id: str) -> str:

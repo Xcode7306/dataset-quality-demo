@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
-from .metric_catalog import get_metric_definition
+from .metric_catalog import get_metric_definition, metric_rule_type_error
 from .rule_authoring_providers import (
     RuleAuthoringProvider,
     RuleAuthoringProviderError,
@@ -649,6 +649,13 @@ def validate_rule_draft(
     )
     errors.extend(rule_validation.errors)
     if draft.rule_spec is not None:
+        if draft.target_type == "catalog_metric" and draft.target_metric_id:
+            compatibility_error = metric_rule_type_error(
+                draft.target_metric_id,
+                draft.rule_spec.rule_type,
+            )
+            if compatibility_error:
+                errors.append(compatibility_error)
         inspection = inspect_rule_intent(
             draft.context,
             user_intent=draft.user_intent,

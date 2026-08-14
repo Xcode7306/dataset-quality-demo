@@ -102,6 +102,7 @@ from src.rule_pack import (
 from src.rule_service import (
     dry_run_uploaded_dataset_with_rule_pack,
     evaluate_uploaded_dataset_with_rule_pack,
+    serialize_rule_evaluation_markdown,
     serialize_rule_evaluation_result,
     serialize_rule_issue_locations_csv,
 )
@@ -445,6 +446,10 @@ def _render_model_api_settings() -> None:
                 "点击‘保存 API Key’后保存到当前会话；macOS 上同时使用"
                 "当前用户钥匙串，不写入报告、审计信息或项目文件。"
             ),
+        )
+        st.caption(
+            "多用户边界：本 Demo 没有登录或多用户隔离；macOS 同一操作系统用户的"
+            "钥匙串会被该用户的浏览器会话共享。请勿在共享操作系统账号中保存不同用户的 API Key。"
         )
         st.text_input(
             "模型名称",
@@ -1073,26 +1078,53 @@ def _pre_evaluation_rule_signature(
     evaluation_signature: object,
     requests: tuple[RuleBatchInput, ...],
 ) -> str:
-    configuration, issue = _model_api_configuration()
-    model_binding = {
-        "issue": issue,
-        "source": configuration.get("source") if configuration else None,
-        "api_url": configuration.get("api_url") if configuration else None,
-        "model": configuration.get("model") if configuration else None,
-        "api_key_sha256": (
-            hashlib.sha256(configuration["api_key"].encode("utf-8")).hexdigest()
-            if configuration and configuration.get("api_key")
-            else None
-        ),
-    }
     return _rule_form_signature(
         {
             "evaluation": evaluation_signature,
             "rules": [item.to_dict() for item in requests],
-            "model": model_binding,
+            "model": _model_request_binding(include_environment=True),
             **_rag_binding_signature(),
         }
     )
+
+
+def _model_request_binding(*, include_environment: bool) -> dict[str, object]:
+    """返回不含明文密钥的模型配置绑定，用于状态哈希。
+
+    规则预检需要绑定最终生效的环境变量配置；已生成报告的生命周期只绑定
+    页面上的模型设置，避免用户临时切换 Agent 环境变量时丢失一份与数据
+    输入无关的基础报告。
+    """
+
+    configuration = None
+    issue = None
+    if include_environment:
+        configuration, issue = _model_api_configuration()
+    saved_key = str(st.session_state.get(MODEL_API_KEY_KEY, "")).strip()
+    effective_key = str(
+        configuration.get("api_key")
+        if configuration is not None
+        else saved_key
+    ).strip()
+    if configuration is None:
+        source = "page" if saved_key else None
+        api_url = str(st.session_state.get(MODEL_API_URL_KEY, "")).strip()
+        model = str(st.session_state.get(MODEL_NAME_KEY, "")).strip()
+    else:
+        source = configuration.get("source")
+        api_url = configuration.get("api_url")
+        model = configuration.get("model")
+    return {
+        "issue": issue,
+        "source": source,
+        "api_url": api_url,
+        "model": model,
+        "api_key_sha256": (
+            hashlib.sha256(effective_key.encode("utf-8")).hexdigest()
+            if effective_key
+            else None
+        ),
+    }
 
 
 def _render_pre_evaluation_rule_state(
@@ -1228,7 +1260,10 @@ def _render_pre_evaluation_rule_state(
             "approved_pack": approved_pack,
             "error": _model_error_detail(error),
         }
-        st.error(f"已批准规则的评估未完成：{_escape_markdown(str(error))}")
+        st.error(
+            "已批准规则的评估未完成："
+            f"{_escape_markdown(_model_error_detail(error))}"
+        )
         return
     st.session_state[PRE_EVALUATION_RULE_RESULT_KEY] = result
     st.session_state[PRE_EVALUATION_RULE_STATE_KEY] = {
@@ -2563,7 +2598,7 @@ def _render_custom_rule_authoring(
                         workflow=run.workflow.fail(
                             stage="compiling",
                             code="provider_configuration_failed",
-                            message=str(error),
+                            message=_model_error_detail(error),
                         )
                     )
             state = _custom_authoring_state(signature=signature, run=run)
@@ -2658,7 +2693,7 @@ def _render_custom_rule_authoring(
                     selected_metric_ids=selected_metric_ids,
                 )
             except RuleAuthoringCoordinatorError as error:
-                st.error(_escape_markdown(str(error)))
+                st.error(_escape_markdown(_model_error_detail(error)))
             state = _custom_authoring_state(signature=signature, run=run)
             st.session_state[CUSTOM_RULE_STATE_KEY] = state
 
@@ -2702,7 +2737,7 @@ def _render_custom_rule_authoring(
                     selected_metric_ids=selected_metric_ids,
                 )
             except RuleAuthoringCoordinatorError as error:
-                st.error(_escape_markdown(str(error)))
+                st.error(_escape_markdown(_model_error_detail(error)))
             state = _custom_authoring_state(signature=signature, run=run)
             st.session_state[CUSTOM_RULE_STATE_KEY] = state
         if run.result is not None:
@@ -2742,7 +2777,10 @@ def _render_custom_rule_authoring(
                 selected_metric_ids=selected_metric_ids,
             )
         except RuleAuthoringCoordinatorError as error:
-            st.error(f"自定义规则未执行：{_escape_markdown(str(error))}")
+            st.error(
+                "自定义规则未执行："
+                f"{_escape_markdown(_model_error_detail(error))}"
+            )
         else:
             state = _custom_authoring_state(signature=signature, run=run)
             st.session_state[CUSTOM_RULE_STATE_KEY] = state
@@ -2896,7 +2934,7 @@ def _render_rule_authoring(
                                 workflow=run.workflow.fail(
                                     stage="compiling",
                                     code="provider_configuration_failed",
-                                    message=str(error),
+                                    message=_model_error_detail(error),
                                 )
                             )
                     state = _sync_metric_authoring_run(
@@ -2952,7 +2990,7 @@ def _render_rule_authoring(
                             workflow=run.workflow.fail(
                                 stage="compiling",
                                 code="provider_configuration_failed",
-                                message=str(error),
+                                message=_model_error_detail(error),
                             )
                         )
                         state = _sync_metric_authoring_run(
@@ -3116,7 +3154,7 @@ def _render_rule_authoring(
                             selected_metric_ids=selected_metric_ids,
                         )
                     except RuleAuthoringCoordinatorError as error:
-                        st.error(_escape_markdown(str(error)))
+                        st.error(_escape_markdown(_model_error_detail(error)))
                     state = _sync_metric_authoring_run(
                         state,
                         metric_id,
@@ -3168,7 +3206,7 @@ def _render_rule_authoring(
                             selected_metric_ids=selected_metric_ids,
                         )
                     except RuleAuthoringCoordinatorError as error:
-                        st.error(_escape_markdown(str(error)))
+                        st.error(_escape_markdown(_model_error_detail(error)))
                     state = _sync_metric_authoring_run(
                         state,
                         metric_id,
@@ -3231,10 +3269,14 @@ def _render_rule_authoring(
                         )
                 except RuleAuthoringCoordinatorError as error:
                     errors = dict(state.get("execution_errors", {}))
-                    errors[metric_id] = str(error)
+                    safe_error = _model_error_detail(error)
+                    errors[metric_id] = safe_error
                     state = {**state, "execution_errors": errors}
                     st.session_state[RULE_AUTHORING_STATE_KEY] = state
-                    st.error(_escape_markdown(f"AI规则未执行：{error}"))
+                    st.error(
+                        "AI规则未执行："
+                        f"{_escape_markdown(safe_error)}"
+                    )
                 else:
                     state = _sync_metric_authoring_run(
                         state,
@@ -3559,9 +3601,12 @@ def _render_rule_enhancement(
                         **state,
                         "approved_pack": approved_pack,
                         "result": None,
-                        "execution_error": str(error),
+                        "execution_error": _model_error_detail(error),
                     }
-                    st.error(_escape_markdown(f"规则增强未执行：{error}"))
+                    st.error(
+                        "规则增强未执行："
+                        f"{_escape_markdown(_model_error_detail(error))}"
+                    )
                 except Exception:
                     failure_message = (
                         "规则增强未能完成；零配置报告不受影响，"
@@ -3651,7 +3696,7 @@ def _render_rule_enhancement(
     )
     st.download_button(
         "下载规则增强报告（Markdown）",
-        data=serialize_markdown_report(result.enhanced_report),
+        data=serialize_rule_evaluation_markdown(result),
         file_name=enhanced_markdown_name,
         mime="text/markdown",
     )
@@ -3792,8 +3837,8 @@ def _evaluation_request_signature(
     sheet_name: str,
     reference_date: date,
     selected_metric_ids: tuple[str, ...],
-) -> tuple[str, str, str, str, str, tuple[str, ...]] | None:
-    """标识当前评估请求，防止输入变化后继续展示旧报告。"""
+) -> tuple[object, ...] | None:
+    """标识当前评估请求，防止输入或模型配置变化后继续展示旧报告。"""
 
     if uploaded_file is None:
         return None
@@ -3805,6 +3850,7 @@ def _evaluation_request_signature(
         sheet_name.strip(),
         reference_date.isoformat(),
         selected_metric_ids,
+        _model_request_binding(include_environment=False),
     )
 
 

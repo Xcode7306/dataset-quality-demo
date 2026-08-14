@@ -16,18 +16,27 @@ import math
 import re
 from typing import Any, Literal, Mapping, Sequence
 
-from .metric_catalog import get_metric_definition
+from .metric_catalog import get_metric_definition, metric_rule_type_error
 
 
 RULE_PACK_SCHEMA_VERSION = "0.1"
 RULE_PACK_GENERATOR = "quality-rule-agent-v0.4"
 MAX_RULES = 100
+# 批量规则的每条自然语言输入至少会保留一条用户依据；目录指标规则还会
+# 增加指标定义和可选标准片段。上限按每条三项设置，既支持 100 条完整批次，
+# 又避免模型响应把证据无限放大。
+MAX_RULE_PACK_EVIDENCE = MAX_RULES * 3
 MAX_PRIMARY_KEY_FIELDS = 5
 MAX_ALLOWED_VALUES = 100
 MAX_RULE_NUMBER_ABS = 10**308
 MAX_REGEX_PATTERN_LENGTH = 200
 MAX_STRING_LENGTH = 10_000
 MAX_CONDITION_VALUES = 100
+
+LEGACY_RULE_PACK_MISSING_METRIC_TARGETS_ERROR = (
+    "旧版 v1.1 RulePack 未包含 metric_targets；当前版本拒绝导入，"
+    "避免静默改变目标指标映射。"
+)
 
 RuleType = Literal[
     "primary_key",
@@ -803,6 +812,13 @@ def validate_rule_pack(
     errors: list[str] = []
     warnings: list[str] = []
     if not isinstance(pack, RulePack):
+        if isinstance(pack, Mapping) and "metric_targets" not in pack:
+            return RulePackValidationResult(
+                valid=False,
+                errors=(LEGACY_RULE_PACK_MISSING_METRIC_TARGETS_ERROR,),
+                warnings=(),
+                draft_sha256=None,
+            )
         return RulePackValidationResult(
             valid=False,
             errors=("待校验对象不是 RulePack。",),
@@ -827,8 +843,10 @@ def validate_rule_pack(
         evidence_items: tuple[Any, ...] = ()
     else:
         evidence_items = pack.evidence
-    if len(evidence_items) > 20:
-        errors.append("RulePack evidence 最多包含 20 条依据。")
+    if len(evidence_items) > MAX_RULE_PACK_EVIDENCE:
+        errors.append(
+            f"RulePack evidence 最多包含 {MAX_RULE_PACK_EVIDENCE} 条依据。"
+        )
     for index, item in enumerate(evidence_items):
         if not isinstance(item, Mapping):
             errors.append(f"RulePack evidence[{index}] 必须是对象。")
@@ -976,6 +994,7 @@ def validate_rule_pack(
         errors.append("RulePack 指标目标数量不能超过规则数量。")
     target_rule_ids: list[str] = []
     target_metric_ids: list[str] = []
+    rules_by_id = {rule.rule_id: rule for rule in typed_rules}
     baseline_metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
     baseline_by_id: dict[str, list[Mapping[str, Any]]] = {}
     if isinstance(baseline_metrics, list):
@@ -998,6 +1017,14 @@ def validate_rule_pack(
             errors.append(
                 f"指标目标引用了不存在的规则：{target.rule_id}。"
             )
+        else:
+            target_rule = rules_by_id[target.rule_id]
+            compatibility_error = metric_rule_type_error(
+                target.target_metric_id,
+                target_rule.type,
+            )
+            if compatibility_error:
+                errors.append(compatibility_error)
         definition = get_metric_definition(target.target_metric_id)
         if definition is None:
             errors.append(

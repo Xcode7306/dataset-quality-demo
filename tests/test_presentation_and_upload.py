@@ -18,6 +18,11 @@ from src.presentation import (
     serialize_markdown_report,
     serialize_report,
 )
+from src.rule_pack import Rule, approve_rule_pack, build_rule_pack
+from src.rule_service import (
+    evaluate_uploaded_dataset_with_rule_pack,
+    serialize_rule_issue_locations_csv,
+)
 from src.upload_service import evaluate_uploaded_dataset
 
 
@@ -184,6 +189,58 @@ class PresentationTests(unittest.TestCase):
 
         self.assertNotIn(malicious_text, payload)
         self.assertIn(r"\!\[x\]\(https://example.invalid/pixel.png\)", payload)
+
+    def test_issue_location_csvs_escape_spreadsheet_formula_prefixes(self):
+        dangerous_fields = ("=SUM(1,1)", "+cmd", "-cmd", "@cmd")
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(dangerous_fields)
+        writer.writerow(["", "", "", ""])
+        content = output.getvalue().encode("utf-8")
+        report = evaluate_uploaded_dataset(content, "formula-prefixes.csv")
+
+        base_rows = list(
+            csv.DictReader(
+                io.StringIO(serialize_issue_locations_csv(report).decode("utf-8-sig"))
+            )
+        )
+        escaped_fields = {row["字段名称"] for row in base_rows}
+        for field in dangerous_fields:
+            with self.subTest(export="baseline", field=field):
+                self.assertIn(f"'{field}", escaped_fields)
+                self.assertNotIn(field, escaped_fields)
+
+        draft = build_rule_pack(
+            report,
+            name="公式前缀导出测试",
+            version="1.0",
+            rules=tuple(
+                Rule(
+                    type="required",
+                    rule_id=f"required-formula-{index}",
+                    fields=(field,),
+                )
+                for index, field in enumerate(dangerous_fields)
+            ),
+        )
+        approved = approve_rule_pack(draft, report, approver="formula-export-test")
+        result = evaluate_uploaded_dataset_with_rule_pack(
+            content,
+            "formula-prefixes.csv",
+            approved,
+        )
+        rule_rows = list(
+            csv.DictReader(
+                io.StringIO(
+                    serialize_rule_issue_locations_csv(result).decode("utf-8-sig")
+                )
+            )
+        )
+        escaped_rule_fields = {row["字段名称"] for row in rule_rows}
+        for field in dangerous_fields:
+            with self.subTest(export="rule", field=field):
+                self.assertIn(f"'{field}", escaped_rule_fields)
+                self.assertNotIn(field, escaped_rule_fields)
 
 
 class UploadServiceTests(unittest.TestCase):

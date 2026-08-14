@@ -25,6 +25,7 @@ from src.rule_pack import (
 )
 from src.rule_service import (
     evaluate_uploaded_dataset_with_rule_pack,
+    serialize_rule_evaluation_markdown,
     serialize_rule_evaluation_result,
     serialize_rule_issue_locations_csv,
 )
@@ -412,6 +413,7 @@ class RuleEngineTests(unittest.TestCase):
                 self._evaluate()
 
     def test_rule_inspection_has_a_lower_independent_resource_limit(self):
+        self.assertEqual(rule_engine.MAX_RULE_INSPECTION_CELLS, 2_000_000)
         with patch(
             "src.rule_engine.MAX_RULE_INSPECTION_CELLS",
             19,
@@ -421,6 +423,22 @@ class RuleEngineTests(unittest.TestCase):
                 "预计检查 20",
             ):
                 self._evaluate()
+
+    def test_actual_rule_inspection_limit_rejects_before_touching_dataframe_rows(self):
+        class InspectionLimitProbe:
+            def __len__(self):
+                # 当前已审批包共检查 5 个字段，因此为 2,000,005 次检查。
+                return 400_001
+
+        with self.assertRaisesRegex(
+            RulePackExecutionError,
+            "预计检查 2000005",
+        ):
+            rule_engine._calculate_business_metrics(
+                InspectionLimitProbe(),
+                self.original_report,
+                self.approved,
+            )
 
     def test_no_parseable_update_keeps_parse_rate_and_marks_freshness_unassessable(self):
         content = (
@@ -592,6 +610,40 @@ class RuleEngineTests(unittest.TestCase):
             with self.subTest(private_value=private_value):
                 self.assertNotIn(private_value, json_payload)
                 self.assertNotIn(private_value, csv_payload)
+
+    def test_rule_enhanced_markdown_carries_the_same_audit_chain_as_json(self):
+        result = self._evaluate()
+        json_payload = json.loads(serialize_rule_evaluation_result(result))
+        pack_payload = json_payload["approved_rule_pack"]
+        approval = pack_payload["approval"]
+        markdown = serialize_rule_evaluation_markdown(result).decode("utf-8")
+
+        self.assertIn("## 规则来源与审批记录", markdown)
+        for value in (
+            pack_payload["rule_pack_id"],
+            pack_payload["version"],
+            pack_payload["base_report_sha256"],
+            pack_payload["base_input_sha256"],
+            approval["approval_id"],
+            approval["draft_sha256"],
+        ):
+            with self.subTest(value=value):
+                self.assertIn(value, markdown)
+        for rule in pack_payload["rules"]:
+            self.assertIn(rule["rule_id"], markdown)
+        for metric in result.enhanced_report.metrics:
+            self.assertIn(metric.name, markdown)
+        for risk in result.enhanced_report.risks:
+            self.assertIn(risk.title, markdown)
+        for private_value in (
+            "private-note-alpha",
+            "private-note-beta",
+            "private-note-gamma",
+            "private-note-delta",
+            "other-secret",
+        ):
+            with self.subTest(private_value=private_value):
+                self.assertNotIn(private_value, markdown)
 
     def test_upload_reevaluation_reuses_workflow_parser_and_resource_limit(self):
         with (

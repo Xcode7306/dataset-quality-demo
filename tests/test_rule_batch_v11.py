@@ -15,7 +15,13 @@ from src.rule_batch import (
     parse_rule_import,
 )
 from src.rule_dsl import ProviderMetadata, RuleSpec
-from src.rule_pack import approve_rule_pack
+from src.rule_pack import (
+    Rule,
+    RuleMetricTarget,
+    RulePackValidationError,
+    approve_rule_pack,
+    build_rule_pack,
+)
 from src.rule_service import (
     dry_run_uploaded_dataset_with_rule_pack,
     evaluate_uploaded_dataset_with_rule_pack,
@@ -221,6 +227,58 @@ class RuleBatchV11Tests(unittest.TestCase):
         )
         self.assertTrue(custom.ready)
         self.assertEqual(custom.draft_pack.metric_targets, ())
+
+    def test_metric_supplement_rejects_rule_type_that_targets_the_wrong_semantics(self):
+        report = evaluate_uploaded_dataset(
+            self.content,
+            SAMPLE.name,
+            reference_date=REFERENCE_DATE,
+            selected_metric_ids=("db31_010102",),
+        )
+        preflight = compile_rule_batch(
+            report,
+            (
+                RuleBatchInput.create(
+                    origin="metric_supplement",
+                    user_intent="service_name为必填字段",
+                    label="格式约束却给必填规则",
+                    target_metric_id="db31_010102",
+                ),
+            ),
+        )
+
+        self.assertFalse(preflight.ready)
+        self.assertIsNone(preflight.draft_pack)
+        self.assertEqual(preflight.items[0].status, "invalid")
+        self.assertTrue(
+            any(
+                "不能绑定指标" in message
+                and "数据格式约束规范性" in message
+                for message in preflight.items[0].messages
+            )
+        )
+
+        # 即使绕过 RuleDraft 服务直接构造 RulePack，包级校验也必须拦截同一错配。
+        with self.assertRaises(RulePackValidationError) as error:
+            build_rule_pack(
+                report,
+                name="错误目标规则包",
+                version="1.1.0",
+                rules=(
+                    Rule(
+                        type="required",
+                        rule_id="required-wrong-target",
+                        fields=("service_name",),
+                    ),
+                ),
+                metric_targets=(
+                    RuleMetricTarget(
+                        "required-wrong-target",
+                        "db31_010102",
+                    ),
+                ),
+            )
+        self.assertIn("不能绑定指标", str(error.exception))
 
     def test_model_cannot_guess_critical_inputs_from_a_vague_description(self):
         preflight = compile_rule_batch(

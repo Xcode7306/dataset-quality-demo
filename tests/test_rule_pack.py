@@ -15,7 +15,9 @@ from jsonschema import Draft202012Validator
 
 from src.rule_pack import (
     FieldSemanticMapping,
+    LEGACY_RULE_PACK_MISSING_METRIC_TARGETS_ERROR,
     MAX_ALLOWED_VALUES,
+    MAX_RULE_PACK_EVIDENCE,
     MAX_RULE_NUMBER_ABS,
     Rule,
     RulePackValidationError,
@@ -26,6 +28,7 @@ from src.rule_pack import (
     is_rule_pack_executable,
     validate_rule_pack,
 )
+from src.rule_dsl import new_evidence
 from src.workflow import build_profile_report
 
 
@@ -185,6 +188,71 @@ class RulePackTests(unittest.TestCase):
 
         self.assert_schema_valid(draft.to_dict())
         self.assert_schema_valid(approved.to_dict())
+
+    def test_evidence_limit_matches_one_hundred_rule_batch_contract_and_schema(self):
+        evidence = tuple(
+            new_evidence(
+                "user_statement",
+                f"第 {index + 1} 条批量规则的用户依据。",
+                source_id=f"batch-input-{index + 1}",
+                source_label="用户评价依据",
+                location=f"batch:{index + 1}",
+            ).to_dict()
+            for index in range(MAX_RULE_PACK_EVIDENCE)
+        )
+        pack = build_rule_pack(
+            self.report,
+            name="批量规则证据上限",
+            version="1.0",
+            rules=(
+                Rule(
+                    type="required",
+                    rule_id="required-service",
+                    fields=("service_name",),
+                ),
+            ),
+            evidence=evidence,
+            generated_at=GENERATED_AT,
+        )
+        self.assertEqual(len(pack.evidence), MAX_RULE_PACK_EVIDENCE)
+        self.assert_schema_valid(pack.to_dict())
+
+        with self.assertRaisesRegex(RulePackValidationError, "300 条依据"):
+            build_rule_pack(
+                self.report,
+                name="超限批量规则证据",
+                version="1.0",
+                rules=(
+                    Rule(
+                        type="required",
+                        rule_id="required-service",
+                        fields=("service_name",),
+                    ),
+                ),
+                evidence=(*evidence, evidence[0]),
+                generated_at=GENERATED_AT,
+            )
+
+    def test_legacy_v11_payload_without_metric_targets_is_explicitly_rejected(self):
+        payload = self.build_pack().to_dict()
+        payload.pop("metric_targets")
+
+        validation = validate_rule_pack(payload, self.report)
+
+        self.assertFalse(validation.valid)
+        self.assertEqual(
+            validation.errors,
+            (LEGACY_RULE_PACK_MISSING_METRIC_TARGETS_ERROR,),
+        )
+        self.assertFalse(is_rule_pack_executable(payload, self.report))
+        schema_errors = list(self.validator.iter_errors(payload))
+        self.assertTrue(
+            any(
+                error.validator == "required"
+                and "metric_targets" in error.message
+                for error in schema_errors
+            )
+        )
 
     def test_unapproved_pack_cannot_execute_and_local_approval_is_traceable(self):
         draft = self.build_pack()

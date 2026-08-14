@@ -50,6 +50,16 @@ ISSUE_TYPE_LABELS = {
 }
 
 
+def spreadsheet_safe_cell(value: Any) -> Any:
+    """阻止不可信文本在 Excel/LibreOffice 中被当作公式执行。"""
+
+    if not isinstance(value, str):
+        return value
+    if value.lstrip().startswith(("=", "+", "-", "@")):
+        return f"'{value}"
+    return value
+
+
 def _metric_catalog_details(metric: MetricResult) -> dict[str, str]:
     """返回指标的来源与计算口径；兼容 RulePack 动态追加指标。"""
 
@@ -507,7 +517,13 @@ def serialize_issue_locations_csv(report: QualityReport) -> bytes:
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
-    writer.writerows(build_issue_location_rows(report))
+    writer.writerows(
+        {
+            key: spreadsheet_safe_cell(value)
+            for key, value in row.items()
+        }
+        for row in build_issue_location_rows(report)
+    )
     return output.getvalue().encode("utf-8-sig")
 
 

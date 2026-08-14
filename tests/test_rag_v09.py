@@ -168,6 +168,50 @@ class RagV09Tests(unittest.TestCase):
         self.assertEqual(empty.status, "no_results")
         self.assertEqual(empty.results, ())
 
+    def test_unapproved_and_expired_sources_are_not_retrievable_or_bindable(self):
+        knowledge_base = RagKnowledgeBase()
+        knowledge_base.ingest_bytes(
+            RAG_TEXT_V1,
+            "active-v1.md",
+            source_namespace=RAG_NAMESPACE_STANDARDS,
+            approved=True,
+            effective_status="active",
+        )
+        knowledge_base.ingest_bytes(
+            RAG_TEXT_V1,
+            "expired-v1.md",
+            source_namespace=RAG_NAMESPACE_STANDARDS,
+            approved=True,
+            effective_status="expired",
+        )
+        knowledge_base.ingest_bytes(
+            RAG_TEXT_V1,
+            "unapproved-v1.md",
+            source_namespace=RAG_NAMESPACE_STANDARDS,
+            approved=False,
+            effective_status="active",
+        )
+
+        response = knowledge_base.search(
+            "service_name 必须填写",
+            metric_id="db31_020100",
+            standard_number="DB31/T 1523-2024",
+            version="v1",
+        )
+        self.assertEqual(response.status, "ok")
+        self.assertEqual(response.filtered_document_count, 1)
+        self.assertTrue(response.results)
+        self.assertTrue(
+            all(
+                item.document.approved
+                and item.document.effective_status == "active"
+                for item in response.results
+            )
+        )
+        evidence = evidence_from_response(response)
+        self.assertTrue(evidence)
+        self.assertTrue(all(item.authoritative for item in evidence))
+
     def test_citations_are_bound_to_retrieval_results_and_pack_source(self):
         knowledge_base = RagKnowledgeBase()
         knowledge_base.ingest_bytes(

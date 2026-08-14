@@ -11,6 +11,10 @@ import openpyxl.xml
 
 from src.parser import DatasetReadError, parse_dataset
 from src.resource_limits import (
+    MAX_DATASET_CELLS,
+    MAX_INPUT_FILE_BYTES,
+    MAX_INPUT_FILE_MIB,
+    MAX_JSON_RECORDS,
     ResourceLimitExceeded,
     validate_dataframe_limits,
     validate_input_file_size,
@@ -34,6 +38,37 @@ class ResourceLimitTests(unittest.TestCase):
                     validate_input_file_size(path)
                 with self.assertRaisesRegex(ResourceLimitExceeded, "\u8d85\u8fc7"):
                     validate_upload_size(4)
+
+    def test_public_limit_values_and_actual_json_record_boundary_are_enforced(self):
+        self.assertEqual(MAX_INPUT_FILE_MIB, 50)
+        self.assertEqual(MAX_DATASET_CELLS, 20_000_000)
+        self.assertEqual(MAX_JSON_RECORDS, 200_000)
+        validate_upload_size(MAX_INPUT_FILE_BYTES)
+        with self.assertRaisesRegex(ResourceLimitExceeded, "50 MiB"):
+            validate_upload_size(MAX_INPUT_FILE_BYTES + 1)
+
+        class CellLimitProbe:
+            # 行、列各自不超限，但乘积超过 20,000,000；无需真的分配 2 千万格。
+            shape = (1_000_000, 21)
+            columns = ()
+
+        with self.assertRaisesRegex(ResourceLimitExceeded, "21000000 个单元格"):
+            validate_dataframe_limits(CellLimitProbe())
+
+        # 真实 200,001 条 JSON 记录必须在 json.load/DataFrame 物化前拒绝，
+        # 避免测试仅依赖被缩小的 mock 阈值。
+        payload = b"[" + b",".join(
+            b"{}" for _ in range(MAX_JSON_RECORDS + 1)
+        ) + b"]"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "over-record-limit.json"
+            path.write_bytes(payload)
+            with (
+                patch("src.parser.json.load") as json_load,
+                self.assertRaisesRegex(DatasetReadError, "超过 200000 项"),
+            ):
+                parse_dataset(path)
+        json_load.assert_not_called()
 
     def test_xlsx_entry_expansion_and_compression_limits_are_enforced(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

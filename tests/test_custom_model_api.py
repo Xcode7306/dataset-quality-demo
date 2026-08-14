@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 
 from src.agent_providers import OpenAICompatibleChatProvider
-from src.rule_authoring_providers import OpenAICompatibleRuleAuthoringProvider
+from src.rule_authoring_providers import (
+    OpenAICompatibleRuleAuthoringProvider,
+    RuleAuthoringProviderError,
+)
 from src.rule_authoring_service import compile_rule_draft
 from src.workflow import build_profile_report
 
@@ -143,6 +146,32 @@ class CustomModelApiProviderTests(unittest.TestCase):
                 provider=FailingProvider(),
                 allow_template_fallback=False,
             )
+
+    def test_rule_provider_does_not_retry_transport_failures_as_parameter_fallbacks(self):
+        requests = []
+
+        class FailingClient:
+            def post(self, url, *, headers, json):
+                del url, headers, json
+                requests.append("attempt")
+                raise TimeoutError("simulated timeout")
+
+            def close(self):
+                pass
+
+        provider = OpenAICompatibleRuleAuthoringProvider(
+            api_key="page-only-key",
+            api_url="https://model.example/v1",
+            model="custom-rule-model",
+            client_factory=lambda **options: FailingClient(),
+        )
+
+        with self.assertRaisesRegex(RuleAuthoringProviderError, "未完成"):
+            provider.generate(
+                {"report_sha256": "a" * 64, "fields": []},
+                user_intent="字段为必填",
+            )
+        self.assertEqual(requests, ["attempt"])
 
 
 if __name__ == "__main__":

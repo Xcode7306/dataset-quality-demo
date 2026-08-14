@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
+from time import monotonic
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
 import pandas as pd
@@ -38,6 +39,9 @@ from .rule_pack import (
 MAX_RULE_IMPORT_BYTES = 2 * 1024 * 1024
 MAX_RULE_TEXT_LENGTH = 4000
 MAX_RULE_FILE_NAME_LENGTH = 255
+# 一个批次最多允许占用一次页面请求 60 秒。外部模型的单次请求仍由 Provider
+# 自己的超时控制；这里的预算避免 100 条批量规则累积等待数十分钟。
+MAX_RULE_BATCH_COMPILE_SECONDS = 60.0
 SUPPORTED_RULE_IMPORT_EXTENSIONS = frozenset(
     {".txt", ".md", ".csv", ".xls", ".xlsx", ".json", ".jsonl", ".ndjson"}
 )
@@ -63,6 +67,10 @@ _METRIC_COLUMN_ALIASES = (
 )
 _MARKDOWN_BULLET = re.compile(r"^\s*(?:[-*+]\s+|\d{1,3}[.)、]\s*)")
 _RULE_LABEL_PREFIX = re.compile(r"^\s*(?:规则|要求)\s*\d*\s*[:：]\s*")
+_BATCH_TIMEOUT_MESSAGE = (
+    "批量规则生成超过 60 秒安全时限；本批次未生成 RulePack，"
+    "请拆分规则后重试。"
+)
 
 
 class RuleImportError(ValueError):
@@ -592,7 +600,17 @@ def compile_rule_batch(
     chunks = tuple(dict.fromkeys(str(item) for item in selected_chunk_ids))
     results: list[RuleBatchItemResult] = []
     ready_drafts: list[RuleDraft] = []
-    for request in requests:
+    started_at = monotonic()
+    for index, request in enumerate(requests):
+        if monotonic() - started_at >= MAX_RULE_BATCH_COMPILE_SECONDS:
+            results.extend(
+                RuleBatchItemResult(request=pending, error=_BATCH_TIMEOUT_MESSAGE)
+                for pending in requests[index:]
+            )
+            return RuleBatchPreflight(
+                tuple(results),
+                warnings=(_BATCH_TIMEOUT_MESSAGE,),
+            )
         try:
             target_metric_id = _resolve_metric_id(request.target_metric_id)
             if target_metric_id:
@@ -633,6 +651,20 @@ def compile_rule_batch(
                 request=request,
                 error=_safe_error(error),
             )
+        # 一个 Provider 调用本身也可能用尽预算。把已完成但超时返回的候选
+        # 作为失败处理，确保用户不会拿到“部分成功”的可审批 RulePack。
+        if monotonic() - started_at >= MAX_RULE_BATCH_COMPILE_SECONDS:
+            results.append(
+                RuleBatchItemResult(request=request, error=_BATCH_TIMEOUT_MESSAGE)
+            )
+            results.extend(
+                RuleBatchItemResult(request=pending, error=_BATCH_TIMEOUT_MESSAGE)
+                for pending in requests[index + 1:]
+            )
+            return RuleBatchPreflight(
+                tuple(results),
+                warnings=(_BATCH_TIMEOUT_MESSAGE,),
+            )
         results.append(item_result)
 
     if any(item.status != "ready" for item in results):
@@ -652,6 +684,7 @@ def compile_rule_batch(
 
 
 __all__ = [
+    "MAX_RULE_BATCH_COMPILE_SECONDS",
     "MAX_RULE_IMPORT_BYTES",
     "RuleBatchInput",
     "RuleBatchItemResult",

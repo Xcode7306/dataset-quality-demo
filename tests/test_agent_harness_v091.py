@@ -172,6 +172,61 @@ class AgentHarnessV091Tests(unittest.TestCase):
             errors = list(self.trace_validator.iter_errors(case.trace.to_dict()))
             self.assertEqual([], errors, f"{case.case_id}: {errors}")
 
+    def test_template_repeated_generation_is_stable_for_each_rule_type(self):
+        report = build_profile_report(
+            ROOT / "harness" / "data" / "agent_harness.csv",
+            reference_date=date(2026, 8, 1),
+        )
+        cases = {
+            "primary_key": "record_id是唯一标识",
+            "required": "service_name为必填字段",
+            "update_freshness": "更新时间字段update_time每月更新",
+            "allowed_values": "status只能为active、inactive、closed",
+            "numeric_range": "handling_days范围为1到30",
+            "regex_format": r"version必须匹配正则 ^v\d+\.\d+$",
+            "string_length": "version长度为4位",
+            "conditional_required": "status为inactive时，service_name必须填写",
+            "field_comparison": "start_date不得晚于end_date",
+        }
+
+        def semantic_signature(draft):
+            spec = draft.rule_spec
+            return (
+                draft.status,
+                spec.rule_type if spec is not None else None,
+                tuple(spec.fields) if spec is not None else (),
+                json.dumps(
+                    spec.parameters if spec is not None else {},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                tuple(draft.clarification_questions),
+                draft.unsupported_reason,
+            )
+
+        provider = TemplateRuleAuthoringProvider()
+        for expected_type, user_intent in cases.items():
+            with self.subTest(rule_type=expected_type):
+                signatures = []
+                for _ in range(20):
+                    draft = compile_custom_rule_draft(
+                        report,
+                        user_intent=user_intent,
+                        provider=provider,
+                        allow_template_fallback=False,
+                        created_at="2026-08-01T00:00:00Z",
+                    )
+                    self.assertEqual(draft.status, "draft")
+                    self.assertIsNotNone(draft.rule_spec)
+                    self.assertEqual(draft.rule_spec.rule_type, expected_type)
+                    signatures.append(semantic_signature(draft))
+                self.assertEqual(
+                    len(set(signatures)),
+                    1,
+                    f"相同中文输入的 {expected_type} 生成结果出现未解释差异：{set(signatures)}",
+                )
+
     def test_rag_goldens_cover_success_empty_conflict_and_stale_sources(self):
         report = run_rag_retrieval_harness(ROOT)
 

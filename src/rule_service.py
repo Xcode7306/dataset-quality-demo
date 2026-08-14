@@ -15,7 +15,11 @@ from .parser import (
     UnsupportedFileTypeError,
     parse_dataset,
 )
-from .presentation import build_issue_location_rows
+from .presentation import (
+    build_issue_location_rows,
+    serialize_markdown_report,
+    spreadsheet_safe_cell,
+)
 from .resource_limits import ResourceLimitExceeded, validate_upload_size
 from .rule_engine import (
     RuleEvaluationResult,
@@ -24,20 +28,14 @@ from .rule_engine import (
     _evaluate_rule_pack_on_verified_dataframe,
     dry_run_rule_pack_on_dataframe,
 )
-from .rule_pack import RulePack, is_rule_pack_executable, validate_rule_pack
+from .rule_pack import (
+    RulePack,
+    is_rule_pack_executable,
+    validate_rule_pack,
+)
 from .text_utils import normalize_display_text
 from .upload_service import _clean_file_name_component, sanitize_file_name
 from .workflow import build_profile_report
-
-
-def _spreadsheet_safe_cell(value):
-    """阻止不可信字段名在表格软件中被解释为公式。"""
-
-    if not isinstance(value, str):
-        return value
-    if value.lstrip().startswith(("=", "+", "-", "@")):
-        return f"'{value}"
-    return value
 
 
 def _prepare_upload_name(
@@ -214,6 +212,47 @@ def serialize_rule_evaluation_result(
     return result.to_json(indent=2).encode("utf-8")
 
 
+def serialize_rule_evaluation_markdown(
+    result: RuleEvaluationResult,
+) -> bytes:
+    """导出规则增强报告，并附上可与 JSON RulePack 核对的审批链路。"""
+
+    pack = result.approved_rule_pack
+    approval = pack.approval
+    lines = [
+        serialize_markdown_report(result.enhanced_report).decode("utf-8").rstrip(),
+        "",
+        "## 规则来源与审批记录",
+        "",
+        f"- RulePack ID：`{pack.rule_pack_id}`",
+        f"- RulePack 版本：`{pack.version}`",
+        f"- 规则数量：{len(pack.rules)}",
+        "- 规则 ID：" + "、".join(f"`{rule.rule_id}`" for rule in pack.rules),
+        f"- 基线报告 SHA-256：`{pack.base_report_sha256}`",
+        f"- 输入文件 SHA-256：`{pack.base_input_sha256}`",
+        f"- 评估基准日期：`{pack.reference_date}`",
+    ]
+    if approval is None:
+        lines.append("- 审批状态：未找到审批记录（该结果不应被视为可审计）。")
+    else:
+        lines.extend(
+            [
+                "- 审批状态：已审批",
+                f"- 审批记录 ID：`{approval.approval_id}`",
+                f"- 审批绑定草案 SHA-256：`{approval.draft_sha256}`",
+                f"- 审批时间：`{approval.approved_at}`",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "说明：上述哈希可与下载的已审批 RulePack（JSON）和规则增强结果（JSON）交叉核对。",
+            "",
+        ]
+    )
+    return "\n".join(lines).encode("utf-8")
+
+
 def serialize_rule_issue_locations_csv(
     result: RuleEvaluationResult,
 ) -> bytes:
@@ -236,7 +275,7 @@ def serialize_rule_issue_locations_csv(
     writer.writeheader()
     writer.writerows(
         {
-            key: _spreadsheet_safe_cell(value)
+            key: spreadsheet_safe_cell(value)
             for key, value in row.items()
         }
         for row in rows

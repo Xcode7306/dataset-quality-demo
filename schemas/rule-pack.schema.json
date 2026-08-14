@@ -75,7 +75,7 @@
     },
     "evidence": {
       "type": "array",
-      "maxItems": 20,
+      "maxItems": 300,
       "items": {"$ref": "#/$defs/evidence"}
     },
     "approval": {

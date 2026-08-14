@@ -229,6 +229,31 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertEqual("", app.session_state["model_api_key"])
         self.assertEqual("", app.session_state["model_api_key_input"])
 
+    def test_streamlit_sessions_isolate_page_key_and_workflow_state(self):
+        first = self._new_app()
+        first.session_state["model_api_key"] = "session-a-secret"
+        first.session_state["quality_report"] = "report-a-marker"
+        first.session_state["rule_ui_state"] = {"marker": "rule-a-marker"}
+        first.session_state["rule_authoring_workflow_history"] = [
+            "history-a-marker"
+        ]
+
+        second = self._new_app()
+        second_state = second.session_state.filtered_state
+
+        self.assertEqual("", second_state.get("model_api_key"))
+        self.assertNotIn("quality_report", second_state)
+        self.assertNotIn("rule_ui_state", second_state)
+        self.assertNotIn("rule_authoring_workflow_history", second_state)
+        self.assertNotIn("session-a-secret", repr(second_state))
+        self.assertNotIn("report-a-marker", repr(second_state))
+        self.assertNotIn("rule-a-marker", repr(second_state))
+        self.assertNotIn("history-a-marker", repr(second_state))
+
+        warning_text = "\n".join(item.value for item in second.caption)
+        self.assertIn("没有登录或多用户隔离", warning_text)
+        self.assertIn("钥匙串", warning_text)
+
     def test_saved_model_api_key_can_retry_after_credential_store_warning(self):
         app = self._new_app()
         next(
@@ -538,6 +563,53 @@ class StreamlitAppTests(unittest.TestCase):
 
         self._button_by_label(app, "运行质量评估").click().run()
         self._assert_report_surface(app, "json")
+
+    def test_model_configuration_change_invalidates_report_and_rule_state(self):
+        sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
+        app = self._new_app()
+        self._upload_and_run(
+            app,
+            sample.name,
+            sample.read_bytes(),
+            "text/csv",
+        )
+        app.session_state["rule_ui_state"] = {"approved_pack": "sentinel"}
+        app.session_state["agent_ui_state"] = {"latest_analysis": "sentinel"}
+        app.session_state["pre_evaluation_rule_state"] = {
+            "approved_pack": "sentinel",
+        }
+        app.session_state["pre_evaluation_rule_result"] = "sentinel"
+
+        model_input = next(
+            item for item in app.text_input if item.label == "模型名称"
+        )
+        model_input.set_value("changed-model")
+        app.run()
+
+        self.assertFalse(app.exception)
+        self.assertNotIn("quality_report", app.session_state.filtered_state)
+        self.assertNotIn("rule_ui_state", app.session_state.filtered_state)
+        self.assertNotIn("agent_ui_state", app.session_state.filtered_state)
+        self.assertNotIn(
+            "pre_evaluation_rule_state",
+            app.session_state.filtered_state,
+        )
+        self.assertNotIn(
+            "pre_evaluation_rule_result",
+            app.session_state.filtered_state,
+        )
+
+        # 重新生成一份基础报告后，保存新的 API Key 也必须使当前报告失效。
+        self._button_by_label(app, "运行质量评估").click().run()
+        self.assertIn("quality_report", app.session_state.filtered_state)
+        next(
+            item for item in app.text_input if item.label == "API Key"
+        ).set_value("model-binding-test-key")
+        app.run()
+        self._button_by_label(app, "保存 API Key").click().run()
+
+        self.assertFalse(app.exception)
+        self.assertNotIn("quality_report", app.session_state.filtered_state)
 
     def test_agent_is_user_triggered_read_only_and_uses_template_by_default(self):
         sample = PROJECT_ROOT / "sample_data" / "bad_dataset.csv"

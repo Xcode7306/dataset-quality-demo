@@ -14,6 +14,7 @@ from src.rule_authoring_providers import (
 )
 from src.rule_authoring_service import (
     build_rule_pack_from_draft,
+    compile_custom_rule_draft,
     compile_rule_draft,
     validate_rule_draft,
 )
@@ -150,6 +151,39 @@ class RuleAuthoringV07Tests(unittest.TestCase):
         validation = validate_rule_draft(draft, self.report)
         self.assertFalse(validation.valid)
         self.assertTrue(any("不存在的字段" in error for error in validation.errors))
+
+    def test_multi_rule_provider_result_cannot_silently_drop_the_second_rule(self):
+        class FirstRuleOnlyProvider:
+            def generate(self, context, *, user_intent):
+                del context, user_intent
+                return RuleAuthoringProviderResult(
+                    outcome="draft",
+                    rule_spec=RuleSpec(
+                        rule_type="required",
+                        rule_id="first-rule",
+                        name="service_name 必填",
+                        description="测试 Provider 只返回第一条规则。",
+                        fields=("service_name",),
+                    ),
+                    metadata=ProviderMetadata(
+                        provider="first-rule-only-test",
+                        model="fake",
+                        mode="model",
+                        prompt_version="test",
+                    ),
+                )
+
+        draft = compile_custom_rule_draft(
+            self.report,
+            user_intent="service_name为必填字段；department只能为政务服务中心、业务处室。",
+            provider=FirstRuleOnlyProvider(),
+            allow_template_fallback=False,
+            created_at="2026-07-29T08:30:00Z",
+        )
+
+        self.assertEqual(draft.status, "needs_clarification")
+        self.assertIsNone(draft.rule_spec)
+        self.assertTrue(any("多条独立规则" in item for item in draft.clarification_questions))
 
     def test_workflow_state_is_controlled_locally(self):
         workflow = RuleAuthoringWorkflow(
