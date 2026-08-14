@@ -1,0 +1,7 @@
+# Evaluation inputs are fingerprinted as raw bytes. Keep checked-in text datasets
+# byte-stable across Windows, macOS, and Linux checkouts.
+*.csv text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.ndjson text eol=lf
+*.geojson text eol=lf

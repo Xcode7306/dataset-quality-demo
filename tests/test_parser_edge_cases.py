@@ -185,10 +185,10 @@ class ParserEdgeCaseTests(unittest.TestCase):
     def test_csv_accepts_leading_blanks_and_multiline_quoted_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "multiline.csv"
-            path.write_text(
-                '\n \t\r\nname,notes\nA,"first line\nsecond line"\n\nB,ok\n',
-                encoding="utf-8",
-            )
+            with path.open("w", encoding="utf-8", newline="") as file:
+                file.write(
+                    '\n \t\r\nname,notes\nA,"first line\nsecond line"\n\nB,ok\n'
+                )
 
             parsed = parse_dataset(path)
 
@@ -202,10 +202,10 @@ class ParserEdgeCaseTests(unittest.TestCase):
     def test_csv_rejects_wider_logical_record_with_line_and_field_counts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "ragged.csv"
-            path.write_text(
-                '\n \t\r\nname,notes\nA,"first line\nsecond line"\n\nB,ok,extra\n',
-                encoding="utf-8",
-            )
+            with path.open("w", encoding="utf-8", newline="") as file:
+                file.write(
+                    '\n \t\r\nname,notes\nA,"first line\nsecond line"\n\nB,ok,extra\n'
+                )
 
             with self.assertRaisesRegex(
                 DatasetReadError,
