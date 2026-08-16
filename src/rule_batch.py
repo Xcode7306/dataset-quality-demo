@@ -34,6 +34,7 @@ from .rule_pack import (
     RulePackValidationError,
     build_rule_pack,
 )
+from .text_utils import contains_unsafe_unicode_controls
 
 
 MAX_RULE_IMPORT_BYTES = 2 * 1024 * 1024
@@ -111,7 +112,23 @@ class RuleBatchInput:
             intent.encode("utf-8", errors="strict")
         except UnicodeEncodeError as error:
             raise RuleImportError("规则描述包含非法 Unicode 字符。") from error
+        if contains_unsafe_unicode_controls(intent):
+            raise RuleImportError("规则描述不能包含 Unicode 控制字符。")
         normalized_label = str(label or "").strip() or "未命名规则"
+        if contains_unsafe_unicode_controls(normalized_label):
+            raise RuleImportError("规则标签不能包含 Unicode 控制字符。")
+        normalized_source_name = str(source_name).strip() if source_name else None
+        if normalized_source_name and contains_unsafe_unicode_controls(
+            normalized_source_name
+        ):
+            raise RuleImportError("规则来源文件名不能包含 Unicode 控制字符。")
+        normalized_source_location = (
+            str(source_location).strip() if source_location else None
+        )
+        if normalized_source_location and contains_unsafe_unicode_controls(
+            normalized_source_location
+        ):
+            raise RuleImportError("规则来源位置不能包含 Unicode 控制字符。")
         fingerprint = json.dumps(
             [
                 origin,
@@ -133,12 +150,16 @@ class RuleBatchInput:
             target_metric_id=(
                 str(target_metric_id).strip() if target_metric_id else None
             ),
-            source_name=str(source_name).strip()[:MAX_RULE_FILE_NAME_LENGTH]
-            if source_name
-            else None,
-            source_location=str(source_location).strip()[:300]
-            if source_location
-            else None,
+            source_name=(
+                normalized_source_name[:MAX_RULE_FILE_NAME_LENGTH]
+                if normalized_source_name
+                else None
+            ),
+            source_location=(
+                normalized_source_location[:300]
+                if normalized_source_location
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:

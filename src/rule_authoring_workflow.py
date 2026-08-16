@@ -19,6 +19,7 @@ from .rule_dsl import (
     RuleDraftValidationResult,
     make_workflow_id,
 )
+from .text_utils import contains_unsafe_unicode_controls
 
 
 WORKFLOW_SCHEMA_VERSION = "1.0"
@@ -152,6 +153,8 @@ def make_rule_authoring_request_fingerprint(
     if not intent or len(intent) > 4000:
         raise RuleAuthoringWorkflowError("规则编制请求必须包含 1 到 4000 个字符。")
     intent.encode("utf-8", errors="strict")
+    if contains_unsafe_unicode_controls(intent):
+        raise RuleAuthoringWorkflowError("规则编制请求不能包含 Unicode 控制字符。")
     if target_type not in {"catalog_metric", "custom_rule"}:
         raise RuleAuthoringWorkflowError("工作流 target_type 无效。")
     if target_type == "catalog_metric" and not target_metric_id:

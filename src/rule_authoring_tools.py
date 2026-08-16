@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 
 from .metric_catalog import get_metric_definition
+from .text_utils import contains_unsafe_unicode_controls
 
 
 RULE_AUTHORING_TOOL_POLICIES: Mapping[str, Mapping[str, Any]] = {
@@ -56,6 +57,8 @@ def _tool_text(value: Any, label: str, *, maximum: int) -> str:
         text.encode("utf-8", errors="strict")
     except UnicodeEncodeError as error:
         raise RuleAuthoringToolRequestError(f"{label}包含非法 Unicode。") from error
+    if contains_unsafe_unicode_controls(text):
+        raise RuleAuthoringToolRequestError(f"{label}不能包含 Unicode 控制字符。")
     return text
 
 

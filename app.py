@@ -36,6 +36,7 @@ from src.metric_catalog import (
     metric_description,
     normalize_selected_metric_ids,
 )
+from src.model_runtime import model_runtime_snapshot
 from src.models import QualityReport
 from src.parser import DatasetReadError, UnsupportedFileTypeError
 from src.presentation import (
@@ -106,7 +107,12 @@ from src.rule_service import (
     serialize_rule_evaluation_result,
     serialize_rule_issue_locations_csv,
 )
+from src.session_limits import bounded_rule_chat_state
 from src.upload_service import evaluate_uploaded_dataset, sanitize_file_name
+from src.text_utils import (
+    contains_unsafe_unicode_controls,
+    replace_unsafe_unicode_controls,
+)
 
 
 AGENT_STATE_KEY = "agent_ui_state"
@@ -125,6 +131,7 @@ PRE_EVALUATION_RULE_CONFIRM_KEY = "pre_evaluation_rule_confirmed"
 PRE_EVALUATION_IMPORT_VALUES_KEY = "pre_evaluation_import_rule_values"
 PRE_EVALUATION_CHAT_MESSAGES_KEY = "pre_evaluation_rule_chat_messages"
 PRE_EVALUATION_CHAT_ATTACHMENTS_KEY = "pre_evaluation_rule_chat_attachments"
+PRE_EVALUATION_CHAT_NOTICE_KEY = "pre_evaluation_rule_chat_notice"
 MODEL_API_URL_KEY = "model_api_url"
 MODEL_API_KEY_KEY = "model_api_key"
 MODEL_API_KEY_INPUT_KEY = "model_api_key_input"
@@ -211,6 +218,7 @@ def _clear_rule_state(
     if not preserve_chat:
         st.session_state.pop(PRE_EVALUATION_CHAT_MESSAGES_KEY, None)
         st.session_state.pop(PRE_EVALUATION_CHAT_ATTACHMENTS_KEY, None)
+        st.session_state.pop(PRE_EVALUATION_CHAT_NOTICE_KEY, None)
         st.session_state.pop(PRE_EVALUATION_IMPORT_VALUES_KEY, None)
     rag_state = st.session_state.get(RAG_STATE_KEY)
     if isinstance(rag_state, dict):
@@ -394,6 +402,8 @@ def _model_api_configuration() -> tuple[dict[str, str] | None, str | None]:
             return None, key_issue
         if not api_url or not model:
             return None, "请同时填写 API 地址、API Key 和模型名称。"
+        if contains_unsafe_unicode_controls(api_url) or contains_unsafe_unicode_controls(model):
+            return None, "API 地址和模型名称不能包含 Unicode 控制字符。"
         if not api_url.startswith(("http://", "https://")):
             return None, "API 地址必须以 http:// 或 https:// 开头。"
         return {
@@ -519,6 +529,32 @@ def _render_model_api_settings() -> None:
             st.caption(
                 "未填写 API Key 时仅使用本地模板作暂行演示；正式运行请先配置模型。"
             )
+        runtime_usage = model_runtime_snapshot()
+        if runtime_usage:
+            st.caption(
+                "当前进程模型调用汇总（不记录 API Key、提示词、原始数据或模型文本）："
+            )
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "提供方": item.provider,
+                            "模型": item.model,
+                            "请求": item.attempts,
+                            "成功": item.successes,
+                            "失败": item.failures,
+                            "拒绝": item.rejected,
+                            "输入 Token": item.input_tokens,
+                            "输出 Token": item.output_tokens,
+                            "累计耗时(ms)": item.total_latency_ms,
+                            "进行中": item.active_requests,
+                        }
+                        for item in runtime_usage
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
 
 
 def _build_agent_provider():
@@ -627,18 +663,44 @@ def _initialize_metric_evidence_state() -> None:
 def _initialize_pre_evaluation_rule_input_state() -> None:
     """Keep optional rule text available when Streamlit temporarily hides widgets."""
 
-    messages = st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY)
-    if not isinstance(messages, list):
-        st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = []
-    attachments = st.session_state.get(PRE_EVALUATION_CHAT_ATTACHMENTS_KEY)
-    if not isinstance(attachments, list):
-        st.session_state[PRE_EVALUATION_CHAT_ATTACHMENTS_KEY] = []
+    _store_pre_evaluation_rule_chat_state()
     saved_imports = st.session_state.get(PRE_EVALUATION_IMPORT_VALUES_KEY, {})
     if isinstance(saved_imports, dict):
         for item_id, value in saved_imports.items():
             key = f"pre_import_rule_text_{item_id}"
             if key not in st.session_state and isinstance(value, str):
                 st.session_state[key] = value
+
+
+def _store_pre_evaluation_rule_chat_state(
+    messages: object | None = None,
+    attachments: object | None = None,
+) -> None:
+    """Persist only a small, safe recent window of session-local rule chat."""
+
+    raw_messages = (
+        messages
+        if isinstance(messages, list)
+        else st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
+    )
+    raw_attachments = (
+        attachments
+        if isinstance(attachments, list)
+        else st.session_state.get(PRE_EVALUATION_CHAT_ATTACHMENTS_KEY, [])
+    )
+    cleaned_messages, cleaned_attachments, discarded = bounded_rule_chat_state(
+        raw_messages if isinstance(raw_messages, list) else (),
+        raw_attachments if isinstance(raw_attachments, list) else (),
+    )
+    st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = cleaned_messages
+    st.session_state[PRE_EVALUATION_CHAT_ATTACHMENTS_KEY] = cleaned_attachments
+    if discarded:
+        st.session_state[PRE_EVALUATION_CHAT_NOTICE_KEY] = (
+            "为控制当前会话内存，已移除过长、含控制字符或超出数量/总大小上限的规则对话内容或附件。"
+        )
+        # Edited import values refer to prior attachment item IDs.  Clearing
+        # them prevents detached widget values from accumulating after pruning.
+        st.session_state[PRE_EVALUATION_IMPORT_VALUES_KEY] = {}
 
 
 def _preserve_hidden_pre_evaluation_widget_state() -> None:
@@ -807,6 +869,30 @@ def _render_metric_selection_panel() -> tuple[str, ...]:
             transform: translateY(0);
             visibility: visible;
         }
+        .metric-help-icon:focus-visible {
+            outline: 3px solid #2563eb;
+            outline-offset: 2px;
+        }
+        .metric-help-icon::after {
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+        @media (max-width: 768px) {
+            [data-testid="stHorizontalBlock"] {
+                flex-wrap: wrap;
+            }
+            [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+                flex: 1 1 100% !important;
+                min-width: 100% !important;
+            }
+            .metric-help-icon::after {
+                max-width: calc(100vw - 2rem);
+            }
+            [data-testid="stTextArea"] textarea {
+                overflow-wrap: anywhere;
+                word-break: break-word;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -883,6 +969,9 @@ def _render_rule_chat_input(
     chat_messages = list(
         st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
     )
+    chat_notice = st.session_state.get(PRE_EVALUATION_CHAT_NOTICE_KEY)
+    if isinstance(chat_notice, str) and chat_notice:
+        st.warning(chat_notice)
     for message in chat_messages:
         role = message.get("role") if isinstance(message, dict) else None
         content = message.get("content") if isinstance(message, dict) else None
@@ -938,9 +1027,14 @@ def _render_rule_chat_input(
                     "content": item.getvalue(),
                 }
             )
-        st.session_state[PRE_EVALUATION_CHAT_ATTACHMENTS_KEY] = existing_attachments
     if chat_text or attached_files:
-        st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
+        _store_pre_evaluation_rule_chat_state(
+            chat_messages,
+            existing_attachments if attached_files else None,
+        )
+        chat_messages = list(
+            st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
+        )
 
     if chat_messages:
         if st.button(
@@ -951,6 +1045,7 @@ def _render_rule_chat_input(
             st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = []
             st.session_state[PRE_EVALUATION_CHAT_ATTACHMENTS_KEY] = []
             st.session_state[PRE_EVALUATION_IMPORT_VALUES_KEY] = {}
+            st.session_state.pop(PRE_EVALUATION_CHAT_NOTICE_KEY, None)
             st.rerun()
 
     try:
@@ -1279,7 +1374,7 @@ def _render_pre_evaluation_rule_state(
 def _escape_markdown(value: object) -> str:
     """转义会触发 Markdown 链接、图片或 HTML 的不可信展示文本。"""
 
-    text = str(value)
+    text = replace_unsafe_unicode_controls(value)
     for character in ("\\", "`", "*", "_", "[", "]", "(", ")", "<", ">", "#", "!", "|"):
         text = text.replace(character, f"\\{character}")
     return text
@@ -4057,7 +4152,7 @@ if pre_rule_chat_submitted and uploaded_file is None:
             "content": "我已收到规则描述。请先上传数据文件，我才能结合字段画像生成并检查规则。",
         }
     )
-    st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
+    _store_pre_evaluation_rule_chat_state(chat_messages)
     st.rerun()
 
 if (
@@ -4147,7 +4242,7 @@ if (
                             ),
                         }
                     )
-                st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
+                _store_pre_evaluation_rule_chat_state(chat_messages)
         except (
             DatasetReadError,
             UnsupportedFileTypeError,
@@ -4174,7 +4269,7 @@ if (
                         ),
                     }
                 )
-                st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
+                _store_pre_evaluation_rule_chat_state(chat_messages)
         except Exception:
             st.session_state[PRE_EVALUATION_RULE_STATE_KEY] = {
                 "signature": pre_rule_signature,
@@ -4193,7 +4288,7 @@ if (
                         ),
                     }
                 )
-                st.session_state[PRE_EVALUATION_CHAT_MESSAGES_KEY] = chat_messages
+                _store_pre_evaluation_rule_chat_state(chat_messages)
     st.rerun()
 
 if not report_is_displayed and pre_rule_signature:

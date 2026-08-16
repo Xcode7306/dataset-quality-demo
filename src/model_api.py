@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from hashlib import sha256
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 def normalize_chat_completions_url(value: str) -> str:
@@ -16,6 +16,32 @@ def normalize_chat_completions_url(value: str) -> str:
     if endpoint.endswith("/chat/completions"):
         return endpoint
     return f"{endpoint}/chat/completions"
+
+
+def make_chat_completions_client(
+    *,
+    timeout_seconds: float,
+    client_factory: Callable[..., Any] | None = None,
+) -> Any:
+    """Create a verified HTTP client that honors normal proxy configuration.
+
+    Injected factories intentionally receive only ``timeout`` so existing local
+    tests and provider adapters do not need to emulate httpx-specific options.
+    The production client explicitly keeps certificate verification enabled and
+    reads standard proxy/no-proxy environment variables.
+    """
+
+    if client_factory is not None:
+        return client_factory(timeout=timeout_seconds)
+    try:
+        import httpx
+    except ImportError as error:
+        raise RuntimeError("未安装 httpx。") from error
+    return httpx.Client(
+        timeout=timeout_seconds,
+        trust_env=True,
+        verify=True,
+    )
 
 
 def secret_fingerprint(value: str) -> str:
@@ -110,6 +136,7 @@ def response_error_detail(response: Any, *, maximum: int = 500) -> str:
 
 __all__ = [
     "extract_message_content",
+    "make_chat_completions_client",
     "normalize_chat_completions_url",
     "parse_json_object_text",
     "response_error_detail",

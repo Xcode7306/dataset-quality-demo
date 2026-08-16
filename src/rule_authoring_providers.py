@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 import json
 import os
 import re
+from time import monotonic
 from typing import Any, Callable, Mapping, Protocol
 
 from .rule_dsl import (
@@ -22,9 +23,10 @@ from .rule_dsl import (
 )
 from .model_api import (
     extract_message_content,
+    make_chat_completions_client,
     normalize_chat_completions_url,
-    response_error_detail,
 )
+from .model_runtime import acquire_model_request, ModelRuntimeLimitError
 from .rule_authoring_prompts import (
     DEFAULT_RULE_AUTHORING_PROMPT_VERSION,
     get_rule_authoring_prompt,
@@ -1250,14 +1252,14 @@ class DeepSeekRuleAuthoringProvider:
         )
         if not api_key:
             raise RuleAuthoringProviderUnavailable("未配置模型 API key。")
-        factory = self._client_factory
-        if factory is None:
-            try:
-                import httpx
-            except ImportError as error:
-                raise RuleAuthoringProviderUnavailable("未安装 httpx。") from error
-            factory = httpx.Client
-        return factory(timeout=self.timeout_seconds), {
+        try:
+            client = make_chat_completions_client(
+                timeout_seconds=self.timeout_seconds,
+                client_factory=self._client_factory,
+            )
+        except RuntimeError as error:
+            raise RuleAuthoringProviderUnavailable(str(error)) from error
+        return client, {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
@@ -1305,11 +1307,13 @@ class DeepSeekRuleAuthoringProvider:
                 if status_code >= 400:
                     if index < len(variants) - 1 and status_code in {400, 404, 405, 415, 422}:
                         last_error = RuleAuthoringProviderError(
-                            f"模型 API 拒绝当前请求参数：{response_error_detail(response)}"
+                            "模型 API 拒绝当前请求参数（"
+                            f"HTTP {status_code}）。"
                         )
                         continue
                     raise RuleAuthoringProviderError(
-                        f"模型 API 规则请求失败：{response_error_detail(response)}"
+                        "模型 API 规则请求失败（"
+                        f"HTTP {status_code}）。"
                     )
                 body = response.json()
                 if not isinstance(body, Mapping):
@@ -1325,7 +1329,7 @@ class DeepSeekRuleAuthoringProvider:
                     f"{type(error).__name__.casefold()}）。"
                 ) from error
         raise RuleAuthoringProviderError(
-            f"模型 API 规则请求失败：{str(last_error)[:500] if last_error else '未知错误'}"
+            "模型 API 规则请求失败（参数兼容性降级未成功）。"
         ) from last_error
 
     def generate(
@@ -1335,38 +1339,62 @@ class DeepSeekRuleAuthoringProvider:
         user_intent: str,
     ) -> RuleAuthoringProviderResult:
         client, headers = self._client()
-        request_id = make_rule_id(
-            "request",
-            [
-                str(context.get("report_sha256", "")),
-                user_intent,
-                str(context.get("rag", {}).get("chunk_ids", []))
-                if isinstance(context.get("rag"), Mapping)
-                else "",
-            ],
-        )
-        prompt = {
-            "user_intent": user_intent,
-            "metric": context.get("metric"),
-            "fields": context.get("fields", []),
-            "profile_summary": context.get("profile_summary", {}),
-            "rag_evidence": (
-                context.get("rag", {}).get("results", [])
-                if isinstance(context.get("rag"), Mapping)
-                else []
-            ),
-            "allowed_rule_types": [
-                "primary_key",
-                "required",
-                "update_freshness",
-                "allowed_values",
-                "numeric_range",
-                "regex_format",
-                "string_length",
-                "conditional_required",
-                "field_comparison",
-            ],
-        }
+        started = monotonic()
+        try:
+            lease = acquire_model_request(self.provider_name, self.model)
+        except ModelRuntimeLimitError as error:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            raise RuleAuthoringProviderError(str(error)) from error
+        input_tokens = 0
+        output_tokens = 0
+        succeeded = False
+        try:
+            request_id = make_rule_id(
+                "request",
+                [
+                    str(context.get("report_sha256", "")),
+                    user_intent,
+                    str(context.get("rag", {}).get("chunk_ids", []))
+                    if isinstance(context.get("rag"), Mapping)
+                    else "",
+                ],
+            )
+            prompt = {
+                "user_intent": user_intent,
+                "metric": context.get("metric"),
+                "fields": context.get("fields", []),
+                "profile_summary": context.get("profile_summary", {}),
+                "rag_evidence": (
+                    context.get("rag", {}).get("results", [])
+                    if isinstance(context.get("rag"), Mapping)
+                    else []
+                ),
+                "allowed_rule_types": [
+                    "primary_key",
+                    "required",
+                    "update_freshness",
+                    "allowed_values",
+                    "numeric_range",
+                    "regex_format",
+                    "string_length",
+                    "conditional_required",
+                    "field_comparison",
+                ],
+            }
+        except Exception:
+            lease.finish(success=False)
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            raise
         try:
             response = self._post_request(
                 client,
@@ -1398,7 +1426,9 @@ class DeepSeekRuleAuthoringProvider:
                 )
             result = parse_provider_payload(content)
             usage = response.get("usage", {}) if isinstance(response, Mapping) else {}
-            return RuleAuthoringProviderResult(
+            input_tokens = usage.get("prompt_tokens", 0) if isinstance(usage, Mapping) else 0
+            output_tokens = usage.get("completion_tokens", 0) if isinstance(usage, Mapping) else 0
+            result_payload = RuleAuthoringProviderResult(
                 outcome=result.outcome,
                 rule_spec=result.rule_spec,
                 evidence=result.evidence,
@@ -1410,15 +1440,26 @@ class DeepSeekRuleAuthoringProvider:
                     model=self.model,
                     mode="model",
                     request_id=request_id,
-                    input_tokens=usage.get("prompt_tokens", 0),
-                    output_tokens=usage.get("completion_tokens", 0),
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
                     prompt_version=self.prompt_version,
                 ),
             )
+            succeeded = True
+            return result_payload
         finally:
+            lease.finish(
+                success=succeeded,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=max(0, round((monotonic() - started) * 1000)),
+            )
             close = getattr(client, "close", None)
             if callable(close):
-                close()
+                try:
+                    close()
+                except Exception:
+                    pass
 
 
 class OpenAICompatibleRuleAuthoringProvider(DeepSeekRuleAuthoringProvider):

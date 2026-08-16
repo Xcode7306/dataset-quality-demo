@@ -38,6 +38,7 @@ from .agent_tools import (
     ReportSnapshot,
     TOOL_NAMES,
 )
+from .text_utils import contains_unsafe_unicode_controls
 
 
 _CACHE_MAX_ENTRIES = 64
@@ -155,6 +156,8 @@ def _normalize_question(
     normalized = question.strip()
     if len(normalized) > 2000:
         raise ValueError("question 最多包含 2000 个字符。")
+    if contains_unsafe_unicode_controls(normalized):
+        raise ValueError("question 不能包含 Unicode 控制字符。")
     return normalized or None
 
 
@@ -448,6 +451,8 @@ def _fallback_reason(error: Exception) -> str:
         if reason_code in {
             "provider_error",
             "invalid_tool_or_citation",
+            "rate_limited",
+            "concurrency_limited",
         }:
             return reason_code
         return "provider_error"
