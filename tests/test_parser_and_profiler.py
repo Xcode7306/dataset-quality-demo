@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.parser import DatasetReadError, parse_dataset
+from src.parser import DatasetReadError, UnsupportedFileTypeError, parse_dataset
 from src.workflow import build_profile_report
 from src.report import save_report
 
@@ -53,6 +53,13 @@ class ParserAndProfilerTests(unittest.TestCase):
             path = Path(temp_dir) / "nested.json"
             path.write_text('[{"事项": {"名称": "测试"}}]', encoding="utf-8")
             with self.assertRaisesRegex(DatasetReadError, "嵌套"):
+                parse_dataset(path)
+
+    def test_zip_file_is_not_a_supported_dataset_type(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "legacy-shards.zip"
+            path.write_bytes(b"PK\x03\x04not-supported")
+            with self.assertRaisesRegex(UnsupportedFileTypeError, r"\.zip"):
                 parse_dataset(path)
 
     def test_zero_byte_csv_returns_failed_report(self):

@@ -28,7 +28,6 @@ PARSER_PATHS = {
     ".jsonl": "json_lines",
     ".ndjson": "json_lines",
     ".geojson": "geojson",
-    ".zip": "json_zip",
 }
 
 

@@ -364,72 +364,42 @@ class AgentWorkflowV10Tests(unittest.TestCase):
         payload["raw_uploaded_bytes"] = "forbidden"
         self.assertTrue(list(self.workflow_validator.iter_errors(payload)))
 
-    def test_streamlit_exposes_state_history_and_single_execution(self):
+    def test_streamlit_pre_evaluation_chat_executes_once_after_approval(self):
         app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
         next(
             item for item in app.file_uploader if item.label == "选择数据文件"
         ).set_value((SAMPLE.name, self.content, "text/csv")).run()
         app.date_input[0].set_value(REFERENCE_DATE)
-        next(
-            button for button in app.button if button.label == "运行质量评估"
-        ).click().run()
-        next(
-            item for item in app.text_input if item.label == "自定义规则描述"
-        ).set_value("service_name为必填字段").run()
-        next(
-            button
-            for button in app.button
-            if button.label == "AI 解析自定义规则"
-        ).click().run()
+        app.chat_input[0].set_value("service_name为必填字段").run()
 
-        state = app.session_state["custom_rule_ui_state"]
-        self.assertEqual(state["run"].workflow.state, "validated")
-        history = app.session_state["rule_authoring_workflow_history"]
-        self.assertEqual(history.records[-1].state, "validated")
-        self.assertIn(
-            "查看工作流状态与恢复记录",
-            [item.label for item in app.expander],
-        )
-
-        next(
-            button
-            for button in app.button
-            if button.label == "试运行自定义规则"
-        ).click().run()
-        state = app.session_state["custom_rule_ui_state"]
-        self.assertEqual(state["run"].workflow.state, "awaiting_approval")
+        state = app.session_state["pre_evaluation_rule_state"]
+        self.assertTrue(state["preflight"].ready)
+        self.assertIsNotNone(state["preview"])
+        self.assertNotIn("quality_report", app.session_state.filtered_state)
 
         next(
             item
             for item in app.text_input
-            if item.label == "审批人标识（自定义规则，本地自声明）"
-        ).set_value("v1.0-ui-test")
+            if item.label == "审批人标识（评估前 AI 规则，本地自声明）"
+        ).set_value("规则聊天测试审批人")
         next(
             item
             for item in app.checkbox
             if item.label
-            == "我已核对当前自定义规则和试运行摘要，并批准本次确定性重评。"
+            == "我已核对全部生成规则和试运行摘要，并批准将其用于本次评估。"
         ).check()
         app.run()
         next(
             button
             for button in app.button
-            if button.label == "批准并重新评估（自定义规则）"
+            if button.label == "批准规则并运行质量评估"
         ).click().run()
 
-        state = app.session_state["custom_rule_ui_state"]
-        self.assertEqual(state["run"].workflow.state, "executed")
+        state = app.session_state["pre_evaluation_rule_state"]
+        self.assertEqual(state["approved_pack"].status, "approved")
         self.assertIsNotNone(state["result"])
-        app.run()
-        self.assertFalse(
-            any(
-                button.label == "批准并重新评估（自定义规则）"
-                for button in app.button
-            )
-        )
-        history = app.session_state["rule_authoring_workflow_history"]
-        self.assertEqual(history.records[-1].state, "executed")
-        self.assertEqual(len(history.records), 1)
+        self.assertIn("quality_report", app.session_state.filtered_state)
+        self.assertFalse(app.exception)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, ContextManager
-from zipfile import BadZipFile, LargeZipFile, ZipFile, ZipInfo
+from zipfile import BadZipFile
 
 import pandas as pd
 
@@ -29,7 +29,6 @@ from .resource_limits import (
     ResourceLimitExceeded,
     validate_dataframe_limits,
     validate_input_file_size,
-    validate_json_zip_archive,
     validate_xlsx_archive,
 )
 from .text_utils import normalize_display_text
@@ -43,7 +42,6 @@ SUPPORTED_EXTENSIONS = {
     ".jsonl",
     ".ndjson",
     ".geojson",
-    ".zip",
 }
 JSON_WRAPPER_KEYS = {"data", "rows", "records", "items", "list", "result"}
 GEOJSON_TECHNICAL_PREFIX = "__geojson_"
@@ -1396,7 +1394,6 @@ def _read_json_source(
     open_binary: BinaryOpener,
     suffix: str,
     *,
-    allow_geojson: bool = True,
     max_records: int | None = None,
     max_total_pairs: int | None = None,
     max_total_array_items: int | None = None,
@@ -1437,11 +1434,6 @@ def _read_json_source(
             isinstance(payload, dict)
             and payload.get("type") == "FeatureCollection"
         )
-        if is_feature_collection and not allow_geojson:
-            raise DatasetReadError(
-                "ZIP JSON 分片当前不支持 GeoJSON FeatureCollection；"
-                "请将其作为单个 .geojson 文件评估。"
-            )
         if (
             suffix.lower() == ".geojson"
             and not is_feature_collection
@@ -1491,165 +1483,6 @@ def _read_json(path: Path) -> tuple[pd.DataFrame, list[str]]:
 
     result = _read_json_source(_path_binary_opener(path), path.suffix.lower())
     return result.dataframe, result.warnings
-
-
-def _zip_entry_binary_opener(archive: ZipFile, entry: ZipInfo) -> BinaryOpener:
-    return lambda: archive.open(entry, mode="r")
-
-
-def _display_zip_member_name(entry: ZipInfo) -> str:
-    display_name, _ = normalize_display_text(entry.filename)
-    return display_name
-
-
-def _format_zip_warning(message: str, members: list[str]) -> str:
-    examples = "、".join(members[:3])
-    if len(members) > 3:
-        examples = f"{examples} 等"
-    return f"ZIP 中 {len(members)} 个分片（{examples}）：{message}"
-
-
-def _format_field_difference(expected: set[str], actual: set[str]) -> str:
-    missing = sorted(expected - actual)
-    extra = sorted(actual - expected)
-    details: list[str] = []
-    if missing:
-        details.append(f"缺少字段：{_format_error_values(missing, '（空字段名）')}")
-    if extra:
-        details.append(f"新增字段：{_format_error_values(extra, '（空字段名）')}")
-    return "；".join(details)
-
-
-def _read_json_zip(path: Path) -> tuple[pd.DataFrame, list[str]]:
-    """直接从 ZIP 流读取同构 JSON 分片，不按成员路径解压落地。"""
-
-    try:
-        archive = ZipFile(path)
-    except (BadZipFile, LargeZipFile, OSError) as error:
-        raise DatasetReadError(f"ZIP 文件无法打开：{error}") from error
-
-    with archive:
-        shard_entries = validate_json_zip_archive(archive)
-        dataframes: list[pd.DataFrame] = []
-        expected_kind: str | None = None
-        expected_columns: list[str] = []
-        expected_fields: set[str] = set()
-        first_member = ""
-        total_rows = 0
-        total_pairs = 0
-        total_array_items = 0
-        warning_members: dict[str, list[str]] = {}
-
-        def current_warnings() -> list[str]:
-            return [
-                _format_zip_warning(message, members)
-                for message, members in warning_members.items()
-            ]
-
-        for entry in shard_entries:
-            member_name = _display_zip_member_name(entry)
-            remaining_records = max(MAX_JSON_RECORDS - total_rows, 0)
-            if expected_columns:
-                used_cells = total_rows * len(expected_columns)
-                remaining_cell_rows = max(
-                    (MAX_DATASET_CELLS - used_cells) // len(expected_columns),
-                    0,
-                )
-                remaining_records = min(
-                    remaining_records,
-                    remaining_cell_rows,
-                )
-            try:
-                result = _read_json_source(
-                    _zip_entry_binary_opener(archive, entry),
-                    Path(entry.filename).suffix.lower(),
-                    allow_geojson=False,
-                    max_records=remaining_records,
-                    max_total_pairs=max(MAX_JSON_TOTAL_PAIRS - total_pairs, 0),
-                    max_total_array_items=max(
-                        MAX_JSON_TOTAL_ARRAY_ITEMS - total_array_items,
-                        0,
-                    ),
-                )
-                for warning in result.warnings:
-                    warning_members.setdefault(warning, []).append(member_name)
-                validate_dataframe_limits(result.dataframe)
-            except ResourceLimitExceeded as error:
-                raise DatasetReadError(
-                    f"ZIP 分片“{member_name}”超出资源上限：{error}",
-                    warnings=current_warnings(),
-                ) from error
-            except DatasetReadError as error:
-                raise DatasetReadError(
-                    f"ZIP 分片“{member_name}”读取失败：{error}",
-                    warnings=[*current_warnings(), *error.warnings],
-                ) from error
-
-            columns = [str(column) for column in result.dataframe.columns]
-            if not columns:
-                raise DatasetReadError(
-                    f"ZIP 分片“{member_name}”没有可校验的表头或字段集合。",
-                    warnings=current_warnings(),
-                )
-            actual_fields = set(columns)
-            if expected_kind is None:
-                expected_kind = result.structure_kind
-                expected_columns = columns
-                expected_fields = actual_fields
-                first_member = member_name
-            elif result.structure_kind != expected_kind:
-                raise DatasetReadError(
-                    f"ZIP 分片“{member_name}”的结构类型为 "
-                    f"{result.structure_kind}，与首个分片“{first_member}”的 "
-                    f"{expected_kind} 不一致。",
-                    warnings=current_warnings(),
-                )
-            elif expected_kind == "matrix" and columns != expected_columns:
-                raise DatasetReadError(
-                    f"ZIP 分片“{member_name}”的二维数组表头或字段顺序"
-                    f"与首个分片“{first_member}”不一致。",
-                    warnings=current_warnings(),
-                )
-            elif expected_kind == "records" and actual_fields != expected_fields:
-                difference = _format_field_difference(
-                    expected_fields, actual_fields
-                )
-                raise DatasetReadError(
-                    f"ZIP 分片“{member_name}”的对象字段集合与首个分片"
-                    f"“{first_member}”不一致（{difference}）。",
-                    warnings=current_warnings(),
-                )
-
-            total_rows += len(result.dataframe)
-            total_pairs += result.total_pairs
-            total_array_items += result.total_array_items
-            _check_json_table_size(total_rows, len(expected_columns))
-            if total_pairs > MAX_JSON_TOTAL_PAIRS:
-                raise DatasetReadError(
-                    f"ZIP 内全部 JSON 分片合计超过 "
-                    f"{MAX_JSON_TOTAL_PAIRS} 个键值对。",
-                    warnings=current_warnings(),
-                )
-            if total_array_items > MAX_JSON_TOTAL_ARRAY_ITEMS:
-                raise DatasetReadError(
-                    f"ZIP 内全部 JSON 分片合计超过 "
-                    f"{MAX_JSON_TOTAL_ARRAY_ITEMS} 个数组项。",
-                    warnings=current_warnings(),
-                )
-
-            result.dataframe.columns = columns
-            if result.structure_kind == "records":
-                result.dataframe = result.dataframe.reindex(columns=expected_columns)
-            dataframes.append(result.dataframe)
-
-    dataframe = pd.concat(dataframes, ignore_index=True, copy=False)
-    warnings = [
-        f"检测到 ZIP JSON 分片包，已直接从压缩流读取并合并 "
-        f"{len(dataframes)} 个分片、{len(dataframe)} 条记录；"
-        "未按包内成员路径解压落地。",
-        *current_warnings(),
-    ]
-    return dataframe, warnings
 
 
 def parse_dataset(
@@ -1708,9 +1541,6 @@ def parse_dataset(
             dataframe, resolved_sheet_name = _read_excel(
                 path, normalized_sheet_name
             )
-        elif extension == ".zip":
-            dataframe, read_warnings = _read_json_zip(path)
-            warnings.extend(read_warnings)
         else:
             dataframe, read_warnings = _read_json(path)
             warnings.extend(read_warnings)

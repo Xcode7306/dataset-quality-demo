@@ -6,7 +6,6 @@ from pathlib import Path
 import unittest
 
 from jsonschema import Draft202012Validator
-from streamlit.testing.v1 import AppTest
 
 from src.rag.citations import RagCitationError, evidence_from_response
 from src.rag.ingestion import RagIngestionError, ingest_document_bytes
@@ -333,86 +332,6 @@ class RagV09Tests(unittest.TestCase):
                 source_namespace=RAG_NAMESPACE_STANDARDS,
                 approved=True,
             )
-
-    def test_streamlit_can_search_bind_and_compile_with_preloaded_standard(self):
-        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
-        app.run()
-        self.assertFalse(app.exception)
-        next(item for item in app.file_uploader if item.label == "选择数据文件").set_value(
-            (SAMPLE.name, SAMPLE.read_bytes(), "text/csv")
-        )
-        app.run()
-        next(
-            button for button in app.button if button.label == "运行质量评估"
-        ).click().run()
-        self.assertFalse(app.exception)
-
-        next(
-            item
-            for item in app.text_input
-            if item.label == "检索问题或条款关键词"
-        ).set_value("更新频率")
-        next(
-            button for button in app.button if button.label == "检索标准依据"
-        ).click().run()
-        result_selector = next(
-            item
-            for item in app.multiselect
-            if item.label == "选择要绑定的检索片段"
-        )
-        result_selector.set_value([result_selector.options[0]])
-        next(
-            button
-            for button in app.button
-            if button.label == "绑定所选片段到规则编制"
-        ).click().run()
-        self.assertTrue(app.session_state["rag_ui_state"]["selected_chunk_ids"])
-
-        next(
-            item for item in app.text_input if item.label == "自定义规则描述"
-        ).set_value("service_name为必填字段")
-        next(
-            button for button in app.button if button.label == "AI 解析自定义规则"
-        ).click().run()
-        self.assertFalse(app.exception)
-        draft = app.session_state["custom_rule_ui_state"]["draft"]
-        self.assertTrue(
-            any(
-                item.type in {"standard_clause", "data_dictionary", "user_statement"}
-                for item in draft.evidence
-            )
-        )
-
-    def test_streamlit_rag_exposes_preloaded_sources_without_user_ingestion(self):
-        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
-        app.run()
-        self.assertFalse(app.exception)
-        self.assertFalse(
-            any(item.label == "选择标准依据文档" for item in app.file_uploader)
-        )
-        self.assertFalse(
-            any(item.label == "摄取并加入标准依据库" for item in app.button)
-        )
-        self.assertFalse(
-            any(item.label == "文档来源确认" for item in app.selectbox)
-        )
-
-        next(item for item in app.file_uploader if item.label == "选择数据文件").set_value(
-            (SAMPLE.name, SAMPLE.read_bytes(), "text/csv")
-        ).run()
-        next(
-            button for button in app.button if button.label == "运行质量评估"
-        ).click().run()
-        self.assertFalse(app.exception)
-        next(
-            item for item in app.text_input if item.label == "检索问题或条款关键词"
-        ).set_value("更新频率")
-        next(
-            button for button in app.button if button.label == "检索标准依据"
-        ).click().run()
-        response = app.session_state["rag_ui_state"]["response"]
-        self.assertEqual(response.status, "ok")
-
 
 if __name__ == "__main__":
     unittest.main()

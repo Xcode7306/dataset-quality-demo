@@ -367,7 +367,10 @@ class RuleBatchV11Tests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertEqual(len(app.chat_input), 1)
         self.assertTrue(
-            any("与大模型对话创建规则" in item.value for item in app.markdown)
+            any(item.value == "补充评价标准" for item in app.subheader)
+        )
+        self.assertTrue(
+            any("自定义规则" in item.value for item in app.markdown)
         )
 
         app.chat_input[0].set_value("service_name需要规范").run()

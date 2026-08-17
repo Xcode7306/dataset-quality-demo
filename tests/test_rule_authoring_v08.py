@@ -131,7 +131,7 @@ class RuleAuthoringV08Tests(unittest.TestCase):
                 ),
             )
 
-    def test_streamlit_custom_rule_entry_reaches_dry_run(self):
+    def test_streamlit_custom_rule_chat_reaches_pre_evaluation_dry_run(self):
         app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
         next(
             item for item in app.file_uploader if item.label == "选择数据文件"
@@ -139,15 +139,15 @@ class RuleAuthoringV08Tests(unittest.TestCase):
             ("custom-rules.csv", CONTENT, "text/csv")
         ).run()
         app.date_input[0].set_value(REFERENCE_DATE)
-        next(button for button in app.button if button.label == "运行质量评估").click().run()
-        next(
-            item for item in app.text_input if item.label == "自定义规则描述"
-        ).set_value("status为inactive时，name必须填写").run()
-        next(button for button in app.button if button.label == "AI 解析自定义规则").click().run()
+        app.chat_input[0].set_value("status为inactive时，name必须填写").run()
         self.assertFalse(app.exception)
-        self.assertTrue(any("自定义规则已通过" in item.value for item in app.success))
-        next(button for button in app.button if button.label == "试运行自定义规则").click().run()
-        self.assertFalse(app.exception)
+        state = app.session_state["pre_evaluation_rule_state"]
+        self.assertTrue(state["preflight"].ready)
+        self.assertEqual(
+            state["preflight"].items[0].draft.rule_spec.rule_type,
+            "conditional_required",
+        )
+        self.assertIsNotNone(state["preview"])
         self.assertTrue(any("规则试运行完成" in item.value for item in app.success))
 
 

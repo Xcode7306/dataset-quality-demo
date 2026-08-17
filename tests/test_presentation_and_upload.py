@@ -154,6 +154,8 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("# 数据集质量评估报告：bad_dataset", payload)
         self.assertIn("## 风险提示", payload)
         self.assertNotIn("## 疑似问题位置", payload)
+        self.assertNotIn("引擎版本", payload)
+        self.assertNotIn("阈值配置版本", payload)
         self.assertNotIn("数据记录序号", payload)
         self.assertIn("## 指标明细", payload)
         self.assertIn("## 字段画像", payload)
@@ -270,6 +272,10 @@ class UploadServiceTests(unittest.TestCase):
     def test_unsupported_upload_is_rejected_before_writing(self):
         with self.assertRaises(UnsupportedFileTypeError):
             evaluate_uploaded_dataset(b"text", "unsupported.txt")
+
+    def test_zip_upload_is_rejected_before_writing(self):
+        with self.assertRaisesRegex(UnsupportedFileTypeError, r"\.zip"):
+            evaluate_uploaded_dataset(b"PK\x03\x04not-supported", "legacy-shards.zip")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from zipfile import ZipFile
 
 from src.parser import DatasetReadError, parse_dataset
 from src.upload_service import evaluate_uploaded_dataset
@@ -276,29 +275,6 @@ class GeoJsonFormatExpansionTests(unittest.TestCase):
         self.assertTrue(
             any("坐标数组未展开" in item for item in report.execution["warnings"])
         )
-
-    def test_json_zip_does_not_silently_enable_geojson_shards(self):
-        payload = {
-            "type": "FeatureCollection",
-            "features": [
-                self._feature(
-                    "point",
-                    {"名称": "空间样例"},
-                    {"type": "Point", "coordinates": [1, 2]},
-                )
-            ],
-        }
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            path = Path(temporary_directory) / "geojson-shard.zip"
-            with ZipFile(path, "w") as archive:
-                archive.writestr("feature.json", json.dumps(payload))
-            with (
-                patch("src.parser._geojson_feature_collection_to_dataframe") as mapper,
-                self.assertRaisesRegex(DatasetReadError, "不支持 GeoJSON"),
-            ):
-                parse_dataset(path)
-            mapper.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ from datetime import date
 from html import escape as escape_html
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -132,6 +133,7 @@ PRE_EVALUATION_IMPORT_VALUES_KEY = "pre_evaluation_import_rule_values"
 PRE_EVALUATION_CHAT_MESSAGES_KEY = "pre_evaluation_rule_chat_messages"
 PRE_EVALUATION_CHAT_ATTACHMENTS_KEY = "pre_evaluation_rule_chat_attachments"
 PRE_EVALUATION_CHAT_NOTICE_KEY = "pre_evaluation_rule_chat_notice"
+RE_EVALUATION_NOTICE_KEY = "re_evaluation_setup_notice"
 MODEL_API_URL_KEY = "model_api_url"
 MODEL_API_KEY_KEY = "model_api_key"
 MODEL_API_KEY_INPUT_KEY = "model_api_key_input"
@@ -147,7 +149,6 @@ AGENT_PRIORITY_LABELS = {
 }
 RULE_WIDGET_KEYS = (
     "rule_pack_name",
-    "rule_pack_version",
     "rule_primary_key_fields",
     "rule_required_fields",
     "rule_update_time_field",
@@ -178,6 +179,11 @@ RAG_NAMESPACE_LABELS = {
     RAG_NAMESPACE_DATA_DICTIONARY: "数据字典",
     RAG_NAMESPACE_USER_SPEC: "用户规范",
 }
+DEFAULT_RULE_PACK_VERSION = "1.0.0"
+RISK_CHART_LEVEL_ORDER = tuple(
+    RISK_LEVEL_LABELS[level] for level in ("warning", "attention", "info")
+)
+RISK_CHART_COLORS = ("#dc2626", "#f59e0b", "#2563eb")
 RAG_ALL_NAMESPACE_LABEL = "全部已批准来源"
 RULE_CHAT_FILE_TYPES = tuple(
     sorted(extension.lstrip(".") for extension in SUPPORTED_RULE_IMPORT_EXTENSIONS)
@@ -232,6 +238,20 @@ def _clear_rule_state(
         st.session_state[RAG_STATE_KEY] = rag_state
     for key in RULE_WIDGET_KEYS:
         st.session_state.pop(key, None)
+
+
+def _open_re_evaluation_setup() -> None:
+    """Return from a report to the pre-evaluation rule and metric setup."""
+
+    st.session_state.pop("quality_report", None)
+    _clear_agent_state()
+    # Keep the user's metric selections, card criteria, and rule conversation
+    # so they can refine the current evaluation rather than start from scratch.
+    _clear_rule_state(preserve_rag_binding=True, preserve_chat=True)
+    st.session_state[RE_EVALUATION_NOTICE_KEY] = (
+        "已返回评估设置。可补充指标依据或输入自定义规则，"
+        "完成预检和审批后再运行质量评估。"
+    )
 
 
 def _rag_ui_state() -> dict:
@@ -719,6 +739,14 @@ def _preserve_hidden_pre_evaluation_widget_state() -> None:
         if isinstance(value, str):
             st.session_state[key] = value
 
+    # Keep user-authored card criteria while the result view temporarily hides
+    # the metric cards.  They are needed when the user chooses to re-evaluate.
+    for metric_id in ALL_METRIC_IDS:
+        key = _metric_evidence_key(metric_id)
+        value = st.session_state.get(key)
+        if isinstance(value, str):
+            st.session_state[key] = value
+
 
 def _selected_metric_ids_from_cards() -> tuple[str, ...]:
     """从指标卡读取选择，并按照固定目录顺序固化到会话状态。"""
@@ -937,35 +965,28 @@ def _render_metric_selection_panel() -> tuple[str, ...]:
     return selected_metric_ids
 
 
-def _render_rule_chat_input(
-    *,
-    header_slot=None,
-    chat_shell=None,
-) -> tuple[
+def _render_rule_chat_input() -> tuple[
     tuple[RuleBatchInput, ...],
     tuple[str, ...],
     tuple[str, ...],
     bool,
 ]:
-    """Render the top-of-page rule chat and its integrated file attachment flow."""
+    """Render the pre-evaluation custom-rule chat and attachment flow."""
 
     requests: list[RuleBatchInput] = []
     errors: list[str] = []
     warnings: list[str] = []
 
-    if header_slot is None:
-        st.markdown("## 与大模型对话创建规则")
-        st.caption(
-            "描述你想创建的规则；可以连续补充字段、阈值、允许值、频率或比较条件。"
-            "点击输入框左侧的“＋”或直接拖拽规则文件，可批量导入规则。"
-        )
-    else:
-        with header_slot.container():
-            st.markdown("## 与大模型对话创建规则")
-            st.caption(
-                "描述你想创建的规则；可以连续补充字段、阈值、允许值、频率或比较条件。"
-                "点击输入框左侧的“＋”或直接拖拽规则文件，可批量导入规则。"
-            )
+    st.subheader("补充评价标准")
+    st.caption(
+        "在选择指标前补充评价依据或业务规则。规则会在最终评估前完成"
+        "确定性校验、试运行和人工审批。"
+    )
+    st.markdown("#### 自定义规则")
+    st.caption(
+        "用自然语言描述规则；可以连续补充字段、阈值、允许值、频率或比较条件。"
+        "点击输入框左侧的“＋”或直接拖拽规则文件，可批量导入规则。"
+    )
     chat_messages = list(
         st.session_state.get(PRE_EVALUATION_CHAT_MESSAGES_KEY, [])
     )
@@ -982,11 +1003,10 @@ def _render_rule_chat_input(
     # ``st.chat_input`` is pinned to the viewport bottom when rendered
     # directly in the main container.  Put it in a horizontal container so
     # Streamlit renders it inline, immediately below the guidance above.
-    if chat_shell is None:
-        chat_shell = st.empty()
+    chat_shell = st.empty()
     with chat_shell.container(horizontal=True, gap="small"):
         chat_value = st.chat_input(
-            "描述你想创建的规则",
+            "请输入自定义规则，例如：当 status 为 inactive 时，service_name 必填",
             key="pre_evaluation_rule_chat_input",
             max_chars=4000,
             accept_file="multiple",
@@ -1288,7 +1308,7 @@ def _render_pre_evaluation_rule_state(
     for warning in preflight.warnings:
         st.warning(_escape_markdown(warning))
     with st.expander("查看合并后的 RulePack 草案", expanded=True):
-        st.json(preflight.draft_pack.to_dict())
+        st.json(_display_payload_without_versions(preflight.draft_pack.to_dict()))
     preview = state.get("preview")
     if preview is None:
         st.error("规则尚未完成确定性试运行，不能审批或启动最终评估。")
@@ -1378,6 +1398,20 @@ def _escape_markdown(value: object) -> str:
     for character in ("\\", "`", "*", "_", "[", "]", "(", ")", "<", ">", "#", "!", "|"):
         text = text.replace(character, f"\\{character}")
     return text
+
+
+def _display_payload_without_versions(value: object) -> object:
+    """隐藏界面技术详情中的版本元数据，保留原始审计导出。"""
+
+    if isinstance(value, dict):
+        return {
+            key: _display_payload_without_versions(item)
+            for key, item in value.items()
+            if "version" not in str(key).casefold()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_display_payload_without_versions(item) for item in value]
+    return value
 
 
 def _model_error_detail(error: Exception) -> str:
@@ -1472,7 +1506,6 @@ def _render_rule_workflow_status(run: RuleAuthoringRun) -> None:
         "failed": "执行失败",
     }
     st.caption(
-        "v1.0 工作流 · "
         f"{state_labels.get(workflow.state, workflow.state)} · "
         f"重试 {workflow.retry_count}/1 · {workflow.workflow_id}"
     )
@@ -1480,7 +1513,7 @@ def _render_rule_workflow_status(run: RuleAuthoringRun) -> None:
         "查看工作流状态与恢复记录",
         expanded=workflow.state == "failed",
     ):
-        st.json(workflow.to_dict())
+        st.json(_display_payload_without_versions(workflow.to_dict()))
         st.caption("状态由本地确定性代码推进；模型不能审批、执行或选择恢复点。")
 
 
@@ -1519,7 +1552,7 @@ def _render_rule_workflow_history() -> None:
                 indent=2,
                 allow_nan=False,
             ).encode("utf-8"),
-            file_name="rule_authoring_history_v1.0.json",
+            file_name="rule_authoring_history.json",
             mime="application/json",
             key="download_rule_workflow_history_v10",
         )
@@ -1579,8 +1612,8 @@ def _render_metric_selection_summary(report: QualityReport) -> None:
     )
     if standard_metric_ids:
         st.warning(
-            "以下指标需要补充评价标准；请进入“补充评价标准”页面填写所需依据，"
-            "再由规则 Agent 解析、试运行并重新评估："
+            "以下指标需要补充评价标准；点击页面上方“重新评估数据集”返回指标卡片，"
+            "填写所需依据后再由规则 Agent 解析、试运行并重新评估："
         )
         for metric_id in standard_metric_ids:
             definition = get_metric_definition(metric_id)
@@ -1851,7 +1884,6 @@ def _render_agent_analysis(analysis: AgentAnalysis) -> None:
                 "provider": analysis.audit.provider,
                 "model": analysis.audit.model,
                 "mode": analysis.audit.mode,
-                "prompt_version": analysis.audit.prompt_version,
                 "fallback_used": analysis.audit.fallback_used,
                 "fallback_reason": analysis.audit.fallback_reason,
                 "tool_calls": analysis.audit.tool_calls,
@@ -1915,22 +1947,18 @@ def _render_agent(report: QualityReport) -> None:
         "也不会修改或清洗原始数据。"
     )
     configuration, configuration_issue = _model_api_configuration()
-    if configuration and configuration.get("source") == "page":
-        st.warning(
-            "当前已配置自定义大模型 API。点击快捷入口或提交问题时，"
-            "会发送经过白名单过滤的报告投影；不发送原始单元格值。"
-        )
-    elif configuration and configuration.get("source") == "environment":
-        if configuration.get("api_key"):
-            st.warning(
-                "当前部署已配置 DeepSeek 外部模式。点击快捷入口或提交问题时，"
-                "会发送经过白名单过滤的报告投影；不发送原始单元格值。"
-            )
-        else:
-            st.warning(
-                "当前部署已选择 DeepSeek 外部模式，但尚未配置 "
-                "DEEPSEEK_API_KEY；调用前必须补充 API Key，不会回退到本地模板。"
-            )
+    if configuration:
+        if configuration.get("source") == "environment":
+            if configuration.get("api_key"):
+                st.warning(
+                    "当前部署已配置 DeepSeek 外部模式。点击快捷入口或提交问题时，"
+                    "会发送经过白名单过滤的报告投影；不发送原始单元格值。"
+                )
+            else:
+                st.warning(
+                    "当前部署已选择 DeepSeek 外部模式，但尚未配置 "
+                    "DEEPSEEK_API_KEY；调用前必须补充 API Key，不会回退到本地模板。"
+                )
     elif configuration_issue:
         st.warning(configuration_issue)
     else:
@@ -2035,7 +2063,7 @@ def _render_rag_panel(
 ) -> None:
     """渲染项目预置标准依据的检索、冲突提示和引用绑定。"""
 
-    st.subheader("标准依据 RAG（v0.9）")
+    st.subheader("标准依据 RAG")
     st.caption(
         "仅从项目预置的标准、数据字典和用户规范中检索。"
         "结果带文档、版本、条款/章节和稳定 chunk ID；没有可定位来源时，不会形成标准合规依据。"
@@ -2481,7 +2509,6 @@ def _render_rule_result(result) -> None:
         st.json(
             {
                 "rule_pack_id": result.approved_rule_pack.rule_pack_id,
-                "rule_pack_version": result.approved_rule_pack.version,
                 "base_report_sha256": (
                     result.approved_rule_pack.base_report_sha256
                 ),
@@ -2507,7 +2534,6 @@ def _render_rule_dry_run(preview: dict) -> None:
             [
                 {
                     "规则包": preview.get("rule_pack_id", "—"),
-                    "版本": preview.get("rule_pack_version", "—"),
                     "检查数量": counts.get("checked", 0),
                     "符合数量": counts.get("compliant", 0),
                     "疑似问题": counts.get("issues", 0),
@@ -2554,7 +2580,7 @@ def _render_custom_rule_authoring(
 ) -> None:
     """渲染 v1.0 可恢复的自然语言自定义规则闭环。"""
 
-    st.subheader("自定义规则（v1.0）")
+    st.subheader("自定义规则")
     st.caption(
         "用自然语言新增一条业务规则。当前支持格式/正则、字符长度、"
         "条件必填和跨字段比较；规则仍须经过确定性校验、试运行和人工批准。"
@@ -3452,12 +3478,7 @@ def _render_rule_enhancement(
         max_chars=120,
         key="rule_pack_name",
     )
-    rule_pack_version = st.text_input(
-        "规则包版本",
-        value="1.0.0",
-        max_chars=32,
-        key="rule_pack_version",
-    )
+    rule_pack_version = DEFAULT_RULE_PACK_VERSION
     primary_key_fields = st.multiselect(
         "主键字段（可组合，最多 5 个）",
         options=fields,
@@ -3613,9 +3634,9 @@ def _render_rule_enhancement(
             st.text(error)
         return
 
-    st.success(f"规则草案校验通过：{draft.rule_pack_id} v{draft.version}")
+    st.success(f"规则草案校验通过：{draft.rule_pack_id}")
     with st.expander("查看待审批 RulePack"):
-        st.json(draft.to_dict())
+        st.json(_display_payload_without_versions(draft.to_dict()))
     draft_download_name = sanitize_file_name(
         f"{report.dataset.name}_rule_pack_draft.json",
         default_name="rule_pack_draft.json",
@@ -3834,10 +3855,83 @@ def _render_summary(report: QualityReport) -> dict[str, int]:
     return summary
 
 
+def _risk_chart_axis_maximum(maximum_count: int) -> int:
+    """为风险数量图保留可见余量，避免单条风险铺满横轴。"""
+
+    return max(3, maximum_count + max(1, math.ceil(maximum_count * 0.2)))
+
+
 def _render_risks(report: QualityReport) -> None:
     st.subheader("风险分布")
-    risk_chart = pd.DataFrame(build_risk_chart_rows(report)).set_index("级别")
-    st.bar_chart(risk_chart, horizontal=True, height=220)
+    risk_chart = pd.DataFrame(build_risk_chart_rows(report))
+    axis_maximum = _risk_chart_axis_maximum(int(risk_chart["数量"].max()))
+    x_axis = alt.X(
+        "数量:Q",
+        title="风险数量（项）",
+        scale=alt.Scale(domain=[0, axis_maximum], nice=False),
+        axis=alt.Axis(
+            domain=False,
+            grid=True,
+            gridColor="#e2e8f0",
+            labelColor="#64748b",
+            labelFontSize=13,
+            tickCount=min(axis_maximum + 1, 6),
+            tickMinStep=1,
+            titleColor="#475569",
+            titleFontSize=13,
+            titleFontWeight=600,
+            titlePadding=12,
+        ),
+    )
+    y_axis = alt.Y(
+        "级别:N",
+        sort=list(RISK_CHART_LEVEL_ORDER),
+        title=None,
+        axis=alt.Axis(
+            domain=False,
+            labelColor="#475569",
+            labelFontSize=15,
+            labelFontWeight=600,
+            labelPadding=14,
+            ticks=False,
+        ),
+    )
+    chart_base = alt.Chart(risk_chart)
+    bars = chart_base.mark_bar(cornerRadiusEnd=7, height=28).encode(
+        x=x_axis,
+        y=y_axis,
+        color=alt.Color(
+            "级别:N",
+            sort=list(RISK_CHART_LEVEL_ORDER),
+            scale=alt.Scale(
+                domain=list(RISK_CHART_LEVEL_ORDER),
+                range=list(RISK_CHART_COLORS),
+            ),
+            legend=None,
+        ),
+        tooltip=[
+            alt.Tooltip("级别:N", title="风险级别"),
+            alt.Tooltip("数量:Q", title="数量", format="d"),
+        ],
+    )
+    labels = chart_base.mark_text(
+        align="left",
+        baseline="middle",
+        color="#334155",
+        dx=9,
+        fontSize=14,
+        fontWeight=600,
+    ).encode(
+        x=x_axis,
+        y=y_axis,
+        text=alt.Text("数量:Q", format="d"),
+    )
+    st.altair_chart(
+        (bars + labels)
+        .properties(height=164, padding={"left": 0, "right": 36, "top": 4, "bottom": 0})
+        .configure_view(strokeOpacity=0),
+        width="stretch",
+    )
 
     if not report.risks:
         st.info("当前默认阈值下没有生成风险提示。")
@@ -3950,9 +4044,6 @@ def _evaluation_request_signature(
 
 
 st.title("政务数据集质量评估")
-st.caption(
-    "v1.2 · 在首页与大模型对话创建规则，或批量导入规则，并以受控工作流执行。"
-)
 
 _initialize_metric_selection_state()
 _initialize_metric_evidence_state()
@@ -3961,38 +4052,40 @@ _initialize_model_api_state()
 report_is_displayed = st.session_state.get("quality_report") is not None
 if report_is_displayed:
     _preserve_hidden_pre_evaluation_widget_state()
-pre_rule_chat_header = st.empty()
-pre_rule_chat_shell = st.empty()
-if report_is_displayed:
-    pre_rule_chat_header.empty()
-    pre_rule_chat_shell.empty()
+pre_evaluation_setup_shell = st.empty()
 pre_rule_requests: tuple[RuleBatchInput, ...] = ()
 pre_rule_input_errors: tuple[str, ...] = ()
 pre_rule_input_warnings: tuple[str, ...] = ()
 pre_rule_chat_submitted = False
 if not report_is_displayed:
-    (
-        chat_rule_requests,
-        chat_rule_errors,
-        chat_rule_warnings,
-        pre_rule_chat_submitted,
-    ) = _render_rule_chat_input(
-        header_slot=pre_rule_chat_header,
-        chat_shell=pre_rule_chat_shell,
-    )
-    selected_metric_ids = _render_metric_selection_panel()
-    (
-        metric_rule_requests,
-        metric_rule_errors,
-        metric_rule_warnings,
-        _,
-    ) = _render_pre_evaluation_rule_inputs(selected_metric_ids)
-    pre_rule_requests = tuple((*chat_rule_requests, *metric_rule_requests))
-    pre_rule_input_errors = tuple((*chat_rule_errors, *metric_rule_errors))
-    pre_rule_input_warnings = tuple((*chat_rule_warnings, *metric_rule_warnings))
-    for warning in pre_rule_input_warnings:
-        st.warning(_escape_markdown(warning))
+    with pre_evaluation_setup_shell.container():
+        with st.container(border=True):
+            re_evaluation_notice = st.session_state.pop(
+                RE_EVALUATION_NOTICE_KEY,
+                None,
+            )
+            if isinstance(re_evaluation_notice, str) and re_evaluation_notice:
+                st.info(re_evaluation_notice)
+            (
+                chat_rule_requests,
+                chat_rule_errors,
+                chat_rule_warnings,
+                pre_rule_chat_submitted,
+            ) = _render_rule_chat_input()
+        selected_metric_ids = _render_metric_selection_panel()
+        (
+            metric_rule_requests,
+            metric_rule_errors,
+            metric_rule_warnings,
+            _,
+        ) = _render_pre_evaluation_rule_inputs(selected_metric_ids)
+        pre_rule_requests = tuple((*chat_rule_requests, *metric_rule_requests))
+        pre_rule_input_errors = tuple((*chat_rule_errors, *metric_rule_errors))
+        pre_rule_input_warnings = tuple((*chat_rule_warnings, *metric_rule_warnings))
+        for warning in pre_rule_input_warnings:
+            st.warning(_escape_markdown(warning))
 else:
+    pre_evaluation_setup_shell.empty()
     selected_metric_ids = tuple(
         metric_id
         for metric_id in ALL_METRIC_IDS
@@ -4014,7 +4107,6 @@ with st.sidebar:
             "jsonl",
             "ndjson",
             "geojson",
-            "zip",
         ],
         help=(
             "支持 CSV、Excel（.xls、.xlsx）、表格型 JSON "
@@ -4338,6 +4430,19 @@ if report is None:
         "如果需要自定义业务规则，可直接在首页与大模型对话创建。"
     )
 else:
+    action_column, _ = st.columns((1, 5))
+    with action_column:
+        st.button(
+            "重新评估数据集",
+            key="open_re_evaluation_setup",
+            type="primary",
+            on_click=_open_re_evaluation_setup,
+            width="stretch",
+        )
+    st.caption(
+        "需要补充指标依据或新增自定义规则时，点击此处返回评估设置；"
+        "规则通过预检和审批后会重新计算当前数据集。"
+    )
     _agent_state_for(report)
     _rule_state_for(report)
     dataset = report.dataset
@@ -4366,9 +4471,6 @@ else:
         profile_tab,
         execution_tab,
         agent_tab,
-        rag_tab,
-        authoring_tab,
-        rule_tab,
     ) = st.tabs(
         [
             "风险提示",
@@ -4376,9 +4478,6 @@ else:
             "字段画像",
             "无法评估与运行信息",
             "Agent 解读",
-            "标准依据 RAG",
-            "补充评价标准",
-            "规则增强",
         ]
     )
     with risk_tab:
@@ -4391,28 +4490,6 @@ else:
         _render_execution(report)
     with agent_tab:
         _render_agent(report)
-    with rag_tab:
-        _render_rag_panel(
-            selected_metric_ids=selected_metric_ids,
-        )
-    with authoring_tab:
-        _render_rule_authoring(
-            report,
-            uploaded_file=uploaded_file,
-            dataset_name=dataset_name,
-            sheet_name=sheet_name,
-            reference_date=reference_date,
-            selected_metric_ids=selected_metric_ids,
-        )
-    with rule_tab:
-        _render_rule_enhancement(
-            report,
-            uploaded_file=uploaded_file,
-            dataset_name=dataset_name,
-            sheet_name=sheet_name,
-            reference_date=reference_date,
-            selected_metric_ids=selected_metric_ids,
-        )
 
     json_download_file_name = sanitize_file_name(
         f"{dataset.name}_quality_report.json",

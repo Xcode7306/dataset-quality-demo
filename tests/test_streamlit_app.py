@@ -1,12 +1,11 @@
 """Streamlit 页面真实控件交互测试。"""
 
 from datetime import date
-import io
+import json
 import os
 from pathlib import Path
 import unittest
 from unittest.mock import patch
-from zipfile import ZIP_DEFLATED, ZipFile
 
 from streamlit.testing.v1 import AppTest
 
@@ -15,6 +14,7 @@ from src.metric_catalog import (
     METRIC_BY_ID,
     ORIGINAL_METRIC_IDS,
 )
+from src.models import DatasetInfo, QualityReport, RiskItem
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -129,6 +129,51 @@ class StreamlitAppTests(unittest.TestCase):
             lag_metric.evidence["reference_date"], REFERENCE_DATE.isoformat()
         )
 
+    def test_risk_chart_uses_actual_count_scale_and_severity_colors(self):
+        sample = PROJECT_ROOT / "sample_data" / "bad_dataset.csv"
+        app = self._new_app()
+        self._upload_and_run(
+            app,
+            sample.name,
+            sample.read_bytes(),
+            "text/csv",
+        )
+
+        chart_spec = json.loads(app.get("vega_lite_chart")[0].proto.spec)
+        bars = chart_spec["layer"][0]["encoding"]
+        self.assertEqual(bars["x"]["scale"]["domain"], [0, 11])
+        self.assertEqual(bars["x"]["axis"]["tickMinStep"], 1)
+        self.assertEqual(bars["y"]["sort"], ["警告", "关注", "提示"])
+        self.assertEqual(
+            bars["color"]["scale"]["range"],
+            ["#dc2626", "#f59e0b", "#2563eb"],
+        )
+
+    def test_one_risk_does_not_fill_the_chart_axis(self):
+        app = self._new_app()
+        app.session_state["quality_report"] = QualityReport(
+            dataset=DatasetInfo(
+                name="single-risk",
+                file_name="single-risk.csv",
+                file_type="csv",
+            ),
+            risks=[
+                RiskItem(
+                    id="risk-1",
+                    level="warning",
+                    title="测试警告",
+                    message="测试消息",
+                )
+            ],
+        )
+        app.run()
+
+        chart_spec = json.loads(app.get("vega_lite_chart")[0].proto.spec)
+        self.assertEqual(
+            chart_spec["layer"][0]["encoding"]["x"]["scale"]["domain"],
+            [0, 3],
+        )
+
     def test_metric_selector_uses_one_unified_card_list_and_presets(self):
         app = self._new_app()
         self.assertEqual(len(app.multiselect), 0)
@@ -169,6 +214,17 @@ class StreamlitAppTests(unittest.TestCase):
         guidance = [item.value for item in app.info]
         self.assertTrue(any("请先从左侧上传" in value for value in guidance))
         self.assertTrue(all("ZIP" not in value and ".zip" not in value for value in guidance))
+        self.assertFalse(
+            any("在首页与大模型对话创建规则" in item.value for item in app.caption)
+        )
+
+    def test_uploader_no_longer_offers_zip_files(self):
+        app = self._new_app()
+        uploader = next(
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        )
+
+        self.assertNotIn(".zip", uploader.proto.type)
 
     def test_custom_model_api_settings_are_available_on_initial_page(self):
         app = self._new_app()
@@ -194,6 +250,20 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertTrue(
             any("API Key 已保存到当前会话" in item.value for item in app.success)
+        )
+
+        sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
+        self._upload_and_run(
+            app,
+            sample.name,
+            sample.read_bytes(),
+            "text/csv",
+        )
+        self.assertFalse(
+            any("当前已配置自定义大模型 API" in item.value for item in app.warning)
+        )
+        self.assertFalse(
+            any("当前未配置 API Key" in item.value for item in app.caption)
         )
 
     def test_saved_model_api_key_survives_upload_until_explicit_clear(self):
@@ -286,7 +356,7 @@ class StreamlitAppTests(unittest.TestCase):
             any("ASCII 字符" in item.value for item in app.warning)
         )
 
-    def test_custom_rule_provider_error_hides_saved_api_key(self):
+    def test_rule_chat_provider_error_hides_saved_api_key(self):
         sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
         secret = "page-secret-value-12345678"
         app = self._new_app()
@@ -295,28 +365,22 @@ class StreamlitAppTests(unittest.TestCase):
         ).set_value(secret)
         app.run()
         self._button_by_label(app, "保存 API Key").click().run()
-        self._upload_and_run(
-            app,
-            sample.name,
-            sample.read_bytes(),
-            "text/csv",
-        )
         next(
-            item for item in app.text_input if item.label == "自定义规则描述"
-        ).set_value("service_name为必填字段")
+            item for item in app.file_uploader if item.label == "选择数据文件"
+        ).set_value((sample.name, sample.read_bytes(), "text/csv"))
         app.run()
 
         with patch(
-            "src.rule_authoring_coordinator.compile_rule_authoring_run",
+            "src.rule_batch.compile_rule_batch",
             side_effect=ValueError(f"provider rejected API Key {secret}"),
         ):
-            self._button_by_label(app, "AI 解析自定义规则").click().run()
+            app.chat_input[0].set_value("service_name为必填字段").run()
 
         self.assertFalse(app.exception)
         self.assertFalse(any(secret in item.value for item in app.error))
         self.assertNotIn(
             secret,
-            app.session_state["custom_rule_ui_state"]["error"],
+            app.session_state["pre_evaluation_rule_state"]["error"],
         )
 
     def test_selected_metric_without_evidence_blocks_run(self):
@@ -403,7 +467,7 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertNotIn("来源", metric_table.columns)
         self.assertNotIn("标准代码", metric_table.columns)
 
-    def test_report_identifies_missing_standard_and_exposes_completion_page(self):
+    def test_report_identifies_missing_standard_and_offers_re_evaluation(self):
         sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
         app = self._new_app()
         for metric_id in ORIGINAL_METRIC_IDS:
@@ -428,9 +492,17 @@ class StreamlitAppTests(unittest.TestCase):
             any("数据类型约束规范性" in item.value for item in app.markdown)
         )
         self.assertTrue(
-            any("逐字段预期数据类型标准" in item.value for item in app.warning)
+            any("逐字段预期数据类型标准" in item.value for item in app.markdown)
         )
-        self.assertIn("补充评价标准", [tab.label for tab in app.tabs])
+        self.assertNotIn("补充评价标准", [tab.label for tab in app.tabs])
+        self.assertFalse(
+            self._button_by_label(app, "重新评估数据集").disabled
+        )
+        self._button_by_label(app, "重新评估数据集").click().run()
+        self.assertEqual(
+            app.text_area[ALL_METRIC_IDS.index("db31_010101")].value,
+            "按各字段约定的数据类型进行校验",
+        )
 
     def test_empty_metric_selection_disables_run_and_clears_old_state(self):
         sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
@@ -442,10 +514,8 @@ class StreamlitAppTests(unittest.TestCase):
             "text/csv",
         )
         self._button_by_label(app, "概括结果").click().run()
-        self._button_by_label(app, "开始配置业务规则").click().run()
         self.assertIn("quality_report", app.session_state.filtered_state)
         self.assertIn("agent_ui_state", app.session_state.filtered_state)
-        self.assertIn("rule_ui_state", app.session_state.filtered_state)
 
         next(
             item for item in app.file_uploader if item.label == "选择数据文件"
@@ -474,7 +544,7 @@ class StreamlitAppTests(unittest.TestCase):
             )
         )
 
-    def test_evaluation_hides_cards_until_the_uploaded_file_is_removed(self):
+    def test_re_evaluation_returns_to_rule_chat_and_metric_cards(self):
         sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
         app = self._new_app()
         for metric_id in ORIGINAL_METRIC_IDS:
@@ -490,14 +560,26 @@ class StreamlitAppTests(unittest.TestCase):
         )
         self.assertEqual(len(app.checkbox), 0)
         self.assertIn("quality_report", app.session_state.filtered_state)
-        next(
-            item for item in app.file_uploader if item.label == "选择数据文件"
-        ).set_value(None)
-        app.run()
+        self._button_by_label(app, "重新评估数据集").click().run()
 
         self.assertFalse(app.exception)
         self.assertEqual(len(app.checkbox), len(ALL_METRIC_IDS))
         self.assertNotIn("quality_report", app.session_state.filtered_state)
+        self.assertEqual(len(app.chat_input), 1)
+        subheaders = [item.value for item in app.subheader]
+        self.assertLess(
+            subheaders.index("补充评价标准"),
+            subheaders.index("选择评价指标"),
+        )
+        self.assertTrue(any("自定义规则" in item.value for item in app.markdown))
+        self.assertFalse(
+            any("自定义规则（v1.0）" in item.value for item in app.markdown)
+        )
+        app.chat_input[0].set_value("service_name为必填字段").run()
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            app.session_state["pre_evaluation_rule_state"]["preflight"].ready
+        )
 
     def test_supported_formats_run_through_full_report_surface(self):
         samples = PROJECT_ROOT / "sample_data"
@@ -834,25 +916,25 @@ class StreamlitAppTests(unittest.TestCase):
             any("JSON Lines" in item for item in report.execution["warnings"])
         )
 
-    def test_json_zip_runs_through_full_report_surface_and_shows_warning(self):
-        content = io.BytesIO()
-        with ZipFile(content, "w", compression=ZIP_DEFLATED) as archive:
-            archive.writestr("001.json", '[["id","name"],[1,"A"]]')
-            archive.writestr("002.json", '[["id","name"],[2,"B"]]')
-
+    def test_report_hides_legacy_rag_rule_and_supplement_tabs(self):
+        sample = PROJECT_ROOT / "sample_data" / "good_dataset.csv"
         app = self._new_app()
         self._upload_and_run(
             app,
-            "records.zip",
-            content.getvalue(),
-            "application/zip",
+            sample.name,
+            sample.read_bytes(),
+            "text/csv",
         )
 
-        self._assert_report_surface(app, "zip")
-        report = app.session_state["quality_report"]
-        self.assertEqual(report.profile["row_count"], 2)
-        self.assertTrue(
-            any("ZIP JSON 分片包" in item for item in report.execution["warnings"])
+        tab_labels = [tab.label for tab in app.tabs]
+        self.assertNotIn("标准依据 RAG", tab_labels)
+        self.assertNotIn("规则增强", tab_labels)
+        self.assertNotIn("补充评价标准", tab_labels)
+        self.assertFalse(
+            any(item.label == "检索问题或条款关键词" for item in app.text_input)
+        )
+        self.assertFalse(
+            any(item.label == "开始配置业务规则" for item in app.button)
         )
 
     def test_nested_json_returns_downloadable_failed_report(self):

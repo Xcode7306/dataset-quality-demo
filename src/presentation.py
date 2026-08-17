@@ -326,7 +326,7 @@ def _metric_selection_summary(
         metric_id in DB31_METRIC_IDS for metric_id in selected_ids
     )
     return (
-        f"共 {len(selected_ids)} 项（原 v0.4 指标 {original_count} 项，"
+        f"共 {len(selected_ids)} 项（基础指标 {original_count} 项，"
         f"DB31/T 1523-2024 指标 {db31_count} 项）"
     )
 
@@ -354,9 +354,7 @@ def render_markdown_report(report: QualityReport) -> str:
                 ("记录数", f"{summary['row_count']:,}"),
                 ("字段数", f"{summary['column_count']:,}"),
                 ("报告哈希", evaluation_context.get("report_sha256", "—")),
-                ("引擎版本", evaluation_context.get("engine_version", "—")),
                 ("评估基准日期", evaluation_context.get("reference_date", "—")),
-                ("阈值配置版本", evaluation_context.get("threshold_config_version", "—")),
                 ("解析路径", evaluation_context.get("parser_path", "—")),
                 (
                     "指标选择",

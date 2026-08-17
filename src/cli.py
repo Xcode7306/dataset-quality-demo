@@ -53,7 +53,7 @@ def main() -> None:
         "input_file",
         help=(
             "待评估的 CSV、Excel、JSON、JSONL / NDJSON、GeoJSON "
-            "或同构 JSON 分片 ZIP 文件路径。"
+            "文件路径。"
         ),
     )
     parser.add_argument("--name", help="报告中的数据集名称；默认使用文件名。")

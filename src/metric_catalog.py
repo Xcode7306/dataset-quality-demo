@@ -83,7 +83,7 @@ def _legacy(
         "category": category,
         "dimension": category,
         "source": LEGACY_SOURCE,
-        "source_label": "原 v0.4 指标",
+        "source_label": "基础指标",
         "standard_code": None,
         "level": "原有",
         "parent_id": None,
@@ -739,7 +739,7 @@ def metric_selection_label(metric_id: str) -> str:
     item = METRIC_BY_ID[metric_id]
     if item["source"] == LEGACY_SOURCE:
         return (
-            f"[原 v0.4] {item['category']} / "
+            f"[基础指标] {item['category']} / "
             f"{item['name']} ({metric_id})"
         )
     capability = "可直接计算" if item["auto_assessable"] else "需补充评价依据"
