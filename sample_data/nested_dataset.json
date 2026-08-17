@@ -1,0 +1,10 @@
+[
+  {
+    "record_id": 1,
+    "service_name": "社会保险缴费查询",
+    "source": {
+      "department": "人力资源和社会保障局",
+      "url": "https://example.gov.cn/service/1"
+    }
+  }
+]

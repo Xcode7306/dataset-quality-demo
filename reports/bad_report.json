@@ -1,0 +1,1155 @@
+{
+  "dataset": {
+    "name": "bad_dataset",
+    "file_name": "bad_dataset.csv",
+    "file_type": "csv",
+    "sheet_name": null
+  },
+  "status": "success",
+  "schema_version": "0.3",
+  "profile": {
+    "row_count": 6,
+    "column_count": 7,
+    "columns": [
+      {
+        "name": "record_id",
+        "missing_count": 0,
+        "non_missing_count": 6,
+        "missing_rate": 0.0,
+        "inferred_type": "numeric",
+        "non_null_samples": []
+      },
+      {
+        "name": "service_name",
+        "missing_count": 1,
+        "non_missing_count": 5,
+        "missing_rate": 0.166667,
+        "inferred_type": "text",
+        "non_null_samples": []
+      },
+      {
+        "name": "department",
+        "missing_count": 2,
+        "non_missing_count": 4,
+        "missing_rate": 0.333333,
+        "inferred_type": "text",
+        "non_null_samples": []
+      },
+      {
+        "name": "update_time",
+        "missing_count": 1,
+        "non_missing_count": 5,
+        "missing_rate": 0.166667,
+        "inferred_type": "text",
+        "non_null_samples": []
+      },
+      {
+        "name": "source_url",
+        "missing_count": 2,
+        "non_missing_count": 4,
+        "missing_rate": 0.333333,
+        "inferred_type": "text",
+        "non_null_samples": []
+      },
+      {
+        "name": "version",
+        "missing_count": 2,
+        "non_missing_count": 4,
+        "missing_rate": 0.333333,
+        "inferred_type": "text",
+        "non_null_samples": []
+      },
+      {
+        "name": "handling_days",
+        "missing_count": 1,
+        "non_missing_count": 5,
+        "missing_rate": 0.166667,
+        "inferred_type": "text",
+        "non_null_samples": []
+      }
+    ],
+    "recognized_fields": {
+      "date": [
+        "update_time"
+      ],
+      "numeric": [
+        "handling_days",
+        "record_id"
+      ],
+      "url": [
+        "source_url"
+      ],
+      "source": [
+        "department",
+        "source_url"
+      ],
+      "version": [
+        "update_time",
+        "version"
+      ]
+    },
+    "warnings": []
+  },
+  "metrics": [
+    {
+      "id": "file_parse_rate",
+      "name": "文件可解析率",
+      "category": "可读取性",
+      "status": "evaluated",
+      "value": 1.0,
+      "unit": "ratio",
+      "scope": "dataset",
+      "field": null,
+      "evidence": {
+        "attempted_file_count": 1,
+        "successful_file_count": 1,
+        "failed_file_count": 0
+      },
+      "reason": null,
+      "metric_key": "metric:file_parse_rate:dataset"
+    },
+    {
+      "id": "dataset_scale",
+      "name": "数据规模",
+      "category": "规模",
+      "status": "evaluated",
+      "value": 6,
+      "unit": "records",
+      "scope": "dataset",
+      "field": null,
+      "evidence": {
+        "file_count": 1,
+        "row_count": 6,
+        "column_count": 7
+      },
+      "reason": null,
+      "metric_key": "metric:dataset_scale:dataset"
+    },
+    {
+      "id": "field_missing_rate",
+      "name": "字段缺失率",
+      "category": "完整性",
+      "status": "evaluated",
+      "value": 0.0,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "record_id",
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 0
+      },
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:record_id"
+    },
+    {
+      "id": "field_missing_rate",
+      "name": "字段缺失率",
+      "category": "完整性",
+      "status": "evaluated",
+      "value": 0.166667,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "service_name",
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 1
+      },
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:service_name"
+    },
+    {
+      "id": "field_missing_rate",
+      "name": "字段缺失率",
+      "category": "完整性",
+      "status": "evaluated",
+      "value": 0.333333,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "department",
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 2
+      },
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:department"
+    },
+    {
+      "id": "field_missing_rate",
+      "name": "字段缺失率",
+      "category": "完整性",
+      "status": "evaluated",
+      "value": 0.166667,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "update_time",
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 1
+      },
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:update_time"
+    },
+    {
+      "id": "field_missing_rate",
+      "name": "字段缺失率",
+      "category": "完整性",
+      "status": "evaluated",
+      "value": 0.333333,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "source_url",
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 2
+      },
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:source_url"
+    },
+    {
+      "id": "field_missing_rate",
+      "name": "字段缺失率",
+      "category": "完整性",
+      "status": "evaluated",
+      "value": 0.333333,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "version",
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 2
+      },
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:version"
+    },
+    {
+      "id": "field_missing_rate",
+      "name": "字段缺失率",
+      "category": "完整性",
+      "status": "evaluated",
+      "value": 0.166667,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "handling_days",
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 1
+      },
+      "reason": null,
+      "metric_key": "metric:field_missing_rate:field:handling_days"
+    },
+    {
+      "id": "blank_record_rate",
+      "name": "空白记录率",
+      "category": "完整性",
+      "status": "evaluated",
+      "value": 0.166667,
+      "unit": "ratio",
+      "scope": "dataset",
+      "field": null,
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 1,
+        "method": "inferred_content_fields_blank",
+        "content_fields": [
+          "service_name",
+          "department",
+          "update_time",
+          "source_url",
+          "version",
+          "handling_days"
+        ]
+      },
+      "reason": null,
+      "metric_key": "metric:blank_record_rate:dataset"
+    },
+    {
+      "id": "field_type_consistency",
+      "name": "字段类型一致率",
+      "category": "类型一致性",
+      "status": "evaluated",
+      "value": 1.0,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "record_id",
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 0,
+        "dominant_type": "numeric",
+        "type_counts": {
+          "numeric": 6
+        }
+      },
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:record_id"
+    },
+    {
+      "id": "field_type_consistency",
+      "name": "字段类型一致率",
+      "category": "类型一致性",
+      "status": "evaluated",
+      "value": 1.0,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "service_name",
+      "evidence": {
+        "checked_count": 5,
+        "issue_count": 0,
+        "dominant_type": "text",
+        "type_counts": {
+          "text": 5
+        }
+      },
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:service_name"
+    },
+    {
+      "id": "field_type_consistency",
+      "name": "字段类型一致率",
+      "category": "类型一致性",
+      "status": "evaluated",
+      "value": 1.0,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "department",
+      "evidence": {
+        "checked_count": 4,
+        "issue_count": 0,
+        "dominant_type": "text",
+        "type_counts": {
+          "text": 4
+        }
+      },
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:department"
+    },
+    {
+      "id": "field_type_consistency",
+      "name": "字段类型一致率",
+      "category": "类型一致性",
+      "status": "evaluated",
+      "value": 0.8,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "update_time",
+      "evidence": {
+        "checked_count": 5,
+        "issue_count": 1,
+        "dominant_type": "datetime",
+        "type_counts": {
+          "datetime": 4,
+          "text": 1
+        }
+      },
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:update_time"
+    },
+    {
+      "id": "field_type_consistency",
+      "name": "字段类型一致率",
+      "category": "类型一致性",
+      "status": "evaluated",
+      "value": 1.0,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "source_url",
+      "evidence": {
+        "checked_count": 4,
+        "issue_count": 0,
+        "dominant_type": "text",
+        "type_counts": {
+          "text": 4
+        }
+      },
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:source_url"
+    },
+    {
+      "id": "field_type_consistency",
+      "name": "字段类型一致率",
+      "category": "类型一致性",
+      "status": "evaluated",
+      "value": 1.0,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "version",
+      "evidence": {
+        "checked_count": 4,
+        "issue_count": 0,
+        "dominant_type": "text",
+        "type_counts": {
+          "text": 4
+        }
+      },
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:version"
+    },
+    {
+      "id": "field_type_consistency",
+      "name": "字段类型一致率",
+      "category": "类型一致性",
+      "status": "evaluated",
+      "value": 0.6,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "handling_days",
+      "evidence": {
+        "checked_count": 5,
+        "issue_count": 2,
+        "dominant_type": "numeric",
+        "type_counts": {
+          "numeric": 3,
+          "text": 2
+        }
+      },
+      "reason": null,
+      "metric_key": "metric:field_type_consistency:field:handling_days"
+    },
+    {
+      "id": "recognizable_format_anomaly_rate",
+      "name": "可识别格式异常率",
+      "category": "格式规范性",
+      "status": "evaluated",
+      "value": 0.2,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "update_time",
+      "evidence": {
+        "expected_format": "datetime",
+        "checked_count": 5,
+        "issue_count": 1,
+        "invalid_samples": []
+      },
+      "reason": null,
+      "metric_key": "metric:recognizable_format_anomaly_rate:field:update_time"
+    },
+    {
+      "id": "recognizable_format_anomaly_rate",
+      "name": "可识别格式异常率",
+      "category": "格式规范性",
+      "status": "evaluated",
+      "value": 0.25,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "source_url",
+      "evidence": {
+        "expected_format": "url",
+        "checked_count": 4,
+        "issue_count": 1,
+        "invalid_samples": []
+      },
+      "reason": null,
+      "metric_key": "metric:recognizable_format_anomaly_rate:field:source_url"
+    },
+    {
+      "id": "recognizable_format_anomaly_rate",
+      "name": "可识别格式异常率",
+      "category": "格式规范性",
+      "status": "evaluated",
+      "value": 0.4,
+      "unit": "ratio",
+      "scope": "field",
+      "field": "handling_days",
+      "evidence": {
+        "expected_format": "numeric",
+        "checked_count": 5,
+        "issue_count": 2,
+        "invalid_samples": []
+      },
+      "reason": null,
+      "metric_key": "metric:recognizable_format_anomaly_rate:field:handling_days"
+    },
+    {
+      "id": "exact_duplicate_rate",
+      "name": "完全重复率",
+      "category": "唯一性",
+      "status": "evaluated",
+      "value": 0.166667,
+      "unit": "ratio",
+      "scope": "dataset",
+      "field": null,
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 1,
+        "duplicate_group_count": 1,
+        "duplicate_groups": [
+          {
+            "row_indices": [
+              1,
+              2
+            ],
+            "duplicate_count": 1
+          }
+        ],
+        "compared_fields": [
+          "service_name",
+          "department",
+          "update_time",
+          "source_url",
+          "version",
+          "handling_days"
+        ],
+        "normalization": false
+      },
+      "reason": null,
+      "metric_key": "metric:exact_duplicate_rate:dataset"
+    },
+    {
+      "id": "normalized_duplicate_rate",
+      "name": "规范化重复率",
+      "category": "唯一性",
+      "status": "evaluated",
+      "value": 0.166667,
+      "unit": "ratio",
+      "scope": "dataset",
+      "field": null,
+      "evidence": {
+        "checked_count": 6,
+        "issue_count": 1,
+        "duplicate_group_count": 1,
+        "duplicate_groups": [
+          {
+            "row_indices": [
+              1,
+              2
+            ],
+            "duplicate_count": 1
+          }
+        ],
+        "compared_fields": [
+          "service_name",
+          "department",
+          "update_time",
+          "source_url",
+          "version",
+          "handling_days"
+        ],
+        "normalization": true
+      },
+      "reason": null,
+      "metric_key": "metric:normalized_duplicate_rate:dataset"
+    },
+    {
+      "id": "time_info_availability",
+      "name": "时间信息可用率",
+      "category": "及时性",
+      "status": "evaluated",
+      "value": 0.666667,
+      "unit": "ratio",
+      "scope": "dataset",
+      "field": null,
+      "evidence": {
+        "identified_fields": [
+          "update_time"
+        ],
+        "checked_count": 6,
+        "available_count": 4,
+        "issue_count": 2,
+        "earliest_date": "2026-06-01",
+        "latest_date": "2026-06-07"
+      },
+      "reason": null,
+      "metric_key": "metric:time_info_availability:dataset"
+    },
+    {
+      "id": "update_lag_days",
+      "name": "更新滞后天数",
+      "category": "及时性",
+      "status": "evaluated",
+      "value": 40,
+      "unit": "days",
+      "scope": "dataset",
+      "field": null,
+      "evidence": {
+        "identified_fields": [
+          "update_time"
+        ],
+        "latest_update_date": "2026-06-07",
+        "reference_date": "2026-07-17"
+      },
+      "reason": null,
+      "metric_key": "metric:update_lag_days:dataset"
+    },
+    {
+      "id": "source_info_coverage",
+      "name": "来源信息覆盖率",
+      "category": "可溯性",
+      "status": "evaluated",
+      "value": 0.833333,
+      "unit": "ratio",
+      "scope": "dataset",
+      "field": null,
+      "evidence": {
+        "identified_fields": [
+          "department",
+          "source_url"
+        ],
+        "checked_count": 6,
+        "covered_count": 5,
+        "issue_count": 1,
+        "missing_row_indices": [
+          5
+        ]
+      },
+      "reason": null,
+      "metric_key": "metric:source_info_coverage:dataset"
+    },
+    {
+      "id": "version_info_coverage",
+      "name": "版本信息覆盖率",
+      "category": "可溯性",
+      "status": "evaluated",
+      "value": 0.833333,
+      "unit": "ratio",
+      "scope": "dataset",
+      "field": null,
+      "evidence": {
+        "identified_fields": [
+          "update_time",
+          "version"
+        ],
+        "checked_count": 6,
+        "covered_count": 5,
+        "issue_count": 1,
+        "missing_row_indices": [
+          5
+        ]
+      },
+      "reason": null,
+      "metric_key": "metric:version_info_coverage:dataset"
+    },
+    {
+      "id": "statistical_outlier_rate",
+      "name": "统计异常值比例",
+      "category": "数据异常",
+      "status": "not_assessable",
+      "value": null,
+      "unit": null,
+      "scope": "dataset",
+      "field": null,
+      "evidence": {},
+      "reason": "未识别到至少含 4 个可用数值的非标识字段。",
+      "metric_key": "metric:statistical_outlier_rate:dataset"
+    }
+  ],
+  "risks": [
+    {
+      "id": "high_field_missing_rate:service_name",
+      "level": "attention",
+      "title": "字段缺失较多",
+      "message": "字段“service_name”的缺失率为 16.7%，建议核对该字段的可用性。",
+      "related_metrics": [
+        "field_missing_rate"
+      ],
+      "related_metric_keys": [
+        "metric:field_missing_rate:field:service_name"
+      ],
+      "evidence": {
+        "field": "service_name",
+        "checked_count": 6,
+        "issue_count": 1,
+        "decision": {
+          "rule_id": "high_field_missing_rate",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "field_missing_rate",
+          "observed_value": 0.166667,
+          "operator": ">",
+          "threshold": 0.1
+        }
+      }
+    },
+    {
+      "id": "high_field_missing_rate:department",
+      "level": "attention",
+      "title": "字段缺失较多",
+      "message": "字段“department”的缺失率为 33.3%，建议核对该字段的可用性。",
+      "related_metrics": [
+        "field_missing_rate"
+      ],
+      "related_metric_keys": [
+        "metric:field_missing_rate:field:department"
+      ],
+      "evidence": {
+        "field": "department",
+        "checked_count": 6,
+        "issue_count": 2,
+        "decision": {
+          "rule_id": "high_field_missing_rate",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "field_missing_rate",
+          "observed_value": 0.333333,
+          "operator": ">",
+          "threshold": 0.1
+        }
+      }
+    },
+    {
+      "id": "high_field_missing_rate:update_time",
+      "level": "attention",
+      "title": "字段缺失较多",
+      "message": "字段“update_time”的缺失率为 16.7%，建议核对该字段的可用性。",
+      "related_metrics": [
+        "field_missing_rate"
+      ],
+      "related_metric_keys": [
+        "metric:field_missing_rate:field:update_time"
+      ],
+      "evidence": {
+        "field": "update_time",
+        "checked_count": 6,
+        "issue_count": 1,
+        "decision": {
+          "rule_id": "high_field_missing_rate",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "field_missing_rate",
+          "observed_value": 0.166667,
+          "operator": ">",
+          "threshold": 0.1
+        }
+      }
+    },
+    {
+      "id": "high_field_missing_rate:source_url",
+      "level": "attention",
+      "title": "字段缺失较多",
+      "message": "字段“source_url”的缺失率为 33.3%，建议核对该字段的可用性。",
+      "related_metrics": [
+        "field_missing_rate"
+      ],
+      "related_metric_keys": [
+        "metric:field_missing_rate:field:source_url"
+      ],
+      "evidence": {
+        "field": "source_url",
+        "checked_count": 6,
+        "issue_count": 2,
+        "decision": {
+          "rule_id": "high_field_missing_rate",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "field_missing_rate",
+          "observed_value": 0.333333,
+          "operator": ">",
+          "threshold": 0.1
+        }
+      }
+    },
+    {
+      "id": "high_field_missing_rate:version",
+      "level": "attention",
+      "title": "字段缺失较多",
+      "message": "字段“version”的缺失率为 33.3%，建议核对该字段的可用性。",
+      "related_metrics": [
+        "field_missing_rate"
+      ],
+      "related_metric_keys": [
+        "metric:field_missing_rate:field:version"
+      ],
+      "evidence": {
+        "field": "version",
+        "checked_count": 6,
+        "issue_count": 2,
+        "decision": {
+          "rule_id": "high_field_missing_rate",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "field_missing_rate",
+          "observed_value": 0.333333,
+          "operator": ">",
+          "threshold": 0.1
+        }
+      }
+    },
+    {
+      "id": "high_field_missing_rate:handling_days",
+      "level": "attention",
+      "title": "字段缺失较多",
+      "message": "字段“handling_days”的缺失率为 16.7%，建议核对该字段的可用性。",
+      "related_metrics": [
+        "field_missing_rate"
+      ],
+      "related_metric_keys": [
+        "metric:field_missing_rate:field:handling_days"
+      ],
+      "evidence": {
+        "field": "handling_days",
+        "checked_count": 6,
+        "issue_count": 1,
+        "decision": {
+          "rule_id": "high_field_missing_rate",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "field_missing_rate",
+          "observed_value": 0.166667,
+          "operator": ">",
+          "threshold": 0.1
+        }
+      }
+    },
+    {
+      "id": "blank_records_detected",
+      "level": "warning",
+      "title": "发现空白记录",
+      "message": "可识别内容字段均为空的记录占 16.7%，建议检查对应记录。",
+      "related_metrics": [
+        "blank_record_rate"
+      ],
+      "related_metric_keys": [
+        "metric:blank_record_rate:dataset"
+      ],
+      "evidence": {
+        "field": null,
+        "checked_count": 6,
+        "issue_count": 1,
+        "method": "inferred_content_fields_blank",
+        "content_fields": [
+          "service_name",
+          "department",
+          "update_time",
+          "source_url",
+          "version",
+          "handling_days"
+        ],
+        "decision": {
+          "rule_id": "blank_records_detected",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "blank_record_rate",
+          "observed_value": 0.166667,
+          "operator": ">=",
+          "threshold": 0.1
+        }
+      }
+    },
+    {
+      "id": "low_type_consistency:update_time",
+      "level": "warning",
+      "title": "字段类型存在混杂",
+      "message": "字段“update_time”的主要类型一致率为 80.0%，建议查看混入的值类型。",
+      "related_metrics": [
+        "field_type_consistency"
+      ],
+      "related_metric_keys": [
+        "metric:field_type_consistency:field:update_time"
+      ],
+      "evidence": {
+        "field": "update_time",
+        "checked_count": 5,
+        "issue_count": 1,
+        "dominant_type": "datetime",
+        "type_counts": {
+          "datetime": 4,
+          "text": 1
+        },
+        "decision": {
+          "rule_id": "low_type_consistency",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "field_type_consistency",
+          "observed_value": 0.8,
+          "operator": "<=",
+          "threshold": 0.8
+        }
+      }
+    },
+    {
+      "id": "low_type_consistency:handling_days",
+      "level": "warning",
+      "title": "字段类型存在混杂",
+      "message": "字段“handling_days”的主要类型一致率为 60.0%，建议查看混入的值类型。",
+      "related_metrics": [
+        "field_type_consistency"
+      ],
+      "related_metric_keys": [
+        "metric:field_type_consistency:field:handling_days"
+      ],
+      "evidence": {
+        "field": "handling_days",
+        "checked_count": 5,
+        "issue_count": 2,
+        "dominant_type": "numeric",
+        "type_counts": {
+          "numeric": 3,
+          "text": 2
+        },
+        "decision": {
+          "rule_id": "low_type_consistency",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "field_type_consistency",
+          "observed_value": 0.6,
+          "operator": "<=",
+          "threshold": 0.8
+        }
+      }
+    },
+    {
+      "id": "format_anomalies_detected:update_time",
+      "level": "warning",
+      "title": "发现可识别格式异常",
+      "message": "字段“update_time”的可识别格式异常率为 20.0%；其中异常数为 1 条；建议回到原始数据按对应格式规则核对。",
+      "related_metrics": [
+        "recognizable_format_anomaly_rate"
+      ],
+      "related_metric_keys": [
+        "metric:recognizable_format_anomaly_rate:field:update_time"
+      ],
+      "evidence": {
+        "field": "update_time",
+        "expected_format": "datetime",
+        "checked_count": 5,
+        "issue_count": 1,
+        "invalid_samples": [],
+        "decision": {
+          "rule_id": "format_anomalies_detected",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "recognizable_format_anomaly_rate",
+          "observed_value": 0.2,
+          "operator": ">=",
+          "threshold": 0.2
+        }
+      }
+    },
+    {
+      "id": "format_anomalies_detected:source_url",
+      "level": "warning",
+      "title": "发现可识别格式异常",
+      "message": "字段“source_url”的可识别格式异常率为 25.0%；其中异常数为 1 条；建议回到原始数据按对应格式规则核对。",
+      "related_metrics": [
+        "recognizable_format_anomaly_rate"
+      ],
+      "related_metric_keys": [
+        "metric:recognizable_format_anomaly_rate:field:source_url"
+      ],
+      "evidence": {
+        "field": "source_url",
+        "expected_format": "url",
+        "checked_count": 4,
+        "issue_count": 1,
+        "invalid_samples": [],
+        "decision": {
+          "rule_id": "format_anomalies_detected",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "recognizable_format_anomaly_rate",
+          "observed_value": 0.25,
+          "operator": ">=",
+          "threshold": 0.2
+        }
+      }
+    },
+    {
+      "id": "format_anomalies_detected:handling_days",
+      "level": "warning",
+      "title": "发现可识别格式异常",
+      "message": "字段“handling_days”的可识别格式异常率为 40.0%；其中异常数为 2 条；建议回到原始数据按对应格式规则核对。",
+      "related_metrics": [
+        "recognizable_format_anomaly_rate"
+      ],
+      "related_metric_keys": [
+        "metric:recognizable_format_anomaly_rate:field:handling_days"
+      ],
+      "evidence": {
+        "field": "handling_days",
+        "expected_format": "numeric",
+        "checked_count": 5,
+        "issue_count": 2,
+        "invalid_samples": [],
+        "decision": {
+          "rule_id": "format_anomalies_detected",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "recognizable_format_anomaly_rate",
+          "observed_value": 0.4,
+          "operator": ">=",
+          "threshold": 0.2
+        }
+      }
+    },
+    {
+      "id": "exact_duplicates_detected",
+      "level": "warning",
+      "title": "发现完全重复记录",
+      "message": "排除明显技术标识字段后，完全重复记录占 16.7%。",
+      "related_metrics": [
+        "exact_duplicate_rate"
+      ],
+      "related_metric_keys": [
+        "metric:exact_duplicate_rate:dataset"
+      ],
+      "evidence": {
+        "field": null,
+        "checked_count": 6,
+        "issue_count": 1,
+        "duplicate_group_count": 1,
+        "duplicate_groups": [
+          {
+            "row_indices": [
+              1,
+              2
+            ],
+            "duplicate_count": 1
+          }
+        ],
+        "compared_fields": [
+          "service_name",
+          "department",
+          "update_time",
+          "source_url",
+          "version",
+          "handling_days"
+        ],
+        "normalization": false,
+        "decision": {
+          "rule_id": "exact_duplicates_detected",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "exact_duplicate_rate",
+          "observed_value": 0.166667,
+          "operator": ">=",
+          "threshold": 0.1
+        }
+      }
+    },
+    {
+      "id": "low_time_availability",
+      "level": "attention",
+      "title": "时间信息覆盖不足",
+      "message": "仅有 66.7% 的记录含可解析时间，时效性结论可能受限。",
+      "related_metrics": [
+        "time_info_availability"
+      ],
+      "related_metric_keys": [
+        "metric:time_info_availability:dataset"
+      ],
+      "evidence": {
+        "field": null,
+        "identified_fields": [
+          "update_time"
+        ],
+        "checked_count": 6,
+        "available_count": 4,
+        "issue_count": 2,
+        "earliest_date": "2026-06-01",
+        "latest_date": "2026-06-07",
+        "decision": {
+          "rule_id": "low_time_availability",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "time_info_availability",
+          "observed_value": 0.666667,
+          "operator": "<",
+          "threshold": 0.9
+        }
+      }
+    },
+    {
+      "id": "low_source_coverage",
+      "level": "attention",
+      "title": "来源信息覆盖不足",
+      "message": "当前覆盖率为 83.3%，建议查看报告中未覆盖的记录。",
+      "related_metrics": [
+        "source_info_coverage"
+      ],
+      "related_metric_keys": [
+        "metric:source_info_coverage:dataset"
+      ],
+      "evidence": {
+        "field": null,
+        "identified_fields": [
+          "department",
+          "source_url"
+        ],
+        "checked_count": 6,
+        "covered_count": 5,
+        "issue_count": 1,
+        "missing_row_indices": [
+          5
+        ],
+        "decision": {
+          "rule_id": "low_source_coverage",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "source_info_coverage",
+          "observed_value": 0.833333,
+          "operator": "<",
+          "threshold": 0.9
+        }
+      }
+    },
+    {
+      "id": "low_version_coverage",
+      "level": "attention",
+      "title": "版本信息覆盖不足",
+      "message": "当前覆盖率为 83.3%，建议查看报告中未覆盖的记录。",
+      "related_metrics": [
+        "version_info_coverage"
+      ],
+      "related_metric_keys": [
+        "metric:version_info_coverage:dataset"
+      ],
+      "evidence": {
+        "field": null,
+        "identified_fields": [
+          "update_time",
+          "version"
+        ],
+        "checked_count": 6,
+        "covered_count": 5,
+        "issue_count": 1,
+        "missing_row_indices": [
+          5
+        ],
+        "decision": {
+          "rule_id": "low_version_coverage",
+          "rule_version": "0.3",
+          "threshold_config_version": "0.3",
+          "observed_name": "version_info_coverage",
+          "observed_value": 0.833333,
+          "operator": "<",
+          "threshold": 0.9
+        }
+      }
+    }
+  ],
+  "not_assessable": [
+    {
+      "id": "statistical_outlier_rate",
+      "name": "统计异常值比例",
+      "reason": "未识别到至少含 4 个可用数值的非标识字段。",
+      "metric_key": "metric:statistical_outlier_rate:dataset"
+    }
+  ],
+  "evaluation_context": {
+    "engine_version": "0.6",
+    "metric_catalog_version": "0.6",
+    "selected_metric_ids": [
+      "file_parse_rate",
+      "dataset_scale",
+      "field_missing_rate",
+      "blank_record_rate",
+      "field_type_consistency",
+      "recognizable_format_anomaly_rate",
+      "exact_duplicate_rate",
+      "normalized_duplicate_rate",
+      "time_info_availability",
+      "update_lag_days",
+      "source_info_coverage",
+      "version_info_coverage",
+      "statistical_outlier_rate"
+    ],
+    "reference_date": "2026-07-17",
+    "threshold_config_version": "0.3",
+    "parser_path": "csv",
+    "input_sha256": "683571252ca325f104a1fdaf85bc5a1972864e5c8ecc68b8ef21861eed14c350",
+    "input_size_bytes": 522,
+    "report_sha256": "8f091cafe2b1a44717676a5fbce93e3a98c39df3bc88ecc7401359af34d921c7"
+  },
+  "execution": {
+    "warnings": [],
+    "errors": []
+  }
+}

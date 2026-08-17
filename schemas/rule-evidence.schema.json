@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rule-evidence.schema.json",
+  "title": "RuleEvidence v0.1（v0.9 RAG 引用扩展）",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "type",
+    "text",
+    "source_id",
+    "source_label",
+    "location",
+    "authoritative"
+  ],
+  "properties": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 120},
+    "type": {
+      "enum": [
+        "user_statement",
+        "metric_definition",
+        "standard_clause",
+        "data_dictionary",
+        "system_inference"
+      ]
+    },
+    "text": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "source_id": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "maxLength": 300}
+      ]
+    },
+    "source_label": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "maxLength": 300}
+      ]
+    },
+    "location": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "maxLength": 500}
+      ]
+    },
+    "authoritative": {"type": "boolean"},
+    "document_id": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 120}]},
+    "document_name": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 300}]},
+    "document_version": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 100}]},
+    "section": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 300}]},
+    "clause": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 120}]},
+    "chunk_id": {"oneOf": [{"type": "null"}, {"type": "string", "maxLength": 120}]},
+    "page": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]}
+  },
+  "allOf": [
+    {
+      "if": {"required": ["type"], "properties": {"type": {"enum": ["standard_clause", "data_dictionary"]}}},
+      "then": {
+        "required": ["document_name", "document_version", "chunk_id"],
+        "anyOf": [{"required": ["section"]}, {"required": ["clause"]}]
+      }
+    }
+  ]
+}

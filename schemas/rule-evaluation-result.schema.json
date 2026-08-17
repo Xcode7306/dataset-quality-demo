@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "rule-evaluation-result.schema.json",
+  "title": "RuleEvaluationResult v0.4",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "baseline_report",
+    "enhanced_report",
+    "approved_rule_pack",
+    "diff"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.4"
+    },
+    "baseline_report": {
+      "$ref": "quality-report.schema.json"
+    },
+    "enhanced_report": {
+      "$ref": "quality-report.schema.json"
+    },
+    "approved_rule_pack": {
+      "allOf": [
+        {
+          "$ref": "rule-pack.schema.json"
+        },
+        {
+          "properties": {
+            "status": {
+              "const": "approved"
+            }
+          }
+        }
+      ]
+    },
+    "diff": {
+      "$ref": "#/$defs/ruleEvaluationDiff"
+    }
+  },
+  "$defs": {
+    "ruleEvaluationDiff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "added_metric_keys",
+        "added_risk_ids",
+        "added_not_assessable_metric_keys",
+        "counts"
+      ],
+      "properties": {
+        "added_metric_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^metric:business_[^:]+:(dataset|field:.*)$"
+          },
+          "uniqueItems": true
+        },
+        "added_risk_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^business_rule_violation:"
+          },
+          "uniqueItems": true
+        },
+        "added_not_assessable_metric_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^metric:business_[^:]+:(dataset|field:.*)$"
+          },
+          "uniqueItems": true
+        },
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "added_metrics",
+            "added_evaluated_metrics",
+            "added_risks",
+            "added_not_assessable",
+            "added_issue_locations"
+          ],
+          "properties": {
+            "added_metrics": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "added_evaluated_metrics": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "added_risks": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "added_not_assessable": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "added_issue_locations": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

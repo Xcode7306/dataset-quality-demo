@@ -1,4 +1,4 @@
-"""输入资源上限与压缩工作簿预检。
+"""输入资源上限与压缩文件预检。
 
 这些上限是本地 Demo 的安全边界，不是政务数据的业务口径。
 """
@@ -22,18 +22,18 @@ MAX_DATASET_ROWS = 1_000_000
 MAX_DATASET_COLUMNS = 10_000
 MAX_DATASET_CELLS = 20_000_000
 MAX_JSON_RECORDS = 200_000
+MAX_JSON_ARRAY_ITEMS = MAX_JSON_RECORDS + 1
+MAX_JSON_TOTAL_ARRAY_ITEMS = MAX_DATASET_CELLS + MAX_JSON_RECORDS + 1
 MAX_JSON_NESTING_DEPTH = 100
 MAX_JSON_OBJECT_PAIRS = MAX_DATASET_COLUMNS
 MAX_JSON_TOTAL_PAIRS = 1_000_000
 MAX_CELL_TEXT_BYTES = MEBIBYTE
-
-
 class ResourceLimitExceeded(ValueError):
     """输入超出 Demo 可安全处理的资源上限。"""
 
 
 def validate_input_file_size(path: Path) -> None:
-    """在交给 pandas/openpyxl 前限制原始文件体积。"""
+    """在交给 pandas 与对应文件解析引擎前限制原始文件体积。"""
 
     try:
         size = path.stat().st_size

@@ -4,11 +4,12 @@ import re
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Iterable
 
 from .models import QualityReport
 from .parser import DatasetReadError, SUPPORTED_EXTENSIONS, UnsupportedFileTypeError
 from .resource_limits import ResourceLimitExceeded, validate_upload_size
-from .text_utils import normalize_display_text
+from .text_utils import normalize_display_text, replace_unsafe_unicode_controls
 from .workflow import build_profile_report
 
 
@@ -30,6 +31,10 @@ def _clean_file_name_component(file_name: str) -> str:
     """以 POSIX 和 Windows 两种分隔符提取文件名并移除危险字符。"""
 
     normalized_name, _ = normalize_display_text(file_name)
+    normalized_name = replace_unsafe_unicode_controls(
+        normalized_name,
+        replacement="_",
+    )
     leaf_name = re.split(r"[\\/]", normalized_name)[-1]
     leaf_name = _CONTROL_CHAR_PATTERN.sub("_", leaf_name)
     leaf_name = _SURROGATE_PATTERN.sub("_", leaf_name)
@@ -115,6 +120,8 @@ def evaluate_uploaded_dataset(
     dataset_name: str | None = None,
     sheet_name: str | None = None,
     reference_date: date | None = None,
+    *,
+    selected_metric_ids: Iterable[str] | None = None,
 ) -> QualityReport:
     """在临时目录中评估上传内容，并返回与 CLI 相同的报告对象。
 
@@ -154,6 +161,7 @@ def evaluate_uploaded_dataset(
             dataset_name=safe_dataset_name,
             sheet_name=sheet_name or None,
             reference_date=reference_date,
+            selected_metric_ids=selected_metric_ids,
         )
         report.dataset.file_name = safe_file_name
         if file_name_replaced:

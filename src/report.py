@@ -1,6 +1,5 @@
-"""report.json 的组装与写出。"""
+"""评估报告的组装与 JSON / Markdown 文件写出。"""
 
-import json
 import os
 from pathlib import Path
 import secrets
@@ -10,6 +9,7 @@ from typing import Iterable
 
 from .models import DatasetInfo, QualityReport
 from .parser import ParsedDataset
+from .presentation import serialize_markdown_report, serialize_report
 
 
 def create_empty_report(dataset: DatasetInfo) -> QualityReport:
@@ -19,7 +19,7 @@ def create_empty_report(dataset: DatasetInfo) -> QualityReport:
 
 
 def create_profile_report(parsed_dataset: ParsedDataset, profile: dict) -> QualityReport:
-    """将文件解析和数据画像结果组装为 report.json 的第一版内容。"""
+    """将文件解析和数据画像结果组装为评估报告。"""
 
     report = create_empty_report(parsed_dataset.dataset)
     report.profile = profile
@@ -224,19 +224,22 @@ def save_report(
     protected_file_identities: Iterable[FileIdentity] = (),
     expected_parent_identity: FileIdentity | None = None,
 ) -> None:
-    """将结构化报告原子保存为 UTF-8 JSON，且不跟随目标符号链接。"""
+    """按目标扩展名原子保存严格 JSON 或 UTF-8 Markdown 报告。"""
 
     path = Path(output_path)
     if path.name in {"", ".", ".."}:
         raise UnsafeReportDestinationError(
             "报告输出路径必须包含文件名。"
         )
-    payload = json.dumps(
-        report.to_dict(),
-        ensure_ascii=False,
-        indent=2,
-        allow_nan=False,
-    ).encode("utf-8")
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        payload = serialize_report(report)
+    elif suffix == ".md":
+        payload = serialize_markdown_report(report)
+    else:
+        raise UnsafeReportDestinationError(
+            "报告输出路径必须使用 .json 或 .md 扩展名。"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     protected_identities = frozenset(protected_file_identities)
     if os.name == "posix":

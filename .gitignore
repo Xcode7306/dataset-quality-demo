@@ -1,8 +1,14 @@
 __pycache__/
 *.py[cod]
+.DS_Store
 .streamlit/
+.env
+.env.*
 .venv/
 venv/
-reports/
-sample_data/
-tests/
+reports/*
+!reports/bad_report.json
+!reports/excel_report.json
+!reports/format_messy_report.json
+!reports/good_report.json
+!reports/json_report.json
